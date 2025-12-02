@@ -1,3 +1,6 @@
+## 11/24
+startup manager 
+
 ## 11/17
 for next time:
 - start hosting it

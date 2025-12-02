@@ -2,13 +2,27 @@
 # focus_monitor_to_sheets_daily_tabs_buffered.py
 # pip install gspread google-auth openai
 
-import os, json, time, ctypes, re, random
+import os, json, time, ctypes, re, random, base64, tempfile, gspread, openai
 from datetime import datetime, date
 from typing import List, Tuple, Optional, Dict, Literal
-import gspread
 from google.oauth2.service_account import Credentials
-import openai
 from gspread.exceptions import APIError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+b64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")
+if not b64:
+    raise RuntimeError("GCP_SERVICE_ACCOUNT_B64 not set in .env")
+
+# Decode to a temp file
+data = base64.b64decode(b64)
+tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+tmp.write(data)
+tmp.flush()
+tmp.close()
+
+SERVICE_ACCOUNT_JSON = tmp.name  # path to use with Credentials.from_service_account_file
 
 # ===================== MONITOR CONFIG =====================
 LOG_DIR = r".\logs"               # where windows_YYYY-MM-DD.jsonl lives (from your window/url logger)
@@ -26,7 +40,6 @@ OFF_THRESHOLD = 0.60              # OFF_SCORE >= this → OFF-TASK
 # ===================== SHEETS CONFIG ======================
 SHEET_URL_OR_KEY = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
 WORKSHEET_PREFIX = "Focus Logs"   # daily tabs: "<prefix> - YYYY-MM-DD"
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",

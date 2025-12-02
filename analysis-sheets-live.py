@@ -1,212 +1,261 @@
 #!/usr/bin/env python3
 """
-focus_line_per_day_live.py
+focus_dashboard_live.py
 
-Live dashboard: ON-TASK vs OFF-TASK counts per day as an interactive Plotly line chart,
-auto-refreshing from Google Sheets using Dash.
+Single-graph dashboard:
+
+- Stacked bars (left Y): ON-TASK% and OFF-TASK% per day
+- Line (right Y): ON-TASK hours per day
+
+Data source: Google Sheets, using a service-account JSON
+stored in env var GCP_SERVICE_ACCOUNT_B64 (base64-encoded).
 """
 
 import os
-from datetime import datetime
+import base64
+import tempfile
+from typing import List
 
-import gspread
 import pandas as pd
+import gspread
 from google.oauth2.service_account import Credentials
 
-import plotly.express as px
 from dash import Dash, dcc, html
 from dash.dependencies import Input, Output
 
+from dotenv import load_dotenv
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+
 # ===================== CONFIG =====================
 
+load_dotenv()
+
+# Your sheet (URL or key)
 SHEET_URL_OR_KEY = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
-WORKSHEET_PREFIX = "Focus Logs"  # tabs you created per day
 
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service_account.json")
+# Sampling interval used by your monitor (seconds per event)
+INTERVAL_SEC = 3
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets.readonly",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-
-# How often to refresh from Google Sheets (milliseconds)
+# Auto-refresh interval (ms)
 REFRESH_INTERVAL_MS = 60_000  # 60 seconds
 
-# ==================================================
+# ===================== AUTH / GSPREAD =====================
+
+b64 = os.getenv("GCP_SERVICE_ACCOUNT_B64")
+if not b64:
+    raise RuntimeError("GCP_SERVICE_ACCOUNT_B64 not set in .env")
+
+data = base64.b64decode(b64)
+tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+tmp.write(data)
+tmp.flush()
+tmp.close()
+SERVICE_ACCOUNT_JSON = tmp.name
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=SCOPES)
+gc = gspread.authorize(creds)
 
 
-def open_spreadsheet():
-    """Authorize and open the Google Sheet."""
-    if not os.path.exists(SERVICE_ACCOUNT_JSON):
-        raise FileNotFoundError(f"service account file not found: {SERVICE_ACCOUNT_JSON}")
-
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=SCOPES)
-    gc = gspread.authorize(creds)
-
-    if SHEET_URL_OR_KEY.startswith("http"):
-        sh = gc.open_by_url(SHEET_URL_OR_KEY)
+def _open_sheet(url_or_key: str):
+    """Open a Google Sheet by full URL or just key."""
+    if "/d/" in url_or_key:
+        key = url_or_key.split("/d/")[1].split("/")[0]
     else:
-        sh = gc.open_by_key(SHEET_URL_OR_KEY)
-    return sh
+        key = url_or_key
+    return gc.open_by_key(key)
 
 
-def load_focus_logs(sh) -> pd.DataFrame:
+# ===================== DATA LOADING & AGGREGATION =====================
+
+def fetch_focus_logs() -> pd.DataFrame:
     """
-    Load all tabs whose title starts with WORKSHEET_PREFIX into one DataFrame.
-
-    Expected columns from your monitor script:
-      ts, label, confidence, ai_reason, human_label, human_reason, e1_key, ...
+    Read all worksheets in the spreadsheet that contain 'ts' and 'label'
+    columns and concatenate them into a single DataFrame.
     """
-    frames = []
+    sh = _open_sheet(SHEET_URL_OR_KEY)
+
+    frames: List[pd.DataFrame] = []
     for ws in sh.worksheets():
-        if not ws.title.startswith(WORKSHEET_PREFIX):
+        try:
+            records = ws.get_all_records()
+        except Exception:
             continue
 
-        values = ws.get_all_values()
-        if not values:
+        if not records:
             continue
 
-        headers = values[0]
-        rows = values[1:]
-        if not rows:
+        df = pd.DataFrame.from_records(records)
+
+        if "ts" not in df.columns or "label" not in df.columns:
             continue
 
-        df = pd.DataFrame(rows, columns=headers)
         frames.append(df)
 
     if not frames:
-        # return empty DataFrame instead of killing the app
         return pd.DataFrame(columns=["ts", "label"])
 
-    df_all = pd.concat(frames, ignore_index=True)
-
-    # Parse timestamps
-    if "ts" in df_all.columns:
-        df_all["ts_dt"] = pd.to_datetime(df_all["ts"], errors="coerce")
-        df_all = df_all[df_all["ts_dt"].notna()]
-    else:
-        df_all["ts_dt"] = pd.NaT
-
-    # Normalize labels
-    if "label" in df_all.columns:
-        df_all["label"] = df_all["label"].fillna("").astype(str)
-    else:
-        df_all["label"] = ""
-
-    return df_all
+    return pd.concat(frames, ignore_index=True)
 
 
-def compute_daily_counts(df: pd.DataFrame) -> pd.DataFrame:
+def compute_daily_metrics(raw_df: pd.DataFrame, interval_sec: int) -> pd.DataFrame:
     """
-    Compute counts of ON-TASK and OFF-TASK per day.
-    Ignores [idle] and any other labels.
+    From raw focus rows (ts, label, ...), compute per-day metrics:
+
+      - ON-TASK / OFF-TASK counts
+      - hours ON / OFF (using interval_sec)
+      - percentages ON / OFF
     """
-    if df.empty or "ts_dt" not in df.columns:
-        return pd.DataFrame(columns=["date", "label", "count"])
+    if raw_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "date_str",
+                "ON-TASK",
+                "OFF-TASK",
+                "total",
+                "on_hours",
+                "off_hours",
+                "on_pct",
+                "off_pct",
+            ]
+        )
 
-    df = df.copy()
-    df["date"] = df["ts_dt"].dt.date
+    df = raw_df.copy()
+    df = df[df["label"].isin(["ON-TASK", "OFF-TASK"])]
 
-    mask = df["label"].isin(["ON-TASK", "OFF-TASK"])
-    df = df[mask]
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts"])
+    df["date"] = df["ts"].dt.date
 
-    if df.empty:
-        return pd.DataFrame(columns=["date", "label", "count"])
-
-    grouped = (
+    daily = (
         df.groupby(["date", "label"])
           .size()
-          .reset_index(name="count")
+          .unstack("label", fill_value=0)
+          .reset_index()
     )
 
-    grouped["date"] = pd.to_datetime(grouped["date"])
+    for col in ["ON-TASK", "OFF-TASK"]:
+        if col not in daily.columns:
+            daily[col] = 0
 
-    return grouped
+    daily["total"] = daily["ON-TASK"] + daily["OFF-TASK"]
+    daily = daily[daily["total"] > 0]   # drop days with no events
 
+    daily["off_count"] = daily["OFF-TASK"]
+    
+    # Time metrics (hours)
+    daily["on_hours"] = (daily["ON-TASK"] * interval_sec) / 3600.0
+    daily["off_hours"] = (daily["OFF-TASK"] * interval_sec) / 3600.0
 
-def make_figure(daily_counts: pd.DataFrame):
-    """Build the Plotly figure."""
-    if daily_counts.empty:
-        # Empty placeholder figure
-        fig = px.line(
-            title="ON-TASK vs OFF-TASK per day (no data yet)"
-        )
-        fig.update_layout(
-            xaxis_title="Date",
-            yaxis_title="Count",
-        )
+    # Percentage metrics
+    daily["on_pct"] = daily["ON-TASK"] / daily["total"] * 100.0
+    daily["off_pct"] = daily["OFF-TASK"] / daily["total"] * 100.0
+
+    # For category x-axis (only actual dates that have data)
+    daily["date_str"] = daily["date"].astype(str)
+
+    return daily.sort_values("date")
+
+# ===================== FIGURE: COMBINED VIEW =====================
+
+from plotly.subplots import make_subplots
+import plotly.graph_objects as go
+
+def make_combined_figure(daily: pd.DataFrame):
+    """
+    One figure:
+      - bar (primary y): ON-TASK hours per day
+      - line (secondary y): OFF-TASK event count (how many times you go off-task)
+    """
+    if daily.empty:
+        fig = go.Figure()
+        fig.update_layout(title="No focus data available yet")
         return fig
 
-    fig = px.line(
-        daily_counts,
-        x="date",
-        y="count",
-        color="label",
-        markers=True,
-        title="ON-TASK vs OFF-TASK per day",
-        labels={
-            "date": "Date",
-            "count": "Number of events",
-            "label": "Focus state",
-        },
+    x = daily["date_str"]  # categorical x-axis (only days with data)
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # 👉 Single bar: ON-TASK hours (primary y)
+    fig.add_trace(
+        go.Bar(
+            x=x,
+            y=daily["on_hours"],
+            name="ON-TASK hours",
+            hovertemplate="<b>%{x}</b><br>ON: %{y:.2f} hours<extra></extra>",
+        ),
+        secondary_y=False,
+    )
+
+    # 👉 Line: OFF-TASK count (secondary y)
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=daily["off_count"],       # or daily["OFF-TASK"]
+            name="OFF-TASK events",
+            mode="lines+markers",
+            hovertemplate="<b>%{x}</b><br>OFF-TASK events: %{y:d}<extra></extra>",
+        ),
+        secondary_y=True,
     )
 
     fig.update_layout(
-        legend_title_text="Label",
-        hovermode="x unified",
+        title="ON-TASK hours vs OFF-TASK events",
         xaxis_title="Date",
-        yaxis_title="Count",
+        legend_title_text="",
+        hovermode="x unified",
     )
-    return fig
 
+    # Primary y-axis: hours
+    fig.update_yaxes(
+        title_text="Hours ON-TASK",
+        secondary_y=False,
+    )
+
+    # Secondary y-axis: number of times you went off-task
+    fig.update_yaxes(
+        title_text="OFF-TASK events",
+        secondary_y=True,
+        showgrid=False,
+    )
+
+    fig.update_xaxes(type="category")  # only actual dates, no gaps
+
+    return fig
 
 # ===================== DASH APP =====================
 
 app = Dash(__name__)
-app.title = "Focus Monitor – Daily Line"
-
 
 app.layout = html.Div(
-    style={"fontFamily": "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
-           "padding": "20px"},
-    children=[
-        html.H2("Focus Monitor – ON-TASK vs OFF-TASK per day"),
-        html.P(
-            "This chart auto-refreshes from Google Sheets every "
-            f"{REFRESH_INTERVAL_MS // 1000} seconds."
-        ),
-        dcc.Graph(id="daily-line-graph"),
+    [
+        html.H1("Focus Dashboard", style={"textAlign": "center"}),
+
+        dcc.Graph(id="focus_graph"),
+
         dcc.Interval(
-            id="refresh-interval",
+            id="refresh_interval",
             interval=REFRESH_INTERVAL_MS,
-            n_intervals=0,  # triggers immediately on load
+            n_intervals=0,
         ),
     ],
+    style={"maxWidth": "1200px", "margin": "0 auto"},
 )
 
 
 @app.callback(
-    Output("daily-line-graph", "figure"),
-    Input("refresh-interval", "n_intervals"),
+    Output("focus_graph", "figure"),
+    Input("refresh_interval", "n_intervals"),
 )
-def update_graph(n):
-    """Callback: re-pull data from Sheets and update figure."""
-    try:
-        sh = open_spreadsheet()
-        df = load_focus_logs(sh)
-        daily_counts = compute_daily_counts(df)
-        fig = make_figure(daily_counts)
-        return fig
-    except Exception as e:
-        # In case of error, show message in the figure title
-        fig = px.line(title=f"Error loading data: {e}")
-        fig.update_layout(
-            xaxis_title="Date",
-            yaxis_title="Count",
-        )
-        return fig
+def update_focus_graph(_n):
+    raw_df = fetch_focus_logs()
+    daily = compute_daily_metrics(raw_df, INTERVAL_SEC)
+    return make_combined_figure(daily)
 
+
+# ===================== MAIN =====================
 
 if __name__ == "__main__":
-    # debug=True gives you code hot-reload when you edit this file
-    app.run(debug=True)
+    app.run(debug=True, port=8050)
