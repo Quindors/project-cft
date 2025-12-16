@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # focus_monitor_to_sheets_daily_tabs_buffered.py
-# pip install gspread google-auth openai
+# pip install gspread google-auth openai python-dotenv
 
 import os, json, time, ctypes, re, random, base64, tempfile, gspread, openai
 from datetime import datetime, date
-from typing import List, Tuple, Optional, Dict, Literal
+from typing import List, Tuple, Optional, Dict
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
 from dotenv import load_dotenv
@@ -28,14 +28,29 @@ SERVICE_ACCOUNT_JSON = tmp.name  # path to use with Credentials.from_service_acc
 LOG_DIR = r".\logs"               # where windows_YYYY-MM-DD.jsonl lives (from your window/url logger)
 MODEL = "gpt-4o-mini"
 INTERVAL_SEC    = 3
-BATCH_FLUSH_MAX = 20              # ~1 flush/minute at steady state
-IDLE_FLUSH_SEC  = 20.0
-APPEND_ONLY     = True            # if you don't need per-ts upserts
 MAX_EVENTS = 4                    # total events to send (from windows/URLs)
 
 # ---- OFF-TASK threshold (single) ----
 OFF_THRESHOLD = 0.60              # OFF_SCORE >= this → OFF-TASK
-# ====================================
+
+# ===================== CRITIC PASS (FN-optimized) ==========
+CRITIC_ENABLED: bool = True
+CRITIC_MODEL: str = MODEL         # you can set a stronger model here if you want
+CRITIC_MAX_TOKENS: int = 90
+CRITIC_TEMPERATURE: float = 0.0
+
+# When Pass 1 says ON-TASK, run critic if ANY of these triggers hit:
+CRITIC_TRIGGER_CONF_MAX: float = 0.70    # low-confidence ON → critic
+CRITIC_TRIGGER_OFF_MIN: float = 0.30     # moderately off-ish ON → critic
+CRITIC_TRIGGER_RISKY_KEYWORDS: bool = True
+
+RISKY_KEYWORDS = [
+    "youtube", "youtu.be", "reddit", "discord", "twitter", "x.com",
+    "instagram", "tiktok", "netflix", "twitch", "hulu", "prime video",
+    "steam", "epic games", "roblox", "minecraft",
+    "shopping", "amazon", "ebay", "aliexpress"
+]
+# ============================================================
 
 # ===================== SHEETS CONFIG ======================
 SHEET_URL_OR_KEY = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
@@ -44,7 +59,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
-MAX_EVENT_COLS = 5                # flatten up to N events: e{i}_ts, e{i}_key
+MAX_EVENT_COLS = 5                # flatten up to N events: e{i}_key
 
 # --------- WRITE THROTTLING / BUFFERING (tune here) ---------
 APPEND_ONLY: bool = False         # True = never update existing ts rows; fastest/lowest quota
@@ -52,7 +67,6 @@ BATCH_FLUSH_MAX: int = 15         # flush after this many buffered rows
 IDLE_FLUSH_SEC: float = 15.0      # or when buffer is idle this long
 MAX_RETRIES: int = 6              # retries on 429/5xx
 BACKOFF_BASE: float = 0.8         # seconds, exponential with jitter
-
 # ============================================================
 
 last_alert_ts: Optional[str] = None
@@ -70,10 +84,10 @@ def build_prompt(events: List[Tuple[str, str]]) -> str:
         "Event format:\n"
         "- WIN:<window title>\n\n"
         "Goal: Determine how OFF-TASK the user is based on intent.\n"
-        "Potentially distractive apps or titles include (non-exhaustive): Discord, YouTube, Reddit, Twitter, Instagram, TikTok, Netflix, Twitch.\n\n"
+        "Potentially distractive apps or titles include (non-exhaustive): Discord, YouTube, Reddit, Twitter/X, Instagram, TikTok, Netflix, Twitch.\n\n"
         "Rules (intent-based):\n"
         "1) If the title clearly shows *work or learning intent*, treat as ON-TASK.\n"
-        "2) Use surrounding context (last ~5 events) for tie-breaks.\n"
+        "2) Use surrounding context (last few events) for tie-breaks.\n"
         "3) Ambiguity rule: prefer ON-TASK if context suggests work.\n"
         "4) Weigh most recent windows higher.\n\n"
         "Output (strict, single line):\n"
@@ -81,69 +95,146 @@ def build_prompt(events: List[Tuple[str, str]]) -> str:
         "Recent activity (oldest → newest):\n" + ", ".join(tokens)
     )
 
-def ask_gpt(prompt: str, model: str) -> Tuple[str, str, Optional[float], Optional[float]]:
+def build_critic_prompt(events: List[Tuple[str, str]], p1_summary: str) -> str:
+    tokens = [k for _, k in events]
+    return (
+        "You are a strict productivity *auditor* (a critic).\n"
+        "Your job is to challenge ON-TASK decisions and reduce false negatives.\n"
+        "Assume the user *might* be off-task. Try to find evidence.\n"
+        "If evidence is mixed or ambiguous, err slightly toward OFF-TASK.\n\n"
+        "You will be shown the initial model's summary. You may agree or disagree.\n\n"
+        f"Initial model summary: {p1_summary}\n\n"
+        "Output (strict, single line):\n"
+        "  LABEL=<ON-TASK or OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<short explanation>\n\n"
+        "Recent activity (oldest → newest):\n" + ", ".join(tokens)
+    )
+
+def _parse_llm_line(content: str) -> Tuple[str, str, Optional[float], Optional[float]]:
+    content = (content or "").strip()
+
+    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK)", content, flags=re.I)
+    if m_label:
+        label = m_label.group(1).upper()
+    else:
+        upper = content.upper()
+        if "OFF-TASK" in upper:
+            label = "OFF-TASK"
+        elif "ON-TASK" in upper:
+            label = "ON-TASK"
+        else:
+            label = "[WARN]"
+
+    m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
+    off_score: Optional[float] = None
+    if m_off:
+        try:
+            val = float(m_off.group(1))
+            if 0.0 <= val <= 1.0:
+                off_score = val
+        except Exception:
+            off_score = None
+
+    m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
+    confidence: Optional[float] = None
+    if m_conf:
+        try:
+            val = float(m_conf.group(1))
+            if 0.0 <= val <= 1.0:
+                confidence = val
+        except Exception:
+            confidence = None
+
+    reason = ""
+    m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
+    if m_reason:
+        reason = m_reason.group(1).strip()
+
+    if off_score is None:
+        off_score = 0.8 if label == "OFF-TASK" else 0.2
+    if confidence is None:
+        confidence = 0.5
+
+    # Normalize: if label says OFF, guarantee it clears the threshold (FN-biased)
+    if label == "OFF-TASK" and off_score < OFF_THRESHOLD:
+        off_score = OFF_THRESHOLD
+
+    return label, reason, off_score, confidence
+
+def ask_gpt(prompt: str, model: str, max_tokens: int = 60, temperature: float = 0.0) -> Tuple[str, str, Optional[float], Optional[float], str]:
     """
     Returns:
-      label: 'ON-TASK' or 'OFF-TASK' (model's raw label)
-      reason: short explanation (may be empty)
-      off_score: float in [0,1] (higher = more off-task)
-      confidence: model's self-reported confidence in its judgment
+      label, reason, off_score, confidence, raw_text
     """
     try:
         resp = openai.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
-            temperature=0.1,
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
         content = (resp.choices[0].message.content or "").strip()
-
-        m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK)", content, flags=re.I)
-        if m_label:
-            label = m_label.group(1).upper()
-        else:
-            upper = content.upper()
-            if "OFF-TASK" in upper:
-                label = "OFF-TASK"
-            elif "ON-TASK" in upper:
-                label = "ON-TASK"
-            else:
-                label = "[WARN]"
-
-        m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
-        off_score: Optional[float] = None
-        if m_off:
-            try:
-                val = float(m_off.group(1))
-                if 0.0 <= val <= 1.0:
-                    off_score = val
-            except Exception:
-                off_score = None
-
-        m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
-        confidence: Optional[float] = None
-        if m_conf:
-            try:
-                val = float(m_conf.group(1))
-                if 0.0 <= val <= 1.0:
-                    confidence = val
-            except Exception:
-                confidence = None
-
-        reason = ""
-        m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
-        if m_reason:
-            reason = m_reason.group(1).strip()
-
-        if off_score is None:
-            off_score = 0.8 if label == "OFF-TASK" else 0.2
-        if confidence is None:
-            confidence = 0.5
-
-        return label, reason, off_score, confidence
-
+        label, reason, off_score, confidence = _parse_llm_line(content)
+        return label, reason, off_score, confidence, content
     except Exception as e:
-        return "[ERROR]", str(e), None, None
+        return "[ERROR]", str(e), None, None, ""
+
+def _is_risky_context(events: List[Tuple[str, str]]) -> bool:
+    text = " ".join([k for _, k in events]).lower()
+    return any(kw in text for kw in RISKY_KEYWORDS)
+
+def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: List[Tuple[str, str]]) -> bool:
+    if not CRITIC_ENABLED:
+        return False
+    if p1_label != "ON-TASK":
+        return False
+    if p1_conf is not None and p1_conf < CRITIC_TRIGGER_CONF_MAX:
+        return True
+    if p1_off is not None and p1_off >= CRITIC_TRIGGER_OFF_MIN:
+        return True
+    if CRITIC_TRIGGER_RISKY_KEYWORDS and _is_risky_context(events):
+        return True
+    return False
+
+def decide_with_critic(events_context: List[Tuple[str, str]]) -> Tuple[str, str, float, float, bool]:
+    """
+    Returns:
+      final_label, final_reason, final_off, final_conf, critic_ran
+    """
+    p1_prompt = build_prompt(events_context)
+    p1_label, p1_reason, p1_off, p1_conf, _p1_raw = ask_gpt(
+        p1_prompt, MODEL, max_tokens=60, temperature=0.0
+    )
+
+    # If pass1 errored, just return it (don’t double-fail)
+    if p1_label in ("[ERROR]", "[WARN]") or p1_off is None or p1_conf is None:
+        return p1_label, (p1_reason or ""), (p1_off or 0.5), (p1_conf or 0.5), False
+
+    critic_ran = _should_run_critic(p1_label, p1_off, p1_conf, events_context)
+    if not critic_ran:
+        return p1_label, (p1_reason or ""), p1_off, p1_conf, False
+
+    p1_summary = f"LABEL={p1_label} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
+    c_prompt = build_critic_prompt(events_context, p1_summary)
+    c_label, c_reason, c_off, c_conf, _c_raw = ask_gpt(
+        c_prompt, CRITIC_MODEL, max_tokens=CRITIC_MAX_TOKENS, temperature=CRITIC_TEMPERATURE
+    )
+
+    # If critic fails, fall back to pass1
+    if c_label in ("[ERROR]", "[WARN]") or c_off is None or c_conf is None:
+        return p1_label, (p1_reason or ""), p1_off, p1_conf, True
+
+    # FN-biased combine: OFF if either says OFF
+    if c_label == "OFF-TASK" or (c_off >= OFF_THRESHOLD):
+        final_label = "OFF-TASK"
+        final_off = max(p1_off, c_off)
+        final_conf = c_conf
+        final_reason = (c_reason or p1_reason or "").strip()
+        # include a short trace without being too verbose
+        final_reason = f"[Critic] {final_reason}"
+        return final_label, final_reason, final_off, final_conf, True
+
+    # Otherwise keep pass1
+    return p1_label, (p1_reason or ""), p1_off, p1_conf, True
 
 # ----------------------- Windows Log ----------------------
 def todays_log_path() -> str:
@@ -185,8 +276,6 @@ def _open_client_and_spreadsheet():
     return gc, sh
 
 def _expected_headers() -> List[str]:
-    # Column layout:
-    # ts | label | confidence | ai_reason | human_label | human_reason | e1_key | e2_key | ...
     base = [
         "ts",
         "label",
@@ -241,24 +330,21 @@ def _flatten_row(record: Dict) -> List[str]:
         v = record.get(k, default)
         return "" if v is None else str(v)
 
-    # ts | label | confidence | ai_reason | human_label | human_reason
     row: List[str] = [
         get("ts"),
         get("label"),
         get("confidence"),
         get("reason"),   # goes under ai_reason
-        "",              # human_label (left empty)
-        "",              # human_reason (left empty)
+        "",              # human_label
+        "",              # human_reason
     ]
 
-    # Event columns: e{i}_key only
     events = record.get("events") or []
     for i in range(MAX_EVENT_COLS):
         if i < len(events) and isinstance(events[i], dict):
             row.append(str(events[i].get("key", "")) or "")
         else:
             row.append("")
-
     return row
 
 def _retryable_call(fn, *args, **kwargs):
@@ -277,7 +363,6 @@ def _retryable_call(fn, *args, **kwargs):
     raise RuntimeError("Exceeded max retries for Sheets API call")
 
 def _flush_buffer(ws, key_to_row: Dict[str, int], buffer_rows: List[List[str]]):
-    """Efficient batch flush with minimal API calls."""
     if not buffer_rows:
         return {"updated": 0, "appended": 0}
 
@@ -323,6 +408,13 @@ def _flush_buffer(ws, key_to_row: Dict[str, int], buffer_rows: List[List[str]]):
 def main():
     require_api_key()
 
+    # --- TEST: mark that the script started ---
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    startup_log = os.path.join(base_dir, "startup_test.log")
+    with open(startup_log, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  started via Task Scheduler\n")
+    # ------------------------------------------
+
     if not os.path.exists(SERVICE_ACCOUNT_JSON):
         raise SystemExit(f"[fatal] Service account JSON not found: {SERVICE_ACCOUNT_JSON}")
 
@@ -338,7 +430,6 @@ def main():
 
     global last_alert_ts
 
-    # NEW: track last events signature (sequence of keys) so we only log on change
     last_events_signature: Optional[Tuple[str, ...]] = None
 
     buffer: List[List[str]] = []
@@ -348,6 +439,7 @@ def main():
 
     while True:
         loop_start = time.time()
+
         # Daily rollover
         today = date.today()
         if today != current_day:
@@ -358,42 +450,44 @@ def main():
             current_day = today
             ws = _get_or_create_daily_ws(sh, current_day)
             key_to_row = _read_existing_ts(ws)
-            last_written_newest_ts = None
-            last_events_signature = None  # reset for new tab/day
+            last_events_signature = None
             print(f"[info] rolled over → new tab '{ws.title}'")
             last_flush_time = time.time()
 
         path = todays_log_path()
-        events = read_last_events(path, MAX_EVENTS)
+        events_context = read_last_events(path, MAX_EVENTS)  # always keep a stable short context window
 
-        events_for_decision = [e for e in events if not last_alert_ts or e[0] > last_alert_ts]
+        # Decide if there are new events since last alert (used only to avoid repeated popups)
+        events_for_decision = [e for e in events_context if not last_alert_ts or e[0] > last_alert_ts]
 
         ts_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        last_before = last_alert_ts
 
         if not events_for_decision:
-            decision_raw, reason, off_score, confidence = "[idle]", f"no new events in {path}", None, None
-            newest_ts = events[-1][0] if events else None
+            decision_raw = "[idle]"
+            reason = f"no new events in {path}"
+            off_score = None
+            confidence = None
         else:
-            prompt = build_prompt(events_for_decision)
-            decision_raw, reason, off_score, confidence = ask_gpt(prompt, MODEL)
-            newest_ts = events_for_decision[-1][0]
+            # classify using the full context window (better accuracy than only the delta)
+            label, reason, off_score, confidence, critic_ran = decide_with_critic(events_context)
 
             off_val = off_score if off_score is not None else 0.5
             prev_state = current_state
-            current_state = "OFF-TASK" if off_val >= OFF_THRESHOLD else "ON-TASK"
+            current_state = "OFF-TASK" if (label == "OFF-TASK" or off_val >= OFF_THRESHOLD) else "ON-TASK"
 
             if prev_state == "ON-TASK" and current_state == "OFF-TASK":
                 show_popup("You're drifting OFF-TASK!\n" + (reason or ""))
-                last_alert_ts = newest_ts
-                print(f"{ts_now}  OFF-TASK (off={off_val:.2f}, conf={confidence if confidence is not None else 'n/a'}) | {reason}")
+                # mark newest context ts as alerted so we don't re-alert on same window set
+                last_alert_ts = events_context[-1][0] if events_context else None
+                tag = " (critic)" if critic_ran else ""
+                print(f"{ts_now}  OFF-TASK{tag} (off={off_val:.2f}, conf={confidence if confidence is not None else 'n/a'}) | {reason}")
             else:
-                print(f"{ts_now}  {current_state} (off={off_val:.2f}, conf={confidence if confidence is not None else 'n/a'})")
+                tag = " (critic checked)" if critic_ran else ""
+                print(f"{ts_now}  {current_state}{tag} (off={off_val:.2f}, conf={confidence if confidence is not None else 'n/a'})")
 
-        if decision_raw == "[idle]":
-            label_to_log = decision_raw
-        else:
-            label_to_log = current_state
+            decision_raw = label
+
+        label_to_log = decision_raw if decision_raw == "[idle]" else current_state
 
         record = {
             "ts": ts_now,
@@ -405,7 +499,6 @@ def main():
 
         if label_to_log != "[idle]":
             # ---------- ONLY LOG WHEN EVENTS CHANGE ----------
-            # Build an events signature based on the keys of up to MAX_EVENT_COLS events
             events_list = record["events"] or []
             trimmed = events_list[:MAX_EVENT_COLS]
             keys = []
@@ -414,14 +507,11 @@ def main():
                     keys.append(str(e.get("key", "")) or "")
                 else:
                     keys.append("")
-            # pad so signature length is stable
             while len(keys) < MAX_EVENT_COLS:
                 keys.append("")
             current_events_signature = tuple(keys)
 
             if last_events_signature is not None and current_events_signature == last_events_signature:
-                # Events haven't changed → skip logging this row
-                # print("[debug] skipping row, events unchanged")
                 pass
             else:
                 row = _flatten_row(record)

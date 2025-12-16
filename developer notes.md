@@ -1,3 +1,36 @@
+# Todo
+- start hosting it
+- expand inputs
+    - consider screenshots?
+- run script automatically
+- have the popup actually pop up on the front of the screen
+- have the popup auto-close after 3 seconds
+- increase startup speed of monitor-sheets.py
+- add ability of self-correction (fine tuning loop) <<<<<
+- hosting the dashboard
+- check dashboard accuracy
+- weekly report
+
+## 12/15
+Abstain as a first-class outcome: reliability increases massively when the system is allowed to say “UNKNOWN / NEEDS REVIEW” instead of guessing.
+3) Two-pass verification (LLM judge + LLM auditor)
+If you don’t care about cost, this is one of the most reliable patterns:
+Pass A: classify + provide the evidence it used.
+Pass B: independently critique: “Is the label justified by the evidence? What would flip it?”
+If disagreement or weak evidence → UNKNOWN / human review.
+- check if we are calling LLM every window sample, every 3 sec, or every change
+- better model maybe
+- remove google sheets duplicate params
+3) Add “time in current context” as a first-class signal
+LLMs get much more consistent if you include:
+“current window has been active for X seconds"
+“last change was Y seconds ago”
+“in last 30 seconds: app switches = N”
+Real off-task usually has dwell time. That one feature dramatically improves reliability.
+
+## 12/1
+- we will be hosting the dashboard
+
 ## 11/24
 startup manager 
 
