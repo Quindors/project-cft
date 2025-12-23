@@ -6,11 +6,6 @@ import os
 import json
 import time
 import ctypes
-import re
-import random
-import base64
-import tempfile
-import io
 import threading
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
@@ -19,21 +14,12 @@ from typing import List, Tuple, Optional, Dict, Any
 from monitor.config import *   # keeps your existing variable names unchanged
 from monitor.creds import load_env, build_service_account_json_from_b64, require_openai_api_key
 from monitor.decider import decide_with_critic
+from monitor.sheets_sink import SheetsSink
 
 load_env(override=True)
 SERVICE_ACCOUNT_JSON = build_service_account_json_from_b64()
 
-import gspread
 import openai
-from google.oauth2.service_account import Credentials
-from gspread.exceptions import APIError
-from dotenv import load_dotenv
-
-try:
-    from PIL import ImageGrab
-except ImportError:
-    ImageGrab = None
-    print("[warn] Pillow not installed. pip install Pillow")
 
 try:
     from pynput import keyboard
@@ -119,154 +105,6 @@ def show_popup(message: str, title: str = "Productivity Alert"):
     MB_TOPMOST = 0x00040000
     flags = MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
     ctypes.windll.user32.MessageBoxW(0, message, title, flags)
-
-
-# ===================== SHEETS =====================
-
-def _open_client_and_spreadsheet():
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_JSON, scopes=SCOPES)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(SHEET_URL_OR_KEY) if SHEET_URL_OR_KEY.startswith("http") else gc.open_by_key(SHEET_URL_OR_KEY)
-    return gc, sh
-
-def _expected_headers() -> List[str]:
-    base = [
-        "ts",
-        "label",
-        "primary_confidence",
-        "primary_reason",
-        "critic_confidence",
-        "critic_reason",
-        "human_label",
-        "human_reason",
-        "typed_text",
-    ]
-    for i in range(1, MAX_EVENT_COLS + 1):
-        base.append(f"e{i}_key")
-    return base
-
-def _col_letter(n: int) -> str:
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-def _ensure_headers(ws) -> None:
-    headers = _expected_headers()
-    end_col = _col_letter(len(headers))
-    ws.update(f"A1:{end_col}1", [headers], value_input_option="RAW")
-
-def _get_or_create_daily_ws(sh, day: date):
-    title = f"{WORKSHEET_PREFIX} - {day:%Y-%m-%d}"
-    try:
-        ws = sh.worksheet(title)
-    except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=title, rows="200", cols=str(len(_expected_headers())), index=0)
-        _ensure_headers(ws)
-    return ws
-
-def _read_existing_ts(ws) -> Dict[str, int]:
-    headers = _expected_headers()
-    idx_ts = headers.index("ts")
-    values = ws.get_all_values()
-    key_to_row: Dict[str, int] = {}
-    for i, r in enumerate(values[1:], start=2):
-        key = (r[idx_ts] if idx_ts < len(r) else "").strip()
-        if key:
-            key_to_row[key] = i
-    return key_to_row
-
-def _flatten_row(record: Dict[str, Any]) -> List[str]:
-    def get(k, default=""):
-        v = record.get(k, default)
-        return "" if v is None else str(v)
-
-    row: List[str] = [
-        get("ts"),
-        get("label"),
-        get("primary_confidence"),
-        get("primary_reason"),
-        get("critic_confidence"),
-        get("critic_reason"),
-        "",  # human_label
-        "",  # human_reason
-        get("typed_text"),
-    ]
-
-    events = record.get("events") or []
-    for i in range(MAX_EVENT_COLS):
-        if i < len(events) and isinstance(events[i], dict):
-            row.append(str(events[i].get("key", "")) or "")
-        else:
-            row.append("")
-    return row
-
-def _apierror_status(e: APIError) -> Optional[int]:
-    try:
-        # gspread APIError.response is requests.Response
-        return getattr(e.response, "status_code", None)
-    except Exception:
-        return None
-
-def _retryable_call(fn, *args, **kwargs):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return fn(*args, **kwargs)
-        except APIError as e:
-            code = _apierror_status(e)
-            msg = str(e)
-            if ("429" in msg) or (code in (429, 500, 502, 503, 504)):
-                delay = (BACKOFF_BASE * (2 ** attempt)) + random.random()
-                print(f"[warn] Sheets throttled (attempt {attempt+1}/{MAX_RETRIES}) sleeping {delay:.2f}s")
-                time.sleep(delay)
-                continue
-            raise
-    raise RuntimeError("Exceeded max retries for Sheets API call")
-
-def _flush_buffer(ws, key_to_row: Dict[str, int], buffer_rows: List[List[str]]):
-    if not buffer_rows:
-        return {"updated": 0, "appended": 0}
-
-    if APPEND_ONLY:
-        _retryable_call(ws.append_rows, buffer_rows, value_input_option="USER_ENTERED")
-        start_row_guess = max(key_to_row.values(), default=1) + 1
-        for row in buffer_rows:
-            ts = (row[0] or "").strip()
-            if ts and ts not in key_to_row:
-                key_to_row[ts] = start_row_guess
-                start_row_guess += 1
-        return {"updated": 0, "appended": len(buffer_rows)}
-
-    headers = _expected_headers()
-    idx_ts = headers.index("ts")
-    end_col = _col_letter(len(headers))
-
-    updates_payload = []
-    appends: List[List[str]] = []
-
-    for row in buffer_rows:
-        key = (row[idx_ts] or "").strip()
-        if key and key in key_to_row:
-            r = key_to_row[key]
-            updates_payload.append({"range": f"A{r}:{end_col}{r}", "values": [row]})
-        else:
-            appends.append(row)
-
-    if updates_payload:
-        _retryable_call(ws.batch_update, updates_payload, value_input_option="USER_ENTERED")
-
-    if appends:
-        _retryable_call(ws.append_rows, appends, value_input_option="USER_ENTERED")
-        start_row_guess = max(key_to_row.values(), default=1) + 1
-        for row in appends:
-            ts = (row[idx_ts] or "").strip()
-            if ts and ts not in key_to_row:
-                key_to_row[ts] = start_row_guess
-                start_row_guess += 1
-
-    return {"updated": len(updates_payload), "appended": len(appends)}
-
 
 # ===================== KEY LOGGER =====================
 
@@ -410,12 +248,9 @@ def main():
     if not os.path.exists(SERVICE_ACCOUNT_JSON):
         raise SystemExit(f"[fatal] Service account JSON not found: {SERVICE_ACCOUNT_JSON}")
 
-    gc, sh = _open_client_and_spreadsheet()
-
-    current_day = date.today()
-    ws = _get_or_create_daily_ws(sh, current_day)
-    key_to_row = _read_existing_ts(ws)
-    print(f"[info] connected to sheet; tab='{ws.title}', existing rows tracked: {len(key_to_row)}")
+    sink = SheetsSink(SERVICE_ACCOUNT_JSON)
+    sink.ensure_day(date.today())
+    print(f"[info] connected to sheet; tab='{sink.ws_title}', existing rows tracked: {sink.existing_rows_tracked}")
 
     os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -437,8 +272,6 @@ def main():
         key_logger.start()
 
     last_events_signature: Optional[Tuple[str, ...]] = None
-    buffer: List[List[str]] = []
-    last_flush_time = time.time()
 
     # typed_text interval timing
     last_logged_dt = trace.sim_start if trace else datetime.now()
@@ -450,19 +283,8 @@ def main():
             loop_start = time.time()
 
             # daily rollover (live mode only)
-            today = date.today()
-            if not USE_TRACE_FILE and today != current_day:
-                if buffer:
-                    _ensure_headers(ws)
-                    _flush_buffer(ws, key_to_row, buffer)
-                    buffer.clear()
-
-                current_day = today
-                ws = _get_or_create_daily_ws(sh, current_day)
-                key_to_row = _read_existing_ts(ws)
-                last_events_signature = None
-                last_flush_time = time.time()
-                print(f"[info] rolled over → new tab '{ws.title}'")
+            if not USE_TRACE_FILE:
+                sink.ensure_day(date.today())
 
             # keystroke summary
             ks_summary = ""
@@ -539,6 +361,8 @@ def main():
 
             # typed_text interval
             typed_text_interval = ""
+            current_dt_for_text = None  # <-- add this
+
             if CAPTURE_TYPED_TEXT:
                 if USE_TRACE_FILE:
                     sim_now = trace_now(trace, wall_start)
@@ -547,8 +371,6 @@ def main():
                     current_dt_for_text = sim_now
                 else:
                     current_dt_for_text = datetime.now()
-                    # read the keystroke log files in the interval by scanning recent lines (simple)
-                    # If you want a faster indexed approach, we can add it later.
                     path = os.path.join(KEY_LOG_DIR, f"keystrokes_{current_dt_for_text:%Y-%m-%d}.jsonl")
                     if os.path.exists(path):
                         lines = _tail_lines(path, max_lines=2000)
@@ -584,33 +406,29 @@ def main():
                 current_signature = tuple(keys)
 
                 if last_events_signature != current_signature:
-                    row = _flatten_row(record)
-                    buffer.append(row)
-                    last_events_signature = current_signature
-                    last_logged_dt = current_dt_for_text if CAPTURE_TYPED_TEXT else (trace_now(trace, wall_start) if USE_TRACE_FILE else datetime.now())
+                    sink.enqueue_record(record)
 
-            # flush buffer
-            now = time.time()
-            should_flush = len(buffer) >= BATCH_FLUSH_MAX or (buffer and (now - last_flush_time) >= IDLE_FLUSH_SEC)
-            if should_flush:
-                try:
-                    _ensure_headers(ws)
-                    result = _flush_buffer(ws, key_to_row, buffer)
-                    print(f"[flush] updated={result['updated']} appended={result['appended']} (sent {len(buffer)})")
-                    buffer.clear()
-                    last_flush_time = now
-                except Exception as e:
-                    print(f"[error] flush failed: {e}")
+                    # ✅ CRITICAL: update signature so you don't enqueue forever
+                    last_events_signature = current_signature
+
+                    # ✅ CRITICAL: advance typed-text cursor only when you actually log
+                    if CAPTURE_TYPED_TEXT and current_dt_for_text is not None:
+                        last_logged_dt = current_dt_for_text
+
+            res = sink.flush_if_needed()
+            if res:
+                print(f"[flush] updated={res.updated} appended={res.appended} (sent {res.sent})")
 
             # sleep
             elapsed = time.time() - loop_start
             time.sleep(max(0.0, INTERVAL_SEC - elapsed))
 
     finally:
+        print("[info] final sheets flush...")
+        sink.close()
         if key_logger:
             print("[info] stopping key logger...")
             key_logger.stop()
-
 
 if __name__ == "__main__":
     try:
