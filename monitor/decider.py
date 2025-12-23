@@ -1,53 +1,30 @@
-# focusmon/decider.py
+# monitor/decider.py
 from __future__ import annotations
 
 import base64
 import io
 import re
-from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import openai
 
-from monitor.config import (
-    MODEL,
-    OFF_THRESHOLD,
-    CRITIC_ENABLED,
-    CRITIC_MODEL,
-    CRITIC_MAX_TOKENS,
-    CRITIC_TEMPERATURE,
-    CRITIC_TRIGGER_CONF_MAX,
-    CRITIC_TRIGGER_OFF_MIN,
-    CRITIC_TRIGGER_RISKY_KEYWORDS,
-    RISKY_KEYWORDS,
-)
+from monitor.config import Settings, DEFAULT_SETTINGS
 
 try:
     from PIL import ImageGrab
 except ImportError:
     ImageGrab = None
-    print("[warn] Pillow not installed. pip install Pillow")
+    print("[warn] Pillow not installed. Vision tiebreaker disabled. pip install Pillow")
 
 
-# --------------------- Prompt loading ---------------------
+# ------------------ prompts ------------------
 
 def _read_prompt_file(filename: str) -> str:
-    """
-    Tries to read prompt files from:
-    1) current working directory
-    2) project root (parent of focusmon/)
-    """
-    candidates = [
-        Path.cwd() / filename,
-        Path(__file__).resolve().parent.parent / filename,
-    ]
-    for p in candidates:
-        try:
-            if p.exists():
-                return p.read_text(encoding="utf-8").strip()
-        except Exception as e:
-            print(f"[warn] failed to read {p}: {e}")
-    return ""
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
 
 
 def build_prompt(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
@@ -64,11 +41,7 @@ def build_prompt(events: List[Tuple[str, str]], keystroke_summary: str = "") -> 
     return template.replace("[insert here]", activity_str + extra)
 
 
-def build_critic_prompt(
-    events: List[Tuple[str, str]],
-    p1_summary: str,
-    keystroke_summary: str = "",
-) -> str:
+def build_critic_prompt(events: List[Tuple[str, str]], p1_summary: str, keystroke_summary: str = "") -> str:
     activity_str = ", ".join([k for _, k in events])
     extra = f"\nKeystroke Activity: {keystroke_summary}" if keystroke_summary else ""
 
@@ -89,18 +62,16 @@ def build_critic_prompt(
     return template
 
 
-# --------------------- LLM parsing/calls ---------------------
+# ------------------ parsing + calls ------------------
 
-def _parse_llm_line(content: str) -> Tuple[str, str, float, float]:
+def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float, float]:
     content = (content or "").strip()
 
     m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK)", content, flags=re.I)
     label = (
         m_label.group(1).upper()
         if m_label
-        else ("OFF-TASK" if "OFF-TASK" in content.upper()
-              else "ON-TASK" if "ON-TASK" in content.upper()
-              else "[WARN]")
+        else ("OFF-TASK" if "OFF-TASK" in content.upper() else "ON-TASK" if "ON-TASK" in content.upper() else "[WARN]")
     )
 
     m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
@@ -116,8 +87,8 @@ def _parse_llm_line(content: str) -> Tuple[str, str, float, float]:
     reason = m_reason.group(1).strip() if m_reason else ""
 
     # FN-biased normalization
-    if label == "OFF-TASK" and off_score < OFF_THRESHOLD:
-        off_score = OFF_THRESHOLD
+    if label == "OFF-TASK" and off_score < off_threshold:
+        off_score = off_threshold
 
     return label, reason, off_score, conf
 
@@ -125,8 +96,10 @@ def _parse_llm_line(content: str) -> Tuple[str, str, float, float]:
 def ask_gpt(
     prompt: str,
     model: str,
-    max_tokens: int = 60,
-    temperature: float = 0.0,
+    *,
+    max_tokens: int,
+    temperature: float,
+    off_threshold: float,
 ) -> Tuple[str, str, float, float, str]:
     try:
         resp = openai.chat.completions.create(
@@ -136,13 +109,13 @@ def ask_gpt(
             temperature=temperature,
         )
         content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf = _parse_llm_line(content)
+        label, reason, off_score, conf = _parse_llm_line(content, off_threshold)
         return label, reason, off_score, conf, content
     except Exception as e:
         return "[ERROR]", str(e), 0.5, 0.5, ""
 
 
-# --------------------- Vision tiebreaker ---------------------
+# ------------------ vision tiebreak ------------------
 
 def take_screenshot_b64() -> Optional[str]:
     if not ImageGrab:
@@ -163,6 +136,10 @@ def ask_gpt_vision(
     events: List[Tuple[str, str]],
     main_reason: str,
     critic_reason: str,
+    *,
+    model: str,
+    max_tokens: int,
+    off_threshold: float,
 ) -> Tuple[str, str, float, float]:
     activity_str = ", ".join([k for _, k in events])
     prompt = (
@@ -176,7 +153,7 @@ def ask_gpt_vision(
     )
     try:
         resp = openai.chat.completions.create(
-            model="gpt-4o",
+            model=model,
             messages=[{
                 "role": "user",
                 "content": [
@@ -184,45 +161,122 @@ def ask_gpt_vision(
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}},
                 ],
             }],
-            max_tokens=120,
+            max_tokens=max_tokens,
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf = _parse_llm_line(content)
+        label, reason, off_score, conf = _parse_llm_line(content, off_threshold)
         return label, reason, off_score, conf
     except Exception as e:
         return "[ERROR]", str(e), 0.5, 0.5
 
 
-# --------------------- Critic logic ---------------------
+# ------------------ critic logic ------------------
 
-def _is_risky_context(events: List[Tuple[str, str]]) -> bool:
+def _is_risky_context(events: List[Tuple[str, str]], settings: Settings) -> bool:
     text = " ".join([k for _, k in events]).lower()
-    return any(kw in text for kw in RISKY_KEYWORDS)
+    return any(kw in text for kw in settings.risky_keywords)
 
 
-def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: List[Tuple[str, str]]) -> bool:
-    if not CRITIC_ENABLED:
+def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: List[Tuple[str, str]], settings: Settings) -> bool:
+    c = settings.critic
+    if not c.enabled:
         return False
 
-    # Only run critic on ON-TASK calls (optimize costs)
+    # only run critic on ON-TASK calls (cost control)
     if p1_label != "ON-TASK":
         return False
 
-    if p1_conf <= CRITIC_TRIGGER_CONF_MAX:
+    if p1_conf <= c.trigger_conf_max:
         return True
 
-    if p1_off >= CRITIC_TRIGGER_OFF_MIN:
+    if p1_off >= c.trigger_off_min:
         return True
 
-    if CRITIC_TRIGGER_RISKY_KEYWORDS and _is_risky_context(events):
+    if c.trigger_risky_keywords and _is_risky_context(events, settings):
         return True
 
     return False
 
 
-def decide_with_critic(events_context: List[Tuple[str, str]], keystroke_summary: str = "") -> Dict[str, Any]:
+def decide_with_critic(
+    events_context,
+    keystroke_summary: str = "",
+    settings: Settings = DEFAULT_SETTINGS,
+) -> Dict[str, Any]:
+    # Primary
     p1_prompt = build_prompt(events_context, keystroke_summary)
-    p1_label, p1_reason, p1_off, p1_conf, _ = ask_gpt(p1_prompt, MODEL, max_tokens=60, temperature=0.0)
-
+    p1_label, p1_reason, p1_off, p1_conf, _ = ask_gpt(
+        p1_prompt,
+        settings.model,
+        max_tokens=60,
+        temperature=0.0,
+        off_threshold=settings.off_threshold,
+    )
     primary_res = {"label": p1_label, "reason": p1_reason or "", "off": p1_off, "conf": p1_conf}
+
+    def mk_ret(label, reason, off, conf, critic_ran, critic_res=None):
+        return {
+            "final_label": label,
+            "final_reason": reason,
+            "final_off": off,
+            "final_conf": conf,
+            "critic_ran": critic_ran,
+            "primary": primary_res,
+            "critic": critic_res,
+        }
+
+    if p1_label in ("[ERROR]", "[WARN]"):
+        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], False)
+
+    if not _should_run_critic(p1_label, p1_off, p1_conf, events_context, settings):
+        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], False)
+
+    # Critic
+    p1_summary = f"LABEL={p1_label} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
+    c_prompt = build_critic_prompt(events_context, p1_summary, keystroke_summary)
+
+    c_label, c_reason, c_off, c_conf, _ = ask_gpt(
+        c_prompt,
+        settings.critic_model(),
+        max_tokens=settings.critic.max_tokens,
+        temperature=settings.critic.temperature,
+        off_threshold=settings.off_threshold,
+    )
+    critic_res = {"label": c_label, "reason": c_reason or "", "off": c_off, "conf": c_conf}
+
+    if c_label in ("[ERROR]", "[WARN]"):
+        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)
+
+    critic_says_off = (c_label == "OFF-TASK") or (c_off >= settings.off_threshold)
+
+    if critic_says_off:
+        if settings.critic.vision_enabled:
+            print("[info] Disagreement: critic says OFF. Trying vision tiebreak...")
+            b64_img = take_screenshot_b64()
+            if b64_img:
+                v_label, v_reason, v_off, v_conf = ask_gpt_vision(
+                    b64_img,
+                    events_context,
+                    p1_reason,
+                    c_reason,
+                    model=settings.critic.vision_model,
+                    max_tokens=settings.critic.vision_max_tokens,
+                    off_threshold=settings.off_threshold,
+                )
+                if v_label not in ("[ERROR]", "[WARN]"):
+                    return mk_ret(v_label, f"[Vision] {v_reason}", v_off, v_conf, True, critic_res)
+
+        # fallback to critic (safer)
+        final_off = max(p1_off, c_off)
+        return mk_ret(
+            "OFF-TASK",
+            f"[Critic] {critic_res['reason'] or primary_res['reason']}",
+            final_off,
+            c_conf,
+            True,
+            critic_res,
+        )
+
+    # critic agrees ON-TASK
+    return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)

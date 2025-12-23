@@ -7,25 +7,16 @@ import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 
-from monitor.config import (
-    LOG_DIR,
-    KEY_LOG_DIR,
-    TRACE_WIN_PATH,
-    TRACE_KEY_PATH,
-    TRACE_SPEED,
-)
+from monitor.config import Settings, DEFAULT_SETTINGS
 
-# optional dependency for live key capture
 try:
     from pynput import keyboard
 except ImportError:
     keyboard = None
-    print("[warn] pynput not installed. KeyLogger disabled. pip install pynput")
+    print("[warn] pynput not installed. Live KeyLogger disabled. pip install pynput")
 
-
-# ===================== helpers =====================
 
 def _tail_lines(path: str, max_lines: int = 300) -> List[str]:
     try:
@@ -33,6 +24,7 @@ def _tail_lines(path: str, max_lines: int = 300) -> List[str]:
             return f.readlines()[-max_lines:]
     except Exception:
         return []
+
 
 def format_keys_as_text(keys: List[str]) -> str:
     out = []
@@ -49,8 +41,6 @@ def format_keys_as_text(keys: List[str]) -> str:
             out.append(f"[{k}]")
     return "".join(out)
 
-
-# ===================== KeyLogger (live mode) =====================
 
 class KeyLogger:
     def __init__(self, log_dir: str):
@@ -130,11 +120,6 @@ class KeyLogger:
             self.flush_thread.join(timeout=2.0)
 
 
-# ===================== Events: Live + Trace =====================
-
-def _todays_windows_log_path(now_dt: datetime) -> str:
-    return os.path.join(LOG_DIR, f"windows_{now_dt:%Y-%m-%d}.jsonl")
-
 def _read_last_events_file(path: str, limit: int) -> List[Tuple[str, str]]:
     events: List[Tuple[str, str]] = []
     if not os.path.exists(path):
@@ -180,9 +165,9 @@ def _load_trace(path: str) -> List[Tuple[datetime, str]]:
     return out
 
 
-def load_trace_data() -> TraceData:
-    win = _load_trace(TRACE_WIN_PATH)
-    keys = _load_trace(TRACE_KEY_PATH)
+def load_trace_data(settings: Settings) -> TraceData:
+    win = _load_trace(settings.trace.trace_win_path)
+    keys = _load_trace(settings.trace.trace_key_path)
     if not win and not keys:
         raise RuntimeError("Trace mode enabled but both trace files are missing/empty.")
     sim_start = min([x[0] for x in (win[:1] + keys[:1]) if x] or [datetime.now()])
@@ -193,55 +178,43 @@ def load_trace_data() -> TraceData:
 class TraceSession:
     trace: TraceData
     wall_start: float
-
-    @property
-    def sim_start(self) -> datetime:
-        return self.trace.sim_start
+    speed: float
 
     def now_dt(self) -> datetime:
-        elapsed = (time.time() - self.wall_start) * TRACE_SPEED
+        elapsed = (time.time() - self.wall_start) * self.speed
         return self.trace.sim_start + timedelta(seconds=elapsed)
 
 
 class EventSource:
     def now_dt(self) -> datetime: ...
-    def now_str(self) -> str: ...
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]: ...
 
 
 class LiveEventSource(EventSource):
+    def __init__(self, settings: Settings):
+        self.settings = settings
+
     def now_dt(self) -> datetime:
         return datetime.now()
 
-    def now_str(self) -> str:
-        return self.now_dt().strftime("%Y-%m-%d %H:%M:%S")
-
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
-        path = _todays_windows_log_path(now_dt)
+        path = os.path.join(self.settings.log_dir, f"windows_{now_dt:%Y-%m-%d}.jsonl")
         return _read_last_events_file(path, limit)
 
 
 class TraceEventSource(EventSource):
     def __init__(self, session: TraceSession):
         self.session = session
-
-    @property
-    def sim_start(self) -> datetime:
-        return self.session.sim_start
+        self.sim_start = session.trace.sim_start  # for printing
 
     def now_dt(self) -> datetime:
         return self.session.now_dt()
-
-    def now_str(self) -> str:
-        return self.now_dt().strftime("%Y-%m-%d %H:%M:%S")
 
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
         eligible = [x for x in self.session.trace.win if x[0] <= now_dt]
         tail = eligible[-limit:]
         return [(dt.strftime("%Y-%m-%d %H:%M:%S"), key) for dt, key in tail]
 
-
-# ===================== Keystrokes: Live + Trace =====================
 
 class KeystrokeSource:
     def start(self) -> None: ...
@@ -251,9 +224,10 @@ class KeystrokeSource:
 
 
 class LiveKeystrokeSource(KeystrokeSource):
-    def __init__(self, log_dir: str = KEY_LOG_DIR, enable_logger: bool = True):
-        self.log_dir = log_dir
-        self.logger = KeyLogger(log_dir) if enable_logger else None
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.log_dir = settings.keystrokes.key_log_dir
+        self.logger = KeyLogger(self.log_dir) if settings.keystrokes.enable_live_keylogger else None
 
     def start(self) -> None:
         if self.logger:
@@ -263,8 +237,8 @@ class LiveKeystrokeSource(KeystrokeSource):
         if self.logger:
             self.logger.stop()
 
-    def _path_for_day(self, now_dt: datetime) -> str:
-        return os.path.join(self.log_dir, f"keystrokes_{now_dt:%Y-%m-%d}.jsonl")
+    def _path_for_day(self, dt: datetime) -> str:
+        return os.path.join(self.log_dir, f"keystrokes_{dt:%Y-%m-%d}.jsonl")
 
     def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
         path = self._path_for_day(now_dt)
@@ -310,7 +284,6 @@ class LiveKeystrokeSource(KeystrokeSource):
                     keys_interval.append(rec.get("key", ""))
             except Exception:
                 continue
-
         return format_keys_as_text(keys_interval)
 
 
@@ -319,11 +292,9 @@ class TraceKeystrokeSource(KeystrokeSource):
         self.session = session
 
     def start(self) -> None:
-        # no-op
         return
 
     def stop(self) -> None:
-        # no-op
         return
 
     def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
@@ -339,15 +310,16 @@ class TraceKeystrokeSource(KeystrokeSource):
         return format_keys_as_text(keys)
 
 
-# ===================== factories =====================
+def make_sources(
+    use_trace: Optional[bool] = None,
+    settings: Settings = DEFAULT_SETTINGS,
+):
+    if use_trace is None:
+        use_trace = settings.trace.use_trace_file
 
-def make_sources(use_trace: bool):
-    """
-    Returns (event_source, keystroke_source)
-    """
     if use_trace:
-        trace = load_trace_data()
-        session = TraceSession(trace=trace, wall_start=time.time())
+        trace = load_trace_data(settings)
+        session = TraceSession(trace=trace, wall_start=time.time(), speed=settings.trace.trace_speed)
         return TraceEventSource(session), TraceKeystrokeSource(session)
 
-    return LiveEventSource(), LiveKeystrokeSource(KEY_LOG_DIR, enable_logger=True)
+    return LiveEventSource(settings), LiveKeystrokeSource(settings)

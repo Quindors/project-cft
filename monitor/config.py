@@ -1,54 +1,87 @@
-# focusmon/config.py
+# monitor/config.py
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass, field
+from typing import List, Optional
 
-# Logs / models
-LOG_DIR = r".\logs"
-MODEL = "gpt-4o-mini"
-INTERVAL_SEC = 3
-MAX_EVENTS = 4
 
-# OFF-TASK threshold
-OFF_THRESHOLD = 0.60
+@dataclass(frozen=True)
+class CriticSettings:
+    enabled: bool = True
+    model: Optional[str] = None  # None => use Settings.model
+    max_tokens: int = 90
+    temperature: float = 0.0
 
-# Critic pass
-CRITIC_ENABLED = True
-CRITIC_MODEL = MODEL
-CRITIC_MAX_TOKENS = 90
-CRITIC_TEMPERATURE = 0.0
+    trigger_conf_max: float = 0.70
+    trigger_off_min: float = 0.30
+    trigger_risky_keywords: bool = True
 
-CRITIC_TRIGGER_CONF_MAX = 0.70
-CRITIC_TRIGGER_OFF_MIN = 0.30
-CRITIC_TRIGGER_RISKY_KEYWORDS = True
+    # Vision tiebreaker
+    vision_enabled: bool = True
+    vision_model: str = "gpt-4o"
+    vision_max_tokens: int = 120
 
-RISKY_KEYWORDS = [
-    "youtube", "youtu.be", "reddit", "discord", "twitter", "x.com",
-    "instagram", "tiktok", "netflix", "twitch", "hulu", "prime video",
-    "steam", "epic games", "roblox", "minecraft",
-    "shopping", "amazon", "ebay", "aliexpress"
-]
 
-# Sheets
-SHEET_URL_OR_KEY = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
-WORKSHEET_PREFIX = "Focus Logs"
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
-]
-MAX_EVENT_COLS = 5
+@dataclass(frozen=True)
+class SheetsSettings:
+    sheet_url_or_key: str = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
+    worksheet_prefix: str = "Focus Logs"
+    scopes: List[str] = field(default_factory=lambda: [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ])
 
-# Write throttling
-APPEND_ONLY = False
-BATCH_FLUSH_MAX = 15
-IDLE_FLUSH_SEC = 15.0
-MAX_RETRIES = 6
-BACKOFF_BASE = 0.8
+    max_event_cols: int = 5
 
-# Keystrokes
-KEY_LOG_DIR = os.path.join(".", "logs")
-CAPTURE_TYPED_TEXT = True  # NOTE: logs actual typed chars (privacy risk)
+    # Write throttling/buffering
+    append_only: bool = False
+    batch_flush_max: int = 15
+    idle_flush_sec: float = 15.0
+    max_retries: int = 6
+    backoff_base: float = 0.8
 
-# Trace mode
-USE_TRACE_FILE = True
-TRACE_WIN_PATH = r"tests/traces/trace_win.jsonl"
-TRACE_KEY_PATH = r"tests/traces/trace_key.jsonl"
-TRACE_SPEED = 1.0
+
+@dataclass(frozen=True)
+class KeystrokeSettings:
+    key_log_dir: str = os.path.join(".", "logs")
+    capture_typed_text: bool = True
+    enable_live_keylogger: bool = True
+
+
+@dataclass(frozen=True)
+class TraceSettings:
+    use_trace_file: bool = True
+    trace_win_path: str = r"tests/traces/trace_win.jsonl"
+    trace_key_path: str = r"tests/traces/trace_key.jsonl"
+    trace_speed: float = 1.0
+
+
+@dataclass(frozen=True)
+class Settings:
+    # General
+    log_dir: str = r".\logs"
+    model: str = "gpt-4o-mini"
+    interval_sec: float = 3.0
+    max_events: int = 4
+
+    # OFF-TASK threshold
+    off_threshold: float = 0.60
+
+    risky_keywords: List[str] = field(default_factory=lambda: [
+        "youtube", "youtu.be", "reddit", "discord", "twitter", "x.com",
+        "instagram", "tiktok", "netflix", "twitch", "hulu", "prime video",
+        "steam", "epic games", "roblox", "minecraft",
+        "shopping", "amazon", "ebay", "aliexpress",
+    ])
+
+    critic: CriticSettings = field(default_factory=CriticSettings)
+    sheets: SheetsSettings = field(default_factory=SheetsSettings)
+    keystrokes: KeystrokeSettings = field(default_factory=KeystrokeSettings)
+    trace: TraceSettings = field(default_factory=TraceSettings)
+
+    def critic_model(self) -> str:
+        return self.critic.model or self.model
+
+
+DEFAULT_SETTINGS = Settings()
