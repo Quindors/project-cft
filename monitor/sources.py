@@ -215,6 +215,9 @@ class TraceEventSource(EventSource):
         tail = eligible[-limit:]
         return [(dt.strftime("%Y-%m-%d %H:%M:%S"), key) for dt, key in tail]
 
+    def event_times(self):
+        return sorted({dt for (dt, _key) in self.session.trace.win})
+
 
 class KeystrokeSource:
     def start(self) -> None: ...

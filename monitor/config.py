@@ -5,6 +5,11 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+@dataclass(frozen=True)
+class AlertSettings:
+    enabled: bool = True
+    repeat_while_offtask: bool = True
+    cooldown_sec: float = 5.0   # re-alert every 5s while OFF-TASK
 
 @dataclass(frozen=True)
 class CriticSettings:
@@ -55,7 +60,9 @@ class TraceSettings:
     trace_win_path: str = r"tests/traces/trace_win.jsonl"
     trace_key_path: str = r"tests/traces/trace_key.jsonl"
     trace_speed: float = 1.0
-
+    # NEW:
+    upload_to_sheets: bool = False     # testing mode: don't write to sheets
+    replay_realtime: bool = False      # False = run as fast as possible; True = sleep by trace gaps/trace_speed
 
 @dataclass(frozen=True)
 class Settings:
@@ -79,9 +86,16 @@ class Settings:
     sheets: SheetsSettings = field(default_factory=SheetsSettings)
     keystrokes: KeystrokeSettings = field(default_factory=KeystrokeSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
+    alerts: AlertSettings = field(default_factory=AlertSettings)
 
     def critic_model(self) -> str:
         return self.critic.model or self.model
 
 
-DEFAULT_SETTINGS = Settings()
+DEFAULT_SETTINGS = Settings(
+    trace=TraceSettings(
+        use_trace_file=True,
+        upload_to_sheets=False,
+        replay_realtime=False,
+    ),
+)

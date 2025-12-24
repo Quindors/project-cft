@@ -29,6 +29,26 @@ def _col_letter(n: int) -> str:
     return s
 
 
+class NullSink:
+    """
+    No-op sink used in testing/trace mode to guarantee nothing is uploaded.
+    """
+    ws_title = "(testing mode — no sheets)"
+    existing_rows_tracked = 0
+
+    def ensure_day(self, day):
+        return
+
+    def enqueue_record(self, record):
+        return
+
+    def flush_if_needed(self):
+        return None
+
+    def close(self):
+        return
+
+
 class SheetsSink:
     def __init__(self, service_account_json_path: str, settings: Settings = DEFAULT_SETTINGS):
         self.settings = settings

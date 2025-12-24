@@ -1,12 +1,8 @@
 # monitor/decider.py
 from __future__ import annotations
 
-import base64
-import io
-import re
+import base64, io, re, openai
 from typing import List, Tuple, Dict, Any, Optional
-
-import openai
 
 from monitor.config import Settings, DEFAULT_SETTINGS
 
