@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-tracing = True
+tracing = False
 
 @dataclass(frozen=True)
 class AlertSettings:
