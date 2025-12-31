@@ -1,6 +1,5 @@
 # Todo
 ## fine tuning
-- change keystrokes input to be the whole window of keys instead of individual events
 - add abstaining which triggers the critic
 (next session)
 - Sliding Window Sizes:

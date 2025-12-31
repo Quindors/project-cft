@@ -23,9 +23,8 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
 
     testing_mode = settings.trace.use_trace_file
     
-    #popup_fn = _noop_popup if testing_mode else show_popup
-    popup_fn = show_popup
-
+    popup_fn = _noop_popup if testing_mode else show_popup
+    
     # ✅ choose sink based on trace/testing settings
     if settings.trace.use_trace_file and not settings.trace.upload_to_sheets:
         sink = NullSink()
