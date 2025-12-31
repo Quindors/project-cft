@@ -21,9 +21,6 @@
 ## devops
 - start hosting it
 - run script automatically
-- hosting the dashboard
-- check dashboard accuracy
-- weekly report
 
 ## analytics
 - check dashboard accuracy
