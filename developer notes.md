@@ -1,9 +1,23 @@
 # Todo
 ## fine tuning
-- add ability of self-correction (fine tuning loop) <<<<<
-    - automatically update prompt with new rules based on feedback
 - change keystrokes input to be the whole window of keys instead of individual events
 - add abstaining which triggers the critic
+(next session)
+- Sliding Window Sizes:
+    - Micro-context (last 30 sec): Immediate activity
+    - Meso-context (last 3 min): Current task
+    - Macro-context (last 15 min): Session trajectory
+- Instead of binary ON/OFF, use multi-factor scoring:
+    - Window relevance:      0.7  (math-related)
+    - Dwell time:            -0.3 (too long without returning)
+    - Keystroke activity:    -0.4 (minimal typing)
+    - Trajectory:            -0.5 (drifting away from homework)
+    - Historical pattern:    -0.2 (user has 70% accuracy on similar)
+    - AGGREGATE SCORE: -0.7 → OFF-TASK (confidence: 0.85)
+- prompt mutation strategy:
+    - Don't just append rules (prompt bloat)
+    - Identify conflicting patterns and rewrite sections
+    - Example: If system thinks "low typing = focused reading" but mistakes show "low typing = passive consumption", update that heuristic
 
 ## devops
 - start hosting it
