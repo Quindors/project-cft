@@ -1,6 +1,6 @@
 # Todo
 ## fine tuning
-- add abstaining which triggers the critic
+- ~~add abstaining which triggers the critic~~ ✓
 (next session)
 - Sliding Window Sizes:
     - Micro-context (last 30 sec): Immediate activity

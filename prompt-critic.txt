@@ -10,4 +10,4 @@ Initial model summary: [insert here]
 Output (strict, single line):
   LABEL=<ON-TASK or OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<short explanation>
 
-Recent activity (oldest → newest): [insert here]
+Recent activity (oldest -> newest): [insert here]

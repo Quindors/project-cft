@@ -63,17 +63,35 @@ def build_critic_prompt(events: List[Tuple[str, str]], p1_summary: str, keystrok
 def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float, float]:
     content = (content or "").strip()
 
-    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK)", content, flags=re.I)
-    label = (
-        m_label.group(1).upper()
-        if m_label
-        else ("OFF-TASK" if "OFF-TASK" in content.upper() else "ON-TASK" if "ON-TASK" in content.upper() else "[WARN]")
-    )
+    # Match ON-TASK, OFF-TASK, or ABSTAIN
+    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK|ABSTAIN)", content, flags=re.I)
+    if m_label:
+        label = m_label.group(1).upper()
+    else:
+        # Fallback parsing
+        upper = content.upper()
+        if "ABSTAIN" in upper:
+            label = "ABSTAIN"
+        elif "OFF-TASK" in upper:
+            label = "OFF-TASK"
+        elif "ON-TASK" in upper:
+            label = "ON-TASK"
+        else:
+            label = "[WARN]"
 
     m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
     m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
 
-    off_score = float(m_off.group(1)) if m_off else (0.8 if label == "OFF-TASK" else 0.2)
+    # Default OFF_SCORE: 0.5 for ABSTAIN (uncertain), 0.8 for OFF, 0.2 for ON
+    if m_off:
+        off_score = float(m_off.group(1))
+    elif label == "OFF-TASK":
+        off_score = 0.8
+    elif label == "ABSTAIN":
+        off_score = 0.5
+    else:
+        off_score = 0.2
+
     conf = float(m_conf.group(1)) if m_conf else 0.5
 
     off_score = min(max(off_score, 0.0), 1.0)
@@ -82,7 +100,7 @@ def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float
     m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
     reason = m_reason.group(1).strip() if m_reason else ""
 
-    # FN-biased normalization
+    # FN-biased normalization (only for definitive OFF-TASK)
     if label == "OFF-TASK" and off_score < off_threshold:
         off_score = off_threshold
 
@@ -179,10 +197,15 @@ def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: Lis
     if not c.enabled:
         return False
 
-    # only run critic on ON-TASK calls (cost control)
-    if p1_label != "ON-TASK":
+    # Always run critic when main model abstains
+    if p1_label == "ABSTAIN":
+        return True
+
+    # Only run critic on ON-TASK calls (cost control) - skip definitive OFF-TASK
+    if p1_label == "OFF-TASK":
         return False
 
+    # ON-TASK with low confidence or high OFF_SCORE
     if p1_conf <= c.trigger_conf_max:
         return True
 

@@ -9,10 +9,11 @@ Potentially distractive apps or titles include (non-exhaustive): Discord, YouTub
 Rules (intent-based):
 1) If the title clearly shows *work or learning intent*, treat as ON-TASK.
 2) Use surrounding context (last few events) for tie-breaks.
-3) Ambiguity rule: prefer ON-TASK if context suggests work.
+3) If evidence is genuinely ambiguous or mixed, output ABSTAIN — do not guess.
 4) Weigh most recent windows higher.
+5) Only use ON-TASK or OFF-TASK when you are reasonably confident.
 
 Output (strict, single line):
-  LABEL=<ON-TASK or OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<short explanation if OFF-TASK, else brief note>
+  LABEL=<ON-TASK or OFF-TASK or ABSTAIN> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<short explanation>
 
-Recent activity (oldest → newest):
+Recent activity (oldest -> newest): [insert here]
