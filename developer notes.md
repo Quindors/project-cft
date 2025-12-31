@@ -1,15 +1,25 @@
 # Todo
-- start hosting it
-- expand inputs
-    - consider screenshots?
-- run script automatically
-- have the popup actually pop up on the front of the screen
-- have the popup auto-close after 3 seconds
-- increase startup speed of monitor-sheets.py
+## fine tuning
 - add ability of self-correction (fine tuning loop) <<<<<
+    - automatically update prompt with new rules based on feedback
+- change keystrokes input to be the whole window of keys instead of individual events
+- add abstaining which triggers the critic
+
+## devops
+- start hosting it
+- run script automatically
 - hosting the dashboard
 - check dashboard accuracy
 - weekly report
+
+## analytics
+- check dashboard accuracy
+- weekly report
+
+## bugs/improvements
+- have the popup actually pop up on the front of the screen
+- have the popup auto-close after 3 seconds
+- increase startup speed of monitor-sheets.py
 
 ## 12/15
 Abstain as a first-class outcome: reliability increases massively when the system is allowed to say “UNKNOWN / NEEDS REVIEW” instead of guessing.
