@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+tracing = True
+
 @dataclass(frozen=True)
 class AlertSettings:
     enabled: bool = True
@@ -94,8 +96,8 @@ class Settings:
 
 DEFAULT_SETTINGS = Settings(
     trace=TraceSettings(
-        use_trace_file=True,
-        upload_to_sheets=False,
-        replay_realtime=False,
+        use_trace_file=tracing,
+        upload_to_sheets=not tracing,
+        replay_realtime=not tracing,
     ),
 )
