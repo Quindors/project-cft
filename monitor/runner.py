@@ -1,6 +1,8 @@
 # monitor/runner.py
 from __future__ import annotations
 
+import os
+import json
 import time
 from typing import Optional, Callable, Any, List
 from datetime import datetime
@@ -13,6 +15,40 @@ def _is_testing_mode(settings) -> bool:
     # Treat trace replay as testing mode (and/or add a dedicated flag later)
     return bool(getattr(settings, "trace", None) and settings.trace.use_trace_file)
 
+
+def _save_results_to_file(results: List[dict], settings: Settings) -> None:
+    """Save testing results to a file in the results folder."""
+    results_dir = os.path.join(os.path.dirname(settings.log_dir), "tests/results")
+    os.makedirs(results_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"test_results_{timestamp}.jsonl"
+    filepath = os.path.join(results_dir, filename)
+    
+    with open(filepath, "w", encoding="utf-8") as f:
+        for result in results:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    
+    # Also create a summary file
+    summary_file = os.path.join(results_dir, f"test_summary_{timestamp}.txt")
+    off_task_count = sum(1 for r in results if r["label"] == "OFF-TASK")
+    abstain_count = sum(1 for r in results if r["label"] == "ABSTAIN")
+    on_task_count = sum(1 for r in results if r["label"] == "ON-TASK")
+    
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write(f"Test Results Summary\n")
+        f.write(f"{'='*50}\n")
+        f.write(f"Total decisions: {len(results)}\n")
+        f.write(f"ON-TASK:  {on_task_count} ({on_task_count/len(results)*100:.1f}%)\n")
+        f.write(f"OFF-TASK: {off_task_count} ({off_task_count/len(results)*100:.1f}%)\n")
+        f.write(f"ABSTAIN:  {abstain_count} ({abstain_count/len(results)*100:.1f}%)\n")
+        f.write(f"\nDetailed results saved to: {filename}\n")
+    
+    print(f"[info] Results saved to {results_dir}/")
+    print(f"       - {filename} (detailed)")
+    print(f"       - {os.path.basename(summary_file)} (summary)")
+
+
 def _run_one_tick(
     *,
     now_dt: datetime,
@@ -22,10 +58,11 @@ def _run_one_tick(
     show_popup: Callable[[str, str], None],
     settings: Settings,
     state: dict,
-) -> None:
+) -> Optional[dict]:
     """
     Shared logic for one evaluation tick at a given now_dt.
     Uses `state` to persist cursors/signatures across ticks.
+    Returns decision info for results tracking (only in testing mode).
     """
 
     ts_now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -51,6 +88,7 @@ def _run_one_tick(
 
     decision_raw = "[idle]"
     reason = "no new events"
+    decision_info = None  # For results tracking
 
     current_state: str = state["current_state"]
 
@@ -82,6 +120,18 @@ def _run_one_tick(
         reason_str = (reason or "").strip()
         if testing_mode and not reason_str:
             reason_str = "(no reason returned)"
+
+        # Create decision info for results tracking
+        if testing_mode and (current_state in ["OFF-TASK", "ABSTAIN"] or label == "ABSTAIN"):
+            decision_info = {
+                "timestamp": ts_now_str,
+                "label": label if label == "ABSTAIN" else current_state,
+                "off_score": off_val,
+                "confidence": conf_val,
+                "reason": reason_str,
+                "critic_ran": critic_ran,
+                "events": [key for _, key in events_context],
+            }
 
         if prev_state == "ON-TASK" and current_state == "OFF-TASK":
             show_popup("You're drifting OFF-TASK!\n" + (reason_str or ""), "Productivity Alert")
@@ -142,6 +192,8 @@ def _run_one_tick(
     if res:
         print(f"[flush] updated={res.updated} appended={res.appended} (sent {res.sent})")
 
+    return decision_info
+
 
 def _trace_event_times(event_src: Any) -> List[datetime]:
     """
@@ -192,8 +244,11 @@ def run_monitor_loop(
         # start typed-text cursor at the first event time
         state["last_logged_dt"] = times[0]
 
+        # Track results for testing mode
+        results: List[dict] = []
+
         for now_dt in times:
-            _run_one_tick(
+            decision_info = _run_one_tick(
                 now_dt=now_dt,
                 event_src=event_src,
                 key_src=key_src,
@@ -202,10 +257,23 @@ def run_monitor_loop(
                 settings=settings,
                 state=state,
             )
+            
+            # Collect results for OFF-TASK and ABSTAIN decisions
+            if decision_info:
+                results.append(decision_info)
 
         print("[info] trace replay complete.")
+        
+        # Save results to file
+        if results:
+            _save_results_to_file(results, settings)
+            print(f"[info] Tracked {len(results)} OFF-TASK/ABSTAIN decisions")
+        else:
+            print("[info] No OFF-TASK or ABSTAIN decisions recorded")
+        
         return
 
+    # Live mode (non-trace)
     while True:
         loop_start = time.time()
         now_dt = event_src.now_dt()

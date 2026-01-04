@@ -1,0 +1,8 @@
+Test Results Summary
+==================================================
+Total decisions: 8
+ON-TASK:  0 (0.0%)
+OFF-TASK: 8 (100.0%)
+ABSTAIN:  0 (0.0%)
+
+Detailed results saved to: test_results_20260103_155222.jsonl
