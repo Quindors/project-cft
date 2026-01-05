@@ -31,6 +31,10 @@
 - have the popup auto-close after 3 seconds
 - increase startup speed of monitor-sheets.py
 
+## how can I maintain user privacy when recording data to fine tune the model?
+- maybe find some real-world products that counter the privacy issue that use a similar ai format to my project
+- probably just like conceptual things that i can implement, like password redaction or smth
+
 ## 12/15
 Abstain as a first-class outcome: reliability increases massively when the system is allowed to say “UNKNOWN / NEEDS REVIEW” instead of guessing.
 3) Two-pass verification (LLM judge + LLM auditor)

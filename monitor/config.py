@@ -39,7 +39,7 @@ class SheetsSettings:
         "https://www.googleapis.com/auth/drive.readonly",
     ])
 
-    max_event_cols: int = 5
+    max_event_cols: int = 10
 
     # Write throttling/buffering
     append_only: bool = False
@@ -72,7 +72,7 @@ class Settings:
     log_dir: str = r".\logs"
     model: str = "gpt-4o-mini"
     interval_sec: float = 3.0
-    max_events: int = 4
+    max_events: int = 10
 
     # OFF-TASK threshold
     off_threshold: float = 0.60
