@@ -86,6 +86,13 @@ class SheetsSink:
             "primary_reason",
             "critic_confidence",
             "critic_reason",
+            # NEW: Factor score columns
+            "factor_window_relevance",
+            "factor_dwell_time",
+            "factor_keystroke",
+            "factor_trajectory",
+            "factor_risky",
+            # Human feedback
             "human_label",
             "human_reason",
             "typed_text",
@@ -165,6 +172,13 @@ class SheetsSink:
             get("primary_reason"),
             get("critic_confidence"),
             get("critic_reason"),
+            # NEW: Factor scores
+            get("factor_window_relevance"),
+            get("factor_dwell_time"),
+            get("factor_keystroke"),
+            get("factor_trajectory"),
+            get("factor_risky"),
+            # Human feedback
             "",  # human_label
             "",  # human_reason
             get("typed_text"),

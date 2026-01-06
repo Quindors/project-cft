@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64, io, re, openai
 from typing import List, Tuple, Dict, Any, Optional
+from datetime import datetime, timedelta
 
 from monitor.config import Settings, DEFAULT_SETTINGS
 
@@ -13,7 +14,458 @@ except ImportError:
     print("[warn] Pillow not installed. Vision tiebreaker disabled. pip install Pillow")
 
 
-# ------------------ prompts ------------------
+# ==================== NEW: FACTOR COMPUTATION ====================
+
+def compute_factor_scores(
+    events_context: List[Tuple[str, str]],
+    keystroke_summary: str,
+    settings: Settings,
+    window_dwell_info: Optional[Dict[str, Any]] = None
+) -> Dict[str, float]:
+    """
+    Compute individual factor scores for composite decision.
+    All scores are in range [-1, 1] where:
+      - Positive = ON-TASK signal
+      - Negative = OFF-TASK signal
+      - 0 = Neutral
+    
+    Args:
+        events_context: List of (timestamp, window_title) tuples
+        keystroke_summary: Summary of recent keystroke activity
+        settings: Configuration settings
+        window_dwell_info: Optional dict with dwell time tracking
+    
+    Returns:
+        Dict of factor_name -> score
+    """
+    factors = {}
+    
+    # Factor 1: Window Relevance
+    factors["window_relevance"] = _compute_window_relevance(events_context, settings)
+    
+    # Factor 2: Dwell Time (requires temporal context)
+    if window_dwell_info:
+        factors["dwell_time"] = _compute_dwell_factor(events_context, window_dwell_info)
+    else:
+        factors["dwell_time"] = 0.0
+    
+    # Factor 3: Keystroke Activity
+    factors["keystroke_activity"] = _compute_keystroke_factor(keystroke_summary)
+    
+    # Factor 4: Trajectory
+    factors["trajectory"] = _compute_trajectory_factor(events_context, settings)
+    
+    # Factor 5: Risky Keywords
+    factors["risky_keywords"] = _compute_risky_keyword_factor(events_context, settings)
+    
+    return factors
+
+
+def _compute_window_relevance(
+    events_context: List[Tuple[str, str]],
+    settings: Settings
+) -> float:
+    """
+    Score based on how task-related the window titles are.
+    
+    Returns:
+        +0.8 to +1.0: Highly productive apps (IDE, docs, homework)
+        +0.3 to +0.5: Neutral/ambiguous (browser, general tools)
+        -0.5 to -1.0: Clearly distractive apps
+    """
+    if not events_context:
+        return 0.0
+    
+    # Categorize windows
+    productive_keywords = [
+        "visual studio code", "vs code", "pycharm", "intellij",
+        "onenote", "notion", "homework", "assignment",
+        "terminal", "cmd", "powershell",
+        "pdf", "acrobat", "chapter",
+        "google sheets", "excel", "spreadsheet",
+        "documentation", "docs", "reference"
+    ]
+    
+    neutral_keywords = [
+        "chrome", "firefox", "edge", "browser",
+        "new tab", "search"
+    ]
+    
+    # settings.risky_keywords already defined as distractive
+    
+    scores = []
+    for _, key in events_context:
+        key_lower = key.lower()
+        
+        # Check productive patterns
+        if any(kw in key_lower for kw in productive_keywords):
+            scores.append(0.9)
+        # Check distractive patterns
+        elif any(kw in key_lower for kw in settings.risky_keywords):
+            scores.append(-0.9)
+        # Check neutral
+        elif any(kw in key_lower for kw in neutral_keywords):
+            scores.append(0.2)  # Slight positive (could be research)
+        # Unknown/ambiguous
+        else:
+            # Check for educational keywords
+            if any(word in key_lower for word in ["khan", "wolfram", "desmos", "wikipedia", "learn", "tutorial"]):
+                scores.append(0.6)
+            else:
+                scores.append(0.0)
+    
+    # Weight recent windows more heavily
+    if len(scores) > 1:
+        weights = [0.5 ** (len(scores) - 1 - i) for i in range(len(scores))]
+        weight_sum = sum(weights)
+        weighted_avg = sum(s * w for s, w in zip(scores, weights)) / weight_sum
+        return weighted_avg
+    
+    return scores[0] if scores else 0.0
+
+
+def _compute_dwell_factor(
+    events_context: List[Tuple[str, str]],
+    window_dwell_info: Dict[str, Any]
+) -> float:
+    """
+    Score based on how long the user has been on current window.
+    
+    Dwell patterns:
+        - 0-2 min: Neutral (0.0)
+        - 2-5 min with high activity: Positive (+0.3 to +0.5)
+        - 2-5 min with low activity: Slightly negative (-0.2)
+        - 5-10 min with low activity: Negative (-0.5)
+        - 10+ min with low activity: Very negative (-0.8) [rabbit hole]
+    
+    Returns:
+        Score in [-1, 1]
+    """
+    if not events_context:
+        return 0.0
+    
+    # Get most recent window
+    _, current_window = events_context[-1]
+    
+    # Get dwell info
+    dwell_seconds = window_dwell_info.get("current_dwell_seconds", 0)
+    recent_keystroke_count = window_dwell_info.get("recent_keystroke_count", 0)
+    
+    # Compute activity level (keystrokes per minute)
+    dwell_minutes = dwell_seconds / 60.0
+    kpm = recent_keystroke_count / dwell_minutes if dwell_minutes > 0 else 0
+    
+    # Scoring logic
+    if dwell_minutes < 2:
+        return 0.0  # Too early to judge
+    elif dwell_minutes < 5:
+        if kpm > 30:  # Active work
+            return 0.4
+        elif kpm > 10:  # Some activity
+            return 0.1
+        else:  # Passive
+            return -0.2
+    elif dwell_minutes < 10:
+        if kpm > 20:  # Sustained work
+            return 0.5
+        elif kpm > 5:  # Some work
+            return 0.0
+        else:  # Likely distracted
+            return -0.5
+    else:  # 10+ minutes
+        if kpm > 15:  # Deep work
+            return 0.6
+        else:  # Rabbit hole / passive consumption
+            return -0.8
+    
+    return 0.0
+
+
+def _compute_keystroke_factor(keystroke_summary: str) -> float:
+    """
+    Score based on keystroke activity patterns.
+    
+    Indicators:
+        - High KPM (>60): +0.7
+        - Moderate KPM (20-60): +0.3
+        - Low KPM (<20): -0.3
+        - Idle (0 keys): -0.6
+        - Special keys (Ctrl+S, etc): +0.2 bonus
+    
+    Returns:
+        Score in [-1, 1]
+    """
+    if not keystroke_summary or "Idle" in keystroke_summary:
+        return -0.6
+    
+    # Parse keystroke count from summary
+    # Expected format: "45 keys typed. Special: [Key.ctrl, Key.enter]"
+    try:
+        count_match = re.search(r"(\d+)\s+keys", keystroke_summary)
+        if not count_match:
+            return 0.0
+        
+        count = int(count_match.group(1))
+        
+        # Assume 60-second window (per keystroke_summary in sources.py)
+        kpm = count
+        
+        # Base score from KPM
+        if kpm > 60:
+            score = 0.7
+        elif kpm > 40:
+            score = 0.5
+        elif kpm > 20:
+            score = 0.3
+        elif kpm > 10:
+            score = 0.0
+        elif kpm > 5:
+            score = -0.2
+        else:
+            score = -0.4
+        
+        # Bonus for productive special keys
+        productive_keys = ["ctrl", "alt", "tab", "enter", "backspace"]
+        if any(key in keystroke_summary.lower() for key in productive_keys):
+            score += 0.2
+        
+        # Cap at 1.0
+        return min(1.0, score)
+    
+    except Exception:
+        return 0.0
+
+
+def _compute_trajectory_factor(
+    events_context: List[Tuple[str, str]],
+    settings: Settings
+) -> float:
+    """
+    Analyze sequence direction to detect drift patterns.
+    
+    Patterns:
+        - Work → Docs → Work: +0.7 (productive loop)
+        - Work → Neutral → Work: +0.3 (brief check)
+        - Work → Distraction (single): -0.2 (quick check)
+        - Work → Distraction → Distraction: -0.7 (drift)
+        - Distraction → Distraction → Distraction: -0.9 (deep off-task)
+        - Work → Educational → Educational: +0.4 (research, but watch for drift)
+    
+    Returns:
+        Score in [-1, 1]
+    """
+    if len(events_context) < 2:
+        return 0.0
+    
+    # Categorize each window
+    categories = []
+    for _, key in events_context:
+        key_lower = key.lower()
+        
+        # Productive work
+        if any(kw in key_lower for kw in ["vs code", "visual studio", "terminal", "cmd", "homework", "assignment", "onenote"]):
+            categories.append("WORK")
+        # Educational (could be productive or rabbit hole)
+        elif any(kw in key_lower for kw in ["khan", "wolfram", "desmos", "wikipedia", "tutorial", "documentation"]):
+            categories.append("EDUCATIONAL")
+        # Clear distraction
+        elif any(kw in key_lower for kw in settings.risky_keywords):
+            categories.append("DISTRACTION")
+        # Neutral
+        else:
+            categories.append("NEUTRAL")
+    
+    # Pattern analysis (last 3-4 windows)
+    recent = categories[-min(4, len(categories)):]
+    
+    # Count consecutive patterns
+    work_count = recent.count("WORK")
+    distraction_count = recent.count("DISTRACTION")
+    educational_count = recent.count("EDUCATIONAL")
+    
+    # Detect patterns
+    if len(recent) >= 3:
+        # Deep distraction: 3+ consecutive distractions
+        if distraction_count >= 3:
+            return -0.9
+        
+        # Drift pattern: WORK → EDUCATIONAL → EDUCATIONAL → (no return)
+        if recent[0] == "WORK" and educational_count >= 2 and recent[-1] != "WORK":
+            return -0.5  # Possible rabbit hole
+        
+        # Drift to distraction: WORK → X → DISTRACTION → DISTRACTION
+        if recent[0] == "WORK" and distraction_count >= 2:
+            return -0.7
+        
+        # Productive loop: WORK appears at start and end
+        if recent[0] == "WORK" and recent[-1] == "WORK":
+            return 0.7
+        
+        # Research pattern: WORK → EDUCATIONAL → WORK
+        if "WORK" in recent and "EDUCATIONAL" in recent and recent[-1] == "WORK":
+            return 0.5
+    
+    # Single distraction among work
+    if work_count >= 2 and distraction_count == 1:
+        return -0.2  # Quick check, not too bad
+    
+    # Sustained work
+    if work_count >= len(recent) * 0.6:
+        return 0.6
+    
+    # Mostly distractions
+    if distraction_count >= len(recent) * 0.5:
+        return -0.6
+    
+    # Mixed/unclear
+    return 0.0
+
+
+def _compute_risky_keyword_factor(
+    events_context: List[Tuple[str, str]],
+    settings: Settings
+) -> float:
+    """
+    Direct check for known distractive sites/apps.
+    
+    Returns:
+        -0.9: Multiple risky keywords
+        -0.7: Single risky keyword in recent window
+        0.0: No risky keywords
+    """
+    if not events_context:
+        return 0.0
+    
+    # Check last 3 windows
+    recent = events_context[-min(3, len(events_context)):]
+    
+    risky_count = 0
+    for _, key in recent:
+        key_lower = key.lower()
+        if any(kw in key_lower for kw in settings.risky_keywords):
+            risky_count += 1
+    
+    if risky_count >= 2:
+        return -0.9
+    elif risky_count == 1:
+        return -0.7
+    else:
+        return 0.0
+
+
+# ==================== MODIFIED: PARSING ====================
+
+def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float, float, Dict[str, float]]:
+    """
+    Parse LLM response including optional factor scores.
+    
+    Returns:
+        (label, reason, off_score, conf, factors_dict)
+    """
+    content = (content or "").strip()
+
+    # Match ON-TASK, OFF-TASK, or ABSTAIN
+    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK|ABSTAIN)", content, flags=re.I)
+    if m_label:
+        label = m_label.group(1).upper()
+    else:
+        # Fallback parsing
+        upper = content.upper()
+        if "ABSTAIN" in upper:
+            label = "ABSTAIN"
+        elif "OFF-TASK" in upper:
+            label = "OFF-TASK"
+        elif "ON-TASK" in upper:
+            label = "ON-TASK"
+        else:
+            label = "[WARN]"
+
+    m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
+    m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
+
+    # Default OFF_SCORE
+    if m_off:
+        off_score = float(m_off.group(1))
+    elif label == "OFF-TASK":
+        off_score = 0.8
+    elif label == "ABSTAIN":
+        off_score = 0.5
+    else:
+        off_score = 0.2
+
+    conf = float(m_conf.group(1)) if m_conf else 0.5
+
+    off_score = min(max(off_score, 0.0), 1.0)
+    conf = min(max(conf, 0.0), 1.0)
+
+    m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
+    reason = m_reason.group(1).strip() if m_reason else ""
+
+    # FN-biased normalization
+    if label == "OFF-TASK" and off_score < off_threshold:
+        off_score = off_threshold
+
+    # NEW: Extract optional factor scores from LLM
+    factors = {}
+    factor_names = [
+        "WINDOW_RELEVANCE",
+        "TYPING_ENGAGEMENT", 
+        "CONTEXT_TRAJECTORY",
+        "DWELL_PENALTY",
+    ]
+    
+    for factor_name in factor_names:
+        # Match formats like: WINDOW_RELEVANCE=0.8 or WINDOW_RELEVANCE = -0.3
+        m = re.search(rf"{factor_name}\s*=\s*([-+]?[01](?:\.\d+)?|[-+]?\.\d+)", content, flags=re.I)
+        if m:
+            try:
+                score = float(m.group(1))
+                # Clamp to [-1, 1]
+                score = min(max(score, -1.0), 1.0)
+                factors[factor_name.lower()] = score
+            except ValueError:
+                pass
+
+    return label, reason, off_score, conf, factors
+
+
+# ==================== MODIFIED: ASK GPT ====================
+
+def ask_gpt(
+    prompt: str,
+    model: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    off_threshold: float,
+) -> Tuple[str, str, float, float, Dict[str, float], str]:
+    """
+    Modified to return factors dict.
+    
+    Returns:
+        (label, reason, off_score, conf, factors, raw_content)
+    """
+    try:
+        resp = openai.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        content = (resp.choices[0].message.content or "").strip()
+        label, reason, off_score, conf, factors = _parse_llm_line(content, off_threshold)
+        return label, reason, off_score, conf, factors, content
+    except Exception as e:
+        return "[ERROR]", str(e), 0.5, 0.5, {}, ""
+
+
+# ==================== REST OF FILE UNCHANGED ====================
+# (Keep all existing functions: build_prompt, build_critic_prompt, 
+#  take_screenshot_b64, ask_gpt_vision, _is_risky_context, 
+#  _should_run_critic, decide_with_critic)
+
+# ... (copy remaining functions from your current decider.py) ...
+
 
 def _read_prompt_file(filename: str) -> str:
     try:
@@ -57,79 +509,6 @@ def build_critic_prompt(events: List[Tuple[str, str]], p1_summary: str, keystrok
         template += f"\n\nInitial: {p1_summary}\nActivity: {activity_str}{extra}"
     return template
 
-
-# ------------------ parsing + calls ------------------
-
-def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float, float]:
-    content = (content or "").strip()
-
-    # Match ON-TASK, OFF-TASK, or ABSTAIN
-    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK|ABSTAIN)", content, flags=re.I)
-    if m_label:
-        label = m_label.group(1).upper()
-    else:
-        # Fallback parsing
-        upper = content.upper()
-        if "ABSTAIN" in upper:
-            label = "ABSTAIN"
-        elif "OFF-TASK" in upper:
-            label = "OFF-TASK"
-        elif "ON-TASK" in upper:
-            label = "ON-TASK"
-        else:
-            label = "[WARN]"
-
-    m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
-    m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
-
-    # Default OFF_SCORE: 0.5 for ABSTAIN (uncertain), 0.8 for OFF, 0.2 for ON
-    if m_off:
-        off_score = float(m_off.group(1))
-    elif label == "OFF-TASK":
-        off_score = 0.8
-    elif label == "ABSTAIN":
-        off_score = 0.5
-    else:
-        off_score = 0.2
-
-    conf = float(m_conf.group(1)) if m_conf else 0.5
-
-    off_score = min(max(off_score, 0.0), 1.0)
-    conf = min(max(conf, 0.0), 1.0)
-
-    m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
-    reason = m_reason.group(1).strip() if m_reason else ""
-
-    # FN-biased normalization (only for definitive OFF-TASK)
-    if label == "OFF-TASK" and off_score < off_threshold:
-        off_score = off_threshold
-
-    return label, reason, off_score, conf
-
-
-def ask_gpt(
-    prompt: str,
-    model: str,
-    *,
-    max_tokens: int,
-    temperature: float,
-    off_threshold: float,
-) -> Tuple[str, str, float, float, str]:
-    try:
-        resp = openai.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf = _parse_llm_line(content, off_threshold)
-        return label, reason, off_score, conf, content
-    except Exception as e:
-        return "[ERROR]", str(e), 0.5, 0.5, ""
-
-
-# ------------------ vision tiebreak ------------------
 
 def take_screenshot_b64() -> Optional[str]:
     if not ImageGrab:
@@ -179,13 +558,11 @@ def ask_gpt_vision(
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf = _parse_llm_line(content, off_threshold)
+        label, reason, off_score, conf, _ = _parse_llm_line(content, off_threshold)
         return label, reason, off_score, conf
     except Exception as e:
         return "[ERROR]", str(e), 0.5, 0.5
 
-
-# ------------------ critic logic ------------------
 
 def _is_risky_context(events: List[Tuple[str, str]], settings: Settings) -> bool:
     text = " ".join([k for _, k in events]).lower()
@@ -197,15 +574,12 @@ def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: Lis
     if not c.enabled:
         return False
 
-    # Always run critic when main model abstains
     if p1_label == "ABSTAIN":
         return True
 
-    # Only run critic on ON-TASK calls (cost control) - skip definitive OFF-TASK
     if p1_label == "OFF-TASK":
         return False
 
-    # ON-TASK with low confidence or high OFF_SCORE
     if p1_conf <= c.trigger_conf_max:
         return True
 
@@ -222,17 +596,49 @@ def decide_with_critic(
     events_context,
     keystroke_summary: str = "",
     settings: Settings = DEFAULT_SETTINGS,
+    window_dwell_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    # Primary
+    """
+    Modified to include factor scoring.
+    
+    Args:
+        events_context: List of (timestamp, window_title)
+        keystroke_summary: Summary of keystroke activity
+        settings: Configuration
+        window_dwell_info: Optional dwell time tracking dict
+    
+    Returns:
+        Dict with decision info + factor scores
+    """
+    
+    # Compute local factors
+    computed_factors = compute_factor_scores(
+        events_context,
+        keystroke_summary,
+        settings,
+        window_dwell_info
+    )
+    
+    # Primary model
     p1_prompt = build_prompt(events_context, keystroke_summary)
-    p1_label, p1_reason, p1_off, p1_conf, _ = ask_gpt(
+    p1_label, p1_reason, p1_off, p1_conf, p1_factors, _ = ask_gpt(
         p1_prompt,
         settings.model,
         max_tokens=60,
         temperature=0.0,
         off_threshold=settings.off_threshold,
     )
-    primary_res = {"label": p1_label, "reason": p1_reason or "", "off": p1_off, "conf": p1_conf}
+    
+    # Merge LLM factors with computed factors
+    all_factors = {**computed_factors, **p1_factors}
+    
+    primary_res = {
+        "label": p1_label,
+        "reason": p1_reason or "",
+        "off": p1_off,
+        "conf": p1_conf,
+        "factors": all_factors,
+    }
 
     def mk_ret(label, reason, off, conf, critic_ran, critic_res=None):
         return {
@@ -243,6 +649,7 @@ def decide_with_critic(
             "critic_ran": critic_ran,
             "primary": primary_res,
             "critic": critic_res,
+            "factors": all_factors,  # Include in final output
         }
 
     if p1_label in ("[ERROR]", "[WARN]"):
@@ -255,14 +662,21 @@ def decide_with_critic(
     p1_summary = f"LABEL={p1_label} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
     c_prompt = build_critic_prompt(events_context, p1_summary, keystroke_summary)
 
-    c_label, c_reason, c_off, c_conf, _ = ask_gpt(
+    c_label, c_reason, c_off, c_conf, c_factors, _ = ask_gpt(
         c_prompt,
         settings.critic_model(),
         max_tokens=settings.critic.max_tokens,
         temperature=settings.critic.temperature,
         off_threshold=settings.off_threshold,
     )
-    critic_res = {"label": c_label, "reason": c_reason or "", "off": c_off, "conf": c_conf}
+    
+    critic_res = {
+        "label": c_label,
+        "reason": c_reason or "",
+        "off": c_off,
+        "conf": c_conf,
+        "factors": c_factors,
+    }
 
     if c_label in ("[ERROR]", "[WARN]"):
         return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)
@@ -286,7 +700,7 @@ def decide_with_critic(
                 if v_label not in ("[ERROR]", "[WARN]"):
                     return mk_ret(v_label, f"[Vision] {v_reason}", v_off, v_conf, True, critic_res)
 
-        # fallback to critic (safer)
+        # fallback to critic
         final_off = max(p1_off, c_off)
         return mk_ret(
             "OFF-TASK",

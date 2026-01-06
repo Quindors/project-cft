@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 from typing import Optional, Callable, Any, List
@@ -64,7 +65,8 @@ def _run_one_tick(
     Uses `state` to persist cursors/signatures across ticks.
     Returns decision info for results tracking (only in testing mode).
     """
-
+    import re  # For parsing keystroke counts
+    
     ts_now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     sink.ensure_day(now_dt.date())
@@ -72,6 +74,52 @@ def _run_one_tick(
     ks_summary = key_src.summary(now_dt, window_seconds=60)
     events_context = event_src.last_events(now_dt, settings.max_events)
 
+    # ==================== DWELL TIME TRACKING ====================
+    window_dwell_info = None
+    
+    if events_context:
+        _, current_window = events_context[-1]
+        
+        # Check if window changed
+        if state["current_window"] != current_window:
+            # Window switched - reset tracking
+            state["current_window"] = current_window
+            state["current_window_start"] = now_dt
+            state["keystroke_count_in_window"] = 0
+            print(f"[dwell] Window changed to: {current_window[:60]}...")
+        
+        # Compute dwell duration
+        if state["current_window_start"]:
+            dwell_seconds = (now_dt - state["current_window_start"]).total_seconds()
+        else:
+            dwell_seconds = 0
+        
+        # Extract keystroke count from summary
+        # Expected format: "45 keys typed. Special: [...]"
+        recent_keystroke_count = 0
+        if ks_summary and "keys typed" in ks_summary:
+            match = re.search(r"(\d+)\s+keys", ks_summary)
+            if match:
+                recent_keystroke_count = int(match.group(1))
+        
+        # Accumulate keystrokes for this window
+        state["keystroke_count_in_window"] += recent_keystroke_count
+        
+        # Build dwell info dict
+        window_dwell_info = {
+            "current_dwell_seconds": dwell_seconds,
+            "recent_keystroke_count": state["keystroke_count_in_window"],
+        }
+        
+        # Debug output for dwell time
+        if dwell_seconds > 0:
+            dwell_min = dwell_seconds / 60.0
+            kpm = state["keystroke_count_in_window"] / dwell_min if dwell_min > 0 else 0
+            if dwell_min > 2:  # Only log if dwelling for a while
+                print(f"[dwell] Current window: {dwell_min:.1f}m, {state['keystroke_count_in_window']} keys ({kpm:.1f} KPM)")
+
+    # ==================== DECISION LOGIC ====================
+    
     # only decide when there are events newer than last alert (string compare is safe here)
     last_alert_ts: Optional[str] = state["last_alert_ts"]
     if last_alert_ts is None:
@@ -84,16 +132,29 @@ def _run_one_tick(
         "primary_reason": "",
         "critic_confidence": "",
         "critic_reason": "",
+        # NEW: Factor scores
+        "factor_window_relevance": "",
+        "factor_dwell_time": "",
+        "factor_keystroke": "",
+        "factor_trajectory": "",
+        "factor_risky": "",
     }
 
     decision_raw = "[idle]"
     reason = "no new events"
     decision_info = None  # For results tracking
+    all_factors = {}
 
     current_state: str = state["current_state"]
 
     if events_new:
-        decision_res = decide_with_critic(events_context, ks_summary, settings=settings)
+        # Call decision engine WITH dwell info
+        decision_res = decide_with_critic(
+            events_context,
+            ks_summary,
+            settings=settings,
+            window_dwell_info=window_dwell_info
+        )
 
         label = decision_res["final_label"]
         reason = decision_res["final_reason"]
@@ -103,12 +164,21 @@ def _run_one_tick(
 
         primary = decision_res.get("primary") or {}
         critic = decision_res.get("critic") or {}
+        
+        # Extract factors
+        all_factors = decision_res.get("factors", {})
 
         record_extra = {
             "primary_confidence": primary.get("conf", ""),
             "primary_reason": primary.get("reason", ""),
             "critic_confidence": critic.get("conf", "") if critic else "",
             "critic_reason": critic.get("reason", "") if critic else "",
+            # NEW: Store factor scores
+            "factor_window_relevance": f"{all_factors.get('window_relevance', 0):.2f}",
+            "factor_dwell_time": f"{all_factors.get('dwell_time', 0):.2f}",
+            "factor_keystroke": f"{all_factors.get('keystroke_activity', 0):.2f}",
+            "factor_trajectory": f"{all_factors.get('trajectory', 0):.2f}",
+            "factor_risky": f"{all_factors.get('risky_keywords', 0):.2f}",
         }
 
         prev_state = current_state
@@ -131,39 +201,60 @@ def _run_one_tick(
                 "reason": reason_str,
                 "critic_ran": critic_ran,
                 "events": [key for _, key in events_context],
+                "factors": all_factors,  # Include factors in results
             }
 
+        # ==================== ALERTING ====================
+        
         if prev_state == "ON-TASK" and current_state == "OFF-TASK":
             show_popup("You're drifting OFF-TASK!\n" + (reason_str or ""), "Productivity Alert")
             if events_context:
                 state["last_alert_ts"] = events_context[-1][0]
             tag = " (critic)" if critic_ran else ""
 
-            # OFF always prints reason
+            # OFF always prints reason + factors
             print(f"{ts_now_str}  OFF-TASK{tag} (off={off_val:.2f}, conf={conf_val:.2f}) | {reason_str}")
+            
+            # Print factor breakdown
+            if all_factors:
+                print(f"  [factors] relevance={all_factors.get('window_relevance', 0):+.2f}, "
+                      f"dwell={all_factors.get('dwell_time', 0):+.2f}, "
+                      f"keystroke={all_factors.get('keystroke_activity', 0):+.2f}, "
+                      f"trajectory={all_factors.get('trajectory', 0):+.2f}, "
+                      f"risky={all_factors.get('risky_keywords', 0):+.2f}")
         else:
             tag = " (critic checked)" if critic_ran else ""
 
             if testing_mode:
                 # ✅ ON-TASK in testing mode prints reason too
                 print(f"{ts_now_str}  {current_state}{tag} (off={off_val:.2f}, conf={conf_val:.2f}) | {reason_str}")
+                
+                # Print factors in testing mode
+                if all_factors:
+                    print(f"  [factors] relevance={all_factors.get('window_relevance', 0):+.2f}, "
+                          f"dwell={all_factors.get('dwell_time', 0):+.2f}, "
+                          f"keystroke={all_factors.get('keystroke_activity', 0):+.2f}, "
+                          f"trajectory={all_factors.get('trajectory', 0):+.2f}, "
+                          f"risky={all_factors.get('risky_keywords', 0):+.2f}")
             else:
                 # live mode: keep it clean
                 print(f"{ts_now_str}  {current_state}{tag} (off={off_val:.2f}, conf={conf_val:.2f})")
-
 
         decision_raw = label
 
     state["current_state"] = current_state
     label_to_log = decision_raw if decision_raw == "[idle]" else current_state
 
-    # typed text: compute every tick, advance cursor ONLY when a row is logged
+    # ==================== TYPED TEXT CAPTURE ====================
+    
     typed_text_interval = ""
     current_dt_for_text = None
     if settings.keystrokes.capture_typed_text:
         typed_text_interval = key_src.typed_text_between(state["last_logged_dt"], now_dt)
         current_dt_for_text = now_dt
 
+    # ==================== BUILD RECORD ====================
+    
     record = {
         "ts": ts_now_str,
         "label": label_to_log,
@@ -171,10 +262,17 @@ def _run_one_tick(
         "primary_reason": record_extra["primary_reason"],
         "critic_confidence": record_extra["critic_confidence"],
         "critic_reason": record_extra["critic_reason"],
+        "factor_window_relevance": record_extra["factor_window_relevance"],
+        "factor_dwell_time": record_extra["factor_dwell_time"],
+        "factor_keystroke": record_extra["factor_keystroke"],
+        "factor_trajectory": record_extra["factor_trajectory"],
+        "factor_risky": record_extra["factor_risky"],
         "typed_text": typed_text_interval,
         "events": [{"timestamp": ts, "key": key} for ts, key in events_context] if events_context else [],
     }
 
+    # ==================== LOGGING TO SHEETS ====================
+    
     if label_to_log != "[idle]":
         trimmed = (record["events"] or [])[:settings.sheets.max_event_cols]
         keys = [str(e.get("key", "")) for e in trimmed]
@@ -188,6 +286,8 @@ def _run_one_tick(
             if settings.keystrokes.capture_typed_text and current_dt_for_text is not None:
                 state["last_logged_dt"] = current_dt_for_text
 
+    # ==================== FLUSH CHECK ====================
+    
     res = sink.flush_if_needed()
     if res:
         print(f"[flush] updated={res.updated} appended={res.appended} (sent {res.sent})")
@@ -230,6 +330,9 @@ def run_monitor_loop(
         "last_popup_time": 0.0,
         "last_off_reason": "",
         "last_off_ts": "",
+        "current_window": None,
+        "current_window_start": None,
+        "keystroke_count_in_window": 0,
     }
 
     # ✅ TRACE MODE: event-driven replay (no wall-clock sim)
@@ -300,8 +403,38 @@ def run_monitor_loop(
 
         if events_context and decision_needed:
             state["last_decision_signature"] = sig_keys
+            # Track window dwell time
+            if events_context:
+                _, current_window = events_context[-1]
+                
+                # Check if window changed
+                if state["current_window"] != current_window:
+                    state["current_window"] = current_window
+                    state["current_window_start"] = now_dt
+                    state["keystroke_count_in_window"] = 0
+                
+                # Compute dwell seconds
+                if state["current_window_start"]:
+                    dwell_seconds = (now_dt - state["current_window_start"]).total_seconds()
+                else:
+                    dwell_seconds = 0
+                
+                # Count keystrokes in current window
+                # Parse from keystroke_summary
+                if ks_summary and "keys typed" in ks_summary:
+                    match = re.search(r"(\d+)\s+keys", ks_summary)
+                    if match:
+                        state["keystroke_count_in_window"] = int(match.group(1))
+                
+                window_dwell_info = {
+                    "current_dwell_seconds": dwell_seconds,
+                    "recent_keystroke_count": state["keystroke_count_in_window"],
+                }
+            else:
+                window_dwell_info = None
 
-            decision_res = decide_with_critic(events_context, ks_summary, settings=settings)
+            # Now call decide_with_critic with dwell info
+            decision_res = decide_with_critic(events_context, ks_summary, settings=settings, window_dwell_info=window_dwell_info)
 
             label = decision_res["final_label"]
             reason = decision_res["final_reason"]
