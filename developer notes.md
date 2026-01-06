@@ -30,6 +30,7 @@
 - have the popup actually pop up on the front of the screen
 - have the popup auto-close after 3 seconds
 - increase startup speed of monitor-sheets.py
+- disable vision tiebreak when testing??
 
 ## how can I maintain user privacy when recording data to fine tune the model?
 - maybe find some real-world products that counter the privacy issue that use a similar ai format to my project

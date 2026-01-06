@@ -9,7 +9,7 @@ from typing import Optional, Callable, Any, List
 from datetime import datetime
 
 from monitor.config import Settings, DEFAULT_SETTINGS
-from monitor.decider import decide_with_critic
+from monitor.decider import decide_with_critic, aggregate_factor_score
 
 
 def _is_testing_mode(settings) -> bool:
@@ -222,6 +222,22 @@ def _run_one_tick(
                       f"keystroke={all_factors.get('keystroke_activity', 0):+.2f}, "
                       f"trajectory={all_factors.get('trajectory', 0):+.2f}, "
                       f"risky={all_factors.get('risky_keywords', 0):+.2f}")
+                # NEW: Compute and print aggregate score
+                agg_score, agg_explanation = aggregate_factor_score(all_factors)
+                
+                if agg_score > 0.3:
+                    factor_suggests = "ON-TASK"
+                elif agg_score < -0.3:
+                    factor_suggests = "OFF-TASK"
+                else:
+                    factor_suggests = "UNCERTAIN"
+                
+                print(f"  [aggregate] score={agg_score:+.2f} suggests {factor_suggests}")
+                print(f"              {agg_explanation}")
+                
+                if factor_suggests != current_state and current_state != "[idle]":
+                    print(f"  [note] Factor-based would choose {factor_suggests}, but LLM chose {current_state}")
+                    
         else:
             tag = " (critic checked)" if critic_ran else ""
 
