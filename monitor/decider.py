@@ -103,6 +103,65 @@ def aggregate_factor_score(factors: Dict[str, float]) -> Tuple[float, str]:
     return total_score, explanation
 
 
+def decide_hybrid_simple(
+    factors: Dict[str, float],
+    llm_label: str,
+    llm_off_score: float,
+    llm_confidence: float,
+    llm_reason: str,
+    off_threshold: float = 0.60,
+) -> Tuple[str, str, float, float]:
+    """
+    Simple hybrid decision: let factors override LLM only when very confident.
+    
+    Conservative approach:
+        - If factors are decisive (|score| > 0.7), trust them
+        - Otherwise, trust LLM
+    
+    Returns:
+        (final_label, final_reason, final_off_score, final_confidence)
+    """
+    
+    # Get factor-based score
+    agg_score, factor_explanation = aggregate_factor_score(factors)
+    
+    # Convert aggregate score to OFF_SCORE scale [0, 1]
+    # agg_score in [-1, 1] → map to [0, 1]
+    # -1 (fully off-task) = 1.0, +1 (fully on-task) = 0.0
+    factor_off_score = (1.0 - agg_score) / 2.0
+    
+    # Determine factor-based label
+    if agg_score > 0.3:
+        factor_label = "ON-TASK"
+        factor_confidence = min(0.95, 0.6 + (agg_score - 0.3) * 0.5)
+    elif agg_score < -0.3:
+        factor_label = "OFF-TASK"
+        factor_confidence = min(0.95, 0.6 + abs(agg_score + 0.3) * 0.5)
+    else:
+        factor_label = "UNCERTAIN"
+        factor_confidence = 0.5
+    
+    # Decision logic: Only override LLM if factors are VERY strong (|score| > 0.7)
+    DECISIVE_THRESHOLD = 0.7
+    
+    if abs(agg_score) > DECISIVE_THRESHOLD:
+        # Factors are decisive - use them
+        return (
+            factor_label,
+            f"[Factors decisive] {factor_explanation}",
+            factor_off_score,
+            factor_confidence,
+        )
+    else:
+        # Factors uncertain - use LLM
+        return (
+            llm_label,
+            f"{llm_reason} (factors: {agg_score:+.2f})",
+            llm_off_score,
+            llm_confidence,
+        )
+
+
 def _compute_window_relevance(
     events_context: List[Tuple[str, str]],
     settings: Settings
@@ -697,8 +756,18 @@ def decide_with_critic(
     if p1_label in ("[ERROR]", "[WARN]"):
         return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], False)
 
-    if not _should_run_critic(p1_label, p1_off, p1_conf, events_context, settings):
-        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], False)
+    # NEW: Apply hybrid decision
+    hybrid_label, hybrid_reason, hybrid_off, hybrid_conf = decide_hybrid_simple(
+        all_factors,
+        p1_label,
+        p1_off,
+        p1_conf,
+        p1_reason,
+        settings.off_threshold,
+    )
+
+    if not _should_run_critic(hybrid_label, hybrid_off, hybrid_conf, events_context, settings):
+        return mk_ret(hybrid_label, hybrid_reason, hybrid_off, hybrid_conf, False)
 
     # Critic
     p1_summary = f"LABEL={p1_label} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
