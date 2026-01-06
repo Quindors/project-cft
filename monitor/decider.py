@@ -60,6 +60,48 @@ def compute_factor_scores(
     
     return factors
 
+def aggregate_factor_score(factors: Dict[str, float]) -> Tuple[float, str]:
+    """
+    Aggregate individual factor scores into a composite decision score.
+    
+    Returns:
+        (aggregate_score, explanation)
+        aggregate_score in [-1, 1] where:
+            > 0.3: suggests ON-TASK
+            < -0.3: suggests OFF-TASK
+            [-0.3, 0.3]: uncertain
+    """
+    
+    # These weights can be tuned later
+    weights = {
+        "window_relevance": 0.30,
+        "dwell_time": 0.20,
+        "keystroke_activity": 0.20,
+        "trajectory": 0.20,
+        "risky_keywords": 0.10,
+    }
+    
+    # Compute weighted sum
+    total_score = 0.0
+    explanations = []
+    
+    for factor_name, weight in weights.items():
+        score = factors.get(factor_name, 0.0)
+        contribution = score * weight
+        total_score += contribution
+        
+        # Build explanation for significant factors
+        if abs(score) > 0.3:
+            direction = "positive" if score > 0 else "negative"
+            strength = "strong" if abs(score) > 0.7 else "moderate"
+            explanations.append(
+                f"{factor_name.replace('_', ' ')}: {strength} {direction} ({score:+.2f})"
+            )
+    
+    explanation = "; ".join(explanations) if explanations else "all factors neutral"
+    
+    return total_score, explanation
+
 
 def _compute_window_relevance(
     events_context: List[Tuple[str, str]],
@@ -713,3 +755,54 @@ def decide_with_critic(
 
     # critic agrees ON-TASK
     return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)
+
+if __name__ == "__main__":
+    # Test the aggregation function
+    print("Testing aggregate_factor_score()...")
+    
+    # Test case 1: Clear OFF-TASK
+    test_factors_1 = {
+        "window_relevance": -0.9,  # YouTube
+        "dwell_time": -0.8,         # Long time, no activity
+        "keystroke_activity": -0.6, # Idle
+        "trajectory": -0.7,         # Drifting
+        "risky_keywords": -0.9      # Risky site
+    }
+    
+    score_1, explanation_1 = aggregate_factor_score(test_factors_1)
+    print(f"\nTest 1 (should be OFF-TASK):")
+    print(f"  Score: {score_1:+.2f}")
+    print(f"  Explanation: {explanation_1}")
+    print(f"  Decision: {'OFF-TASK' if score_1 < -0.3 else 'ON-TASK' if score_1 > 0.3 else 'UNCERTAIN'}")
+    
+    # Test case 2: Clear ON-TASK
+    test_factors_2 = {
+        "window_relevance": 0.9,   # VS Code
+        "dwell_time": 0.5,          # Good dwell + activity
+        "keystroke_activity": 0.7,  # Typing a lot
+        "trajectory": 0.6,          # Stable work
+        "risky_keywords": 0.0       # No risky sites
+    }
+    
+    score_2, explanation_2 = aggregate_factor_score(test_factors_2)
+    print(f"\nTest 2 (should be ON-TASK):")
+    print(f"  Score: {score_2:+.2f}")
+    print(f"  Explanation: {explanation_2}")
+    print(f"  Decision: {'OFF-TASK' if score_2 < -0.3 else 'ON-TASK' if score_2 > 0.3 else 'UNCERTAIN'}")
+    
+    # Test case 3: Mixed/Uncertain
+    test_factors_3 = {
+        "window_relevance": 0.6,   # Educational site
+        "dwell_time": -0.3,         # Been here a while, low activity
+        "keystroke_activity": 0.1,  # Some typing
+        "trajectory": 0.0,          # Neutral
+        "risky_keywords": 0.0       # No risky keywords
+    }
+    
+    score_3, explanation_3 = aggregate_factor_score(test_factors_3)
+    print(f"\nTest 3 (should be UNCERTAIN):")
+    print(f"  Score: {score_3:+.2f}")
+    print(f"  Explanation: {explanation_3}")
+    print(f"  Decision: {'OFF-TASK' if score_3 < -0.3 else 'ON-TASK' if score_3 > 0.3 else 'UNCERTAIN'}")
+    
+    print("\n✓ If these results look reasonable, move to Step 2")
