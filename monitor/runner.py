@@ -128,16 +128,20 @@ def _run_one_tick(
         events_new = [(ts, key) for (ts, key) in events_context if ts > last_alert_ts]
 
     record_extra = {
+        "main_label": "",
         "primary_confidence": "",
         "primary_reason": "",
-        "critic_confidence": "",
-        "critic_reason": "",
-        # NEW: Factor scores
+        "factors_score": "",
         "factor_window_relevance": "",
         "factor_dwell_time": "",
         "factor_keystroke": "",
         "factor_trajectory": "",
         "factor_risky": "",
+        "critic_label": "",
+        "critic_confidence": "",
+        "critic_reason": "",
+        "vision_label": "",
+        "vision_reason": "",
     }
 
     decision_raw = "[idle]"
@@ -164,21 +168,27 @@ def _run_one_tick(
 
         primary = decision_res.get("primary") or {}
         critic = decision_res.get("critic") or {}
+        vision = decision_res.get("vision") or {}
         
         # Extract factors
         all_factors = decision_res.get("factors", {})
-
+        agg_score, _ = aggregate_factor_score(all_factors) if all_factors else (0.0, "")
+        
         record_extra = {
+            "main_label": primary.get("label", ""),
             "primary_confidence": primary.get("conf", ""),
             "primary_reason": primary.get("reason", ""),
-            "critic_confidence": critic.get("conf", "") if critic else "",
-            "critic_reason": critic.get("reason", "") if critic else "",
-            # NEW: Store factor scores
+            "factors_score": f"{agg_score:.2f}",
             "factor_window_relevance": f"{all_factors.get('window_relevance', 0):.2f}",
             "factor_dwell_time": f"{all_factors.get('dwell_time', 0):.2f}",
             "factor_keystroke": f"{all_factors.get('keystroke_activity', 0):.2f}",
             "factor_trajectory": f"{all_factors.get('trajectory', 0):.2f}",
             "factor_risky": f"{all_factors.get('risky_keywords', 0):.2f}",
+            "critic_label": critic.get("label", "") if critic else "",
+            "critic_confidence": critic.get("conf", "") if critic else "",
+            "critic_reason": critic.get("reason", "") if critic else "",
+            "vision_label": vision.get("label", "") if vision else "",
+            "vision_reason": vision.get("reason", "") if vision else "",
         }
 
         prev_state = current_state
@@ -273,16 +283,21 @@ def _run_one_tick(
     
     record = {
         "ts": ts_now_str,
-        "label": label_to_log,
+        "main_label": record_extra["main_label"],
         "primary_confidence": record_extra["primary_confidence"],
         "primary_reason": record_extra["primary_reason"],
-        "critic_confidence": record_extra["critic_confidence"],
-        "critic_reason": record_extra["critic_reason"],
+        "factors_score": record_extra["factors_score"],
         "factor_window_relevance": record_extra["factor_window_relevance"],
         "factor_dwell_time": record_extra["factor_dwell_time"],
         "factor_keystroke": record_extra["factor_keystroke"],
         "factor_trajectory": record_extra["factor_trajectory"],
         "factor_risky": record_extra["factor_risky"],
+        "critic_label": record_extra["critic_label"],
+        "critic_confidence": record_extra["critic_confidence"],
+        "critic_reason": record_extra["critic_reason"],
+        "vision_label": record_extra["vision_label"],
+        "vision_reason": record_extra["vision_reason"],
+        "label": label_to_log,
         "typed_text": typed_text_interval,
         "events": [{"timestamp": ts, "key": key} for ts, key in events_context] if events_context else [],
     }

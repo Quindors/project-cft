@@ -80,18 +80,27 @@ class SheetsSink:
 
     def _expected_headers(self) -> List[str]:
         base = [
-            "ts",
-            "label",
+            "timestamp",
+            # Main LLM section
+            "main_label",
             "primary_confidence",
             "primary_reason",
-            "critic_confidence",
-            "critic_reason",
-            # NEW: Factor score columns
+            # Factors section
+            "factors_score",
             "factor_window_relevance",
             "factor_dwell_time",
             "factor_keystroke",
             "factor_trajectory",
             "factor_risky",
+            # Critic section
+            "critic_label",
+            "critic_confidence",
+            "critic_reason",
+            # Vision section
+            "vision_label",
+            "vision_reason",
+            # Final decision
+            "label",
             # Human feedback
             "human_label",
             "human_reason",
@@ -119,7 +128,7 @@ class SheetsSink:
 
     def _read_existing_ts(self) -> Dict[str, int]:
         headers = self._expected_headers()
-        idx_ts = headers.index("ts")
+        idx_ts = headers.index("timestamp")
         values = self.ws.get_all_values()
 
         key_to_row: Dict[str, int] = {}
@@ -166,18 +175,27 @@ class SheetsSink:
             return "" if v is None else str(v)
 
         row: List[str] = [
-            get("ts"),
-            get("label"),
+            get("timestamp"),
+            # Main LLM section
+            get("main_label"),
             get("primary_confidence"),
             get("primary_reason"),
-            get("critic_confidence"),
-            get("critic_reason"),
-            # NEW: Factor scores
+            # Factors section
+            get("factors_score"),
             get("factor_window_relevance"),
             get("factor_dwell_time"),
             get("factor_keystroke"),
             get("factor_trajectory"),
             get("factor_risky"),
+            # Critic section
+            get("critic_label"),
+            get("critic_confidence"),
+            get("critic_reason"),
+            # Vision section
+            get("vision_label"),
+            get("vision_reason"),
+            # Final decision
+            get("label"),
             # Human feedback
             "",  # human_label
             "",  # human_reason
@@ -220,7 +238,7 @@ class SheetsSink:
             return None
 
         headers = self._expected_headers()
-        idx_ts = headers.index("ts")
+        idx_ts = headers.index("timestamp")
         end_col = _col_letter(len(headers))
 
         buffer_rows = self.buffer[:]

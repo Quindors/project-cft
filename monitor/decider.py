@@ -741,7 +741,7 @@ def decide_with_critic(
         "factors": all_factors,
     }
 
-    def mk_ret(label, reason, off, conf, critic_ran, critic_res=None):
+    def mk_ret(label, reason, off, conf, critic_ran, critic_res=None, vision_res=None):
         return {
             "final_label": label,
             "final_reason": reason,
@@ -750,7 +750,9 @@ def decide_with_critic(
             "critic_ran": critic_ran,
             "primary": primary_res,
             "critic": critic_res,
-            "factors": all_factors,  # Include in final output
+            "vision": vision_res,
+            "factors": all_factors,
+            "aggregate_score": aggregate_factor_score(all_factors)[0],
         }
 
     if p1_label in ("[ERROR]", "[WARN]"):
@@ -809,7 +811,13 @@ def decide_with_critic(
                     off_threshold=settings.off_threshold,
                 )
                 if v_label not in ("[ERROR]", "[WARN]"):
-                    return mk_ret(v_label, f"[Vision] {v_reason}", v_off, v_conf, True, critic_res)
+                    vision_res = {
+                        "label": v_label,
+                        "reason": v_reason,
+                        "off": v_off,
+                        "conf": v_conf,
+                    }
+                    return mk_ret(v_label, f"[Vision] {v_reason}", v_off, v_conf, True, critic_res, vision_res)
 
         # fallback to critic
         final_off = max(p1_off, c_off)
