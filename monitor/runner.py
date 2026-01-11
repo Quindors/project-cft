@@ -415,6 +415,11 @@ def run_monitor_loop(
             "primary_reason": "",
             "critic_confidence": "",
             "critic_reason": "",
+            "factor_window_relevance": "",
+            "factor_dwell_time": "",
+            "factor_keystroke": "",
+            "factor_trajectory": "",
+            "factor_risky": "",
         }
 
         if events_context and decision_needed:
@@ -460,12 +465,18 @@ def run_monitor_loop(
 
             primary = decision_res.get("primary") or {}
             critic = decision_res.get("critic") or {}
+            all_factors = decision_res.get("factors", {})
 
             record_extra = {
                 "primary_confidence": primary.get("conf", ""),
                 "primary_reason": primary.get("reason", ""),
                 "critic_confidence": critic.get("conf", "") if critic else "",
                 "critic_reason": critic.get("reason", "") if critic else "",
+                "factor_window_relevance": f"{all_factors.get('window_relevance', 0):.2f}",
+                "factor_dwell_time": f"{all_factors.get('dwell_time', 0):.2f}",
+                "factor_keystroke": f"{all_factors.get('keystroke_activity', 0):.2f}",
+                "factor_trajectory": f"{all_factors.get('trajectory', 0):.2f}",
+                "factor_risky": f"{all_factors.get('risky_keywords', 0):.2f}",
             }
 
             prev_state = state["current_state"]
