@@ -498,6 +498,29 @@ def run_monitor_loop(
             else:
                 tag = " (critic checked)" if critic_ran else ""
                 print(f"{ts_now_str}  {new_state}{tag} (off={off_val:.2f}, conf={conf_val:.2f})")
+            # NEW: Print factors in live mode too
+            all_factors = decision_res.get("factors", {})
+            if all_factors:
+                print(f"  [factors] relevance={all_factors.get('window_relevance', 0):+.2f}, "
+                      f"dwell={all_factors.get('dwell_time', 0):+.2f}, "
+                      f"keystroke={all_factors.get('keystroke_activity', 0):+.2f}, "
+                      f"trajectory={all_factors.get('trajectory', 0):+.2f}, "
+                      f"risky={all_factors.get('risky_keywords', 0):+.2f}")
+                
+                # Compute and print aggregate score
+                from monitor.decider import aggregate_factor_score
+                agg_score, agg_explanation = aggregate_factor_score(all_factors)
+                
+                if agg_score > 0.3:
+                    factor_suggests = "ON-TASK"
+                elif agg_score < -0.3:
+                    factor_suggests = "OFF-TASK"
+                else:
+                    factor_suggests = "UNCERTAIN"
+                
+                print(f"  [aggregate] score={agg_score:+.2f} suggests {factor_suggests}")
+                if agg_explanation:
+                    print(f"              {agg_explanation}")
 
         # ---- Repeat alerts while OFF-TASK (nag) ----
         if settings.alerts.enabled and settings.alerts.repeat_while_offtask:
@@ -524,6 +547,11 @@ def run_monitor_loop(
             "primary_reason": record_extra["primary_reason"],
             "critic_confidence": record_extra["critic_confidence"],
             "critic_reason": record_extra["critic_reason"],
+            "factor_window_relevance": record_extra["factor_window_relevance"],
+            "factor_dwell_time": record_extra["factor_dwell_time"],
+            "factor_keystroke": record_extra["factor_keystroke"],
+            "factor_trajectory": record_extra["factor_trajectory"],
+            "factor_risky": record_extra["factor_risky"],
             "typed_text": typed_text_interval,
             "events": [{"timestamp": ts, "key": key} for ts, key in events_context] if events_context else [],
         }
