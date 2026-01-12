@@ -141,6 +141,7 @@ def _run_one_tick(
         "critic_confidence": "",
         "critic_reason": "",
         "vision_label": "",
+        "vision_confidence": "",
         "vision_reason": "",
     }
 
@@ -188,6 +189,7 @@ def _run_one_tick(
             "critic_confidence": critic.get("conf", "") if critic else "",
             "critic_reason": critic.get("reason", "") if critic else "",
             "vision_label": vision.get("label", "") if vision else "",
+            "vision_confidence": vision.get("conf", "") if vision else "",
             "vision_reason": vision.get("reason", "") if vision else "",
         }
 
@@ -282,7 +284,7 @@ def _run_one_tick(
     # ==================== BUILD RECORD ====================
     
     record = {
-        "ts": ts_now_str,
+        "timestamp": ts_now_str,
         "main_label": record_extra["main_label"],
         "primary_confidence": record_extra["primary_confidence"],
         "primary_reason": record_extra["primary_reason"],
@@ -296,6 +298,7 @@ def _run_one_tick(
         "critic_confidence": record_extra["critic_confidence"],
         "critic_reason": record_extra["critic_reason"],
         "vision_label": record_extra["vision_label"],
+        "vision_confidence": record_extra["vision_confidence"],
         "vision_reason": record_extra["vision_reason"],
         "label": label_to_log,
         "typed_text": typed_text_interval,
@@ -426,10 +429,16 @@ def run_monitor_loop(
 
         reason = ""
         record_extra = {
+            "main_label": "",
             "primary_confidence": "",
             "primary_reason": "",
+            "critic_label": "",
             "critic_confidence": "",
             "critic_reason": "",
+            "vision_label": "",
+            "vision_confidence": "",
+            "vision_reason": "",
+            "factors_score": "",
             "factor_window_relevance": "",
             "factor_dwell_time": "",
             "factor_keystroke": "",
@@ -481,12 +490,19 @@ def run_monitor_loop(
             primary = decision_res.get("primary") or {}
             critic = decision_res.get("critic") or {}
             all_factors = decision_res.get("factors", {})
+            agg_score, _ = aggregate_factor_score(all_factors) if all_factors else (0.0, "")
 
             record_extra = {
+                "main_label": primary.get("label", ""),
                 "primary_confidence": primary.get("conf", ""),
                 "primary_reason": primary.get("reason", ""),
+                "critic_label": critic.get("label", "") if critic else "",
                 "critic_confidence": critic.get("conf", "") if critic else "",
                 "critic_reason": critic.get("reason", "") if critic else "",
+                "vision_label": "",
+                "vision_confidence": "",
+                "vision_reason": "",
+                "factors_score": f"{agg_score:.2f}",
                 "factor_window_relevance": f"{all_factors.get('window_relevance', 0):.2f}",
                 "factor_dwell_time": f"{all_factors.get('dwell_time', 0):.2f}",
                 "factor_keystroke": f"{all_factors.get('keystroke_activity', 0):.2f}",
@@ -523,7 +539,6 @@ def run_monitor_loop(
                       f"risky={all_factors.get('risky_keywords', 0):+.2f}")
                 
                 # Compute and print aggregate score
-                from monitor.decider import aggregate_factor_score
                 agg_score, agg_explanation = aggregate_factor_score(all_factors)
                 
                 if agg_score > 0.3:
@@ -556,12 +571,18 @@ def run_monitor_loop(
         label_to_log = state["current_state"] if events_context else "[idle]"
 
         record = {
-            "ts": ts_now_str,
+            "timestamp": ts_now_str,
+            "main_label": record_extra["main_label"],
             "label": label_to_log,
             "primary_confidence": record_extra["primary_confidence"],
             "primary_reason": record_extra["primary_reason"],
+            "critic_label": record_extra["critic_label"],
             "critic_confidence": record_extra["critic_confidence"],
             "critic_reason": record_extra["critic_reason"],
+            "vision_label": record_extra["vision_label"],
+            "vision_confidence": record_extra["vision_confidence"],
+            "vision_reason": record_extra["vision_reason"],
+            "factors_score": record_extra["factors_score"],
             "factor_window_relevance": record_extra["factor_window_relevance"],
             "factor_dwell_time": record_extra["factor_dwell_time"],
             "factor_keystroke": record_extra["factor_keystroke"],

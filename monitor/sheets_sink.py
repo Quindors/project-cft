@@ -98,6 +98,7 @@ class SheetsSink:
             "critic_reason",
             # Vision section
             "vision_label",
+            "vision_confidence",
             "vision_reason",
             # Final decision
             "label",
@@ -193,6 +194,7 @@ class SheetsSink:
             get("critic_reason"),
             # Vision section
             get("vision_label"),
+            get("vision_confidence"),
             get("vision_reason"),
             # Final decision
             get("label"),
