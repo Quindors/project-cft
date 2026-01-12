@@ -1,5 +1,5 @@
 .venv
 logs/*
-tests/results/*
+tests/*
 list.md
 .env
