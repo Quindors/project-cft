@@ -17,10 +17,11 @@
     - Don't just append rules (prompt bloat)
     - Identify conflicting patterns and rewrite sections
     - Example: If system thinks "low typing = focused reading" but mistakes show "low typing = passive consumption", update that heuristic
+- add categories that the AI classifies tasks into
 
 ## devops
 - start hosting it
-- run script automatically
+- ~~run script automatically~~
 
 ## analytics
 - check dashboard accuracy
