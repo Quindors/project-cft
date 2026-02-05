@@ -4,7 +4,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Dict, List, Any, Optional
 
 import gspread
@@ -47,6 +47,9 @@ class NullSink:
 
     def close(self):
         return
+    
+    def get_categories(self):
+        return []
 
 
 class SheetsSink:
@@ -64,6 +67,10 @@ class SheetsSink:
         self.buffer: List[List[str]] = []
         self.last_flush_time = time.time()
 
+        # NEW: Categories worksheet reference
+        self.categories_ws = None
+        self._categories_cache: Optional[List[Dict]] = None
+
         self._open()
 
     @property
@@ -77,21 +84,88 @@ class SheetsSink:
             self.sh = self.gc.open_by_url(self.cfg.sheet_url_or_key)
         else:
             self.sh = self.gc.open_by_key(self.cfg.sheet_url_or_key)
+        
+        # Ensure Categories sheet exists on startup
+        self._ensure_categories_sheet()
+
+    def _ensure_categories_sheet(self):
+        """Create or get Categories worksheet and seed with defaults if new."""
+        try:
+            self.categories_ws = self.sh.worksheet("Categories")
+            print("[info] Found existing Categories worksheet")
+        except gspread.exceptions.WorksheetNotFound:
+            print("[info] Creating Categories worksheet...")
+            self.categories_ws = self.sh.add_worksheet(
+                title="Categories",
+                rows="50",
+                cols="7",
+                index=0  # Put at beginning of workbook
+            )
+            # Write headers
+            headers = ["category_id", "name", "description", "color", "emoji", "is_productive", "created_at"]
+            self.categories_ws.update("A1:G1", [headers], value_input_option="RAW")
+            
+            # Seed default categories
+            self._seed_default_categories()
+            print("[info] Categories worksheet created and seeded with defaults")
+
+    def _seed_default_categories(self):
+        """Add default categories based on typical student workflow."""
+        now_str = datetime.now().isoformat()
+        
+        defaults = [
+            # Productive categories
+            ["deep_work", "Deep Work", "VS Code, PyCharm, coding, writing, focused tasks. Examples: .py files, homework assignments, project work", "#2ecc71", "💻", "TRUE", now_str],
+            ["homework", "Homework", "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "#9b59b6", "📝", "TRUE", now_str],
+            ["research", "Research & Learning", "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "#3498db", "📚", "TRUE", now_str],
+            ["communication", "Communication", "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "#f39c12", "💬", "TRUE", now_str],
+            
+            # Non-productive categories
+            ["social_media", "Social Media", "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "#e74c3c", "📱", "FALSE", now_str],
+            ["entertainment", "Entertainment", "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "#c0392b", "🎬", "FALSE", now_str],
+            ["gaming", "Gaming", "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "#8e44ad", "🎮", "FALSE", now_str],
+            ["shopping", "Shopping", "Amazon, eBay, AliExpress, online shopping, browsing products", "#d35400", "🛒", "FALSE", now_str],
+        ]
+        
+        self.categories_ws.append_rows(defaults, value_input_option="USER_ENTERED")
+
+    def get_categories(self) -> List[Dict]:
+        """
+        Load all categories from Categories sheet.
+        Returns list of dicts with keys: category_id, name, description, color, emoji, is_productive, created_at
+        """
+        if self._categories_cache is not None:
+            return self._categories_cache
+        
+        if not self.categories_ws:
+            self._ensure_categories_sheet()
+        
+        records = self.categories_ws.get_all_records()
+        
+        # Convert to proper types
+        categories = []
+        for r in records:
+            cat = dict(r)
+            # Convert is_productive to boolean
+            if isinstance(cat.get('is_productive'), str):
+                cat['is_productive'] = cat['is_productive'].upper() in ('TRUE', 'YES', '1')
+            categories.append(cat)
+        
+        self._categories_cache = categories
+        return categories
 
     def _expected_headers(self) -> List[str]:
+        """Define the headers for daily Focus Logs sheets - NEW SCHEMA."""
         base = [
             "timestamp",
+            # Category fields (NEW)
+            "category_id",
+            "category_name",
+            "is_productive",
             # Main LLM section
             "main_label",
             "primary_confidence",
             "primary_reason",
-            # Factors section
-            "factors_score",
-            "factor_window_relevance",
-            "factor_dwell_time",
-            "factor_keystroke",
-            "factor_trajectory",
-            "factor_risky",
             # Critic section
             "critic_label",
             "critic_confidence",
@@ -100,13 +174,12 @@ class SheetsSink:
             "vision_label",
             "vision_confidence",
             "vision_reason",
-            # Final decision
-            "label",
             # Human feedback
             "human_label",
             "human_reason",
             "typed_text",
         ]
+        # Event columns
         for i in range(1, self.cfg.max_event_cols + 1):
             base.append(f"e{i}_key")
         return base
@@ -171,23 +244,21 @@ class SheetsSink:
     # ------------------- internal formatting -------------------
 
     def _flatten_row(self, record: Dict[str, Any]) -> List[str]:
+        """Convert record dict to row list matching headers - NEW SCHEMA."""
         def get(k, default=""):
             v = record.get(k, default)
             return "" if v is None else str(v)
 
         row: List[str] = [
             get("timestamp"),
+            # Category fields
+            get("category_id"),
+            get("category_name"),
+            get("is_productive"),
             # Main LLM section
             get("main_label"),
             get("primary_confidence"),
             get("primary_reason"),
-            # Factors section
-            get("factors_score"),
-            get("factor_window_relevance"),
-            get("factor_dwell_time"),
-            get("factor_keystroke"),
-            get("factor_trajectory"),
-            get("factor_risky"),
             # Critic section
             get("critic_label"),
             get("critic_confidence"),
@@ -196,8 +267,6 @@ class SheetsSink:
             get("vision_label"),
             get("vision_confidence"),
             get("vision_reason"),
-            # Final decision
-            get("label"),
             # Human feedback
             "",  # human_label
             "",  # human_reason

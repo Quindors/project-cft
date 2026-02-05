@@ -1,23 +1,142 @@
+# cft → Category-Based System: Migration Checklist
+
+## Phase 1: Data Model
+
+- [ ] Create "Categories" sheet in Google Sheets
+  - [ ] Columns: `category_id`, `name`, `description`, `is_productive`, `created_at`
+  - [ ] Seed with default categories (Deep Work, Homework, Research, Communication, Social Media, Entertainment, Gaming, Shopping, Ambiguous)
+  - [ ] Add `get_categories()` method to `sheets_sink.py`
+
+- [ ] Update daily "Focus Logs" sheet schema
+  - [ ] Add `category_id` column
+  - [ ] Add `category_name` column
+  - [ ] Add `is_productive` column (derived from category)
+  - [ ] Remove old `label` column
+  - [ ] Update `_expected_headers()` in `sheets_sink.py`
+
+## Phase 2: User Goals
+
+- [ ] Create `user_goals.txt` file in project root
+  - [ ] Add template with example goals
+  - [ ] Document format in README
+
+- [ ] Add goals loading to `config.py`
+  - [ ] Read goals from file
+  - [ ] Provide sensible default if file missing
+
+## Phase 3: LLM Prompts
+
+- [ ] Update `prompt-main.txt`
+  - [ ] Add USER'S GOALS section
+  - [ ] Add AVAILABLE CATEGORIES section
+  - [ ] Change output from LABEL to CATEGORY
+  - [ ] Keep OFF_SCORE, CONF, REASON for now
+
+- [ ] Update `prompt-critic.txt`
+  - [ ] Add categories context
+  - [ ] Change to category-based reasoning
+
+## Phase 4: Decision Logic
+
+- [ ] Modify `build_prompt()` in `decider.py`
+  - [ ] Load categories from sheets
+  - [ ] Load user goals from file
+  - [ ] Build category list for prompt
+  - [ ] Pass to LLM
+
+- [ ] Update `_parse_llm_line()` in `decider.py`
+  - [ ] Extract CATEGORY instead of LABEL
+  - [ ] Look up category in categories list
+  - [ ] Derive `is_productive` from category
+  - [ ] Remove factor extraction code
+
+- [ ] Update `ask_gpt()` in `decider.py`
+  - [ ] Return category info instead of label
+  - [ ] Simplify return signature
+
+- [ ] Simplify `decide_with_critic()` in `decider.py`
+  - [ ] Remove factor scoring calls
+  - [ ] Remove `decide_hybrid_simple()`
+  - [ ] Keep critic + vision tiebreaker logic
+  - [ ] Update trigger conditions for critic (low confidence, ambiguous categories)
+
+## Phase 5: Remove Factor Scoring
+
+- [ ] Delete from `decider.py`:
+  - [ ] `compute_factor_scores()`
+  - [ ] `aggregate_factor_score()`
+  - [ ] `decide_hybrid_simple()`
+  - [ ] `_compute_window_relevance()`
+  - [ ] `_compute_dwell_factor()`
+  - [ ] `_compute_keystroke_factor()`
+  - [ ] `_compute_trajectory_factor()`
+  - [ ] `_compute_risky_keyword_factor()`
+
+- [ ] Remove factor columns from sheets schema
+  - [ ] Delete: `factors_score`, `factor_window_relevance`, `factor_dwell_time`, `factor_keystroke`, `factor_trajectory`, `factor_risky`
+
+- [ ] Remove from `runner.py`:
+  - [ ] Dwell time tracking code
+  - [ ] Keystroke accumulation
+  - [ ] Factor display in console output
+
+- [ ] Remove `risky_keywords` from `config.py`
+
+## Phase 6: Critic & Vision Updates
+
+- [ ] Update critic trigger logic
+  - [ ] Trigger on low confidence
+  - [ ] Trigger on ambiguous categories (Research, Communication)
+
+- [ ] Update vision tiebreaker
+  - [ ] Handle category disagreement (not just ON/OFF)
+  - [ ] Return category choice
+
+## Phase 7: Popup Updates
+
+- [ ] Modify `alerts.py`
+  - [ ] Show emoji + category name
+  - [ ] Show reason
+
+- [ ] Update `runner.py` alert messages
+  - [ ] Display category instead of ON-TASK/OFF-TASK
+  - [ ] Format: "📱 Social Media: Discord chatting"
+
+## Phase 8: Category Management
+
+- [ ] Document in README
+  - [ ] How to edit categories in Google Sheets
+  - [ ] Category schema explanation
+  - [ ] How to add new categories
+
+- [ ] Add validation
+  - [ ] Warn if category in logs doesn't exist in Categories sheet
+
+## Phase 9: Recategorization
+
+- [ ] Document in README
+  - [ ] How to change category_id in logs sheet
+  - [ ] What happens when category is corrected
+
+- [ ] (Optional) Add bulk recategorization script
+  - [ ] Update all events matching pattern
+  - [ ] Update date range
+
+## Phase 10: Testing & Cleanup
+
+- [ ] Update test traces with expected categories
+- [ ] Test with `monitor-sheets.py` in trace mode
+- [ ] Remove unused code:
+  - [ ] `2scales.py`
+  - [ ] `sliding_window_simple.py`
+  - [ ] `analyse-simple.py`
+  - [ ] Factor-related test files
+
+- [ ] Update README with new architecture
+
+
 # Todo
-## fine tuning
-- ~~add abstaining which triggers the critic~~ ✓
-(next session)
-- Sliding Window Sizes:
-    - Micro-context (last 30 sec): Immediate activity
-    - Meso-context (last 3 min): Current task
-    - Macro-context (last 15 min): Session trajectory
-- Instead of binary ON/OFF, use multi-factor scoring:
-    - Window relevance:      0.7  (math-related)
-    - Dwell time:            -0.3 (too long without returning)
-    - Keystroke activity:    -0.4 (minimal typing)
-    - Trajectory:            -0.5 (drifting away from homework)
-    - Historical pattern:    -0.2 (user has 70% accuracy on similar)
-    - AGGREGATE SCORE: -0.7 → OFF-TASK (confidence: 0.85)
-- prompt mutation strategy:
-    - Don't just append rules (prompt bloat)
-    - Identify conflicting patterns and rewrite sections
-    - Example: If system thinks "low typing = focused reading" but mistakes show "low typing = passive consumption", update that heuristic
-- add categories that the AI classifies tasks into
+## 
 
 ## devops
 - start hosting it

@@ -3,3 +3,4 @@ logs/*
 tests/*
 list.md
 .env
+venv/*
