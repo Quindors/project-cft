@@ -1,0 +1,28 @@
+# User Goals & Context
+# 
+# This file tells the AI what you're working on so it can accurately categorize your activities.
+# Edit this file to describe your current projects, assignments, and learning goals.
+#
+# The AI will use this context to determine if activities are productive FOR YOU.
+# For example:
+# - "YouTube - Khan Academy Calculus" → Research & Learning (productive)
+# - "YouTube - Funny Cats" → Entertainment (not productive)
+
+I'm a high school student working on:
+
+- Calculus homework (using OneNote, Wolfram Alpha, Khan Academy, Desmos)
+  Currently on Chapter 10: Limits and Derivatives
+
+- Personal coding project "cft" - an AI-powered productivity monitor
+  Tech stack: Python, OpenAI API, Google Sheets
+  Working on: migrating from binary ON/OFF classification to category-based system
+
+- Learning about ML and AI on the side
+  Resources: YouTube tutorials, research papers, online courses
+
+When I use:
+- OneNote: it's for homework notes and assignments
+- VS Code: it's for the cft project or learning to code
+- Chrome/Wikipedia: could be research for homework OR rabbit holes
+- Discord: usually chatting with friends (distraction), sometimes homework help
+- YouTube: educational content for calc/coding OR entertainment videos
