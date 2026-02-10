@@ -456,79 +456,73 @@ def _compute_risky_keyword_factor(
 
 # ==================== MODIFIED: PARSING ====================
 
-def _parse_llm_line(content: str, off_threshold: float) -> Tuple[str, str, float, float, Dict[str, float]]:
+# Updated _parse_llm_line() function for decider.py
+
+def _parse_llm_line(
+    content: str, 
+    off_threshold: float,
+    categories: List[Dict] = None
+) -> Tuple[str, str, float, float, str, bool]:
     """
-    Parse LLM response including optional factor scores.
+    Parse LLM response to extract category and other info.
+    
+    Args:
+        content: Raw LLM response text
+        off_threshold: Threshold for OFF-TASK (kept for backwards compatibility)
+        categories: List of available categories
     
     Returns:
-        (label, reason, off_score, conf, factors_dict)
+        (category_id, category_name, off_score, conf, reason, is_productive)
     """
     content = (content or "").strip()
 
-    # Match ON-TASK, OFF-TASK, or ABSTAIN
-    m_label = re.search(r"LABEL\s*=\s*(ON-TASK|OFF-TASK|ABSTAIN)", content, flags=re.I)
-    if m_label:
-        label = m_label.group(1).upper()
+    # Extract CATEGORY instead of LABEL
+    m_category = re.search(r"CATEGORY\s*=\s*(.+?)(?:\||$)", content, flags=re.I)
+    if m_category:
+        category_name = m_category.group(1).strip().strip('"').strip("'")
     else:
-        # Fallback parsing
-        upper = content.upper()
-        if "ABSTAIN" in upper:
-            label = "ABSTAIN"
-        elif "OFF-TASK" in upper:
-            label = "OFF-TASK"
-        elif "ON-TASK" in upper:
-            label = "ON-TASK"
-        else:
-            label = "[WARN]"
-
+        # Fallback: try to find category name in content
+        category_name = None
+    
+    # Extract OFF_SCORE and CONF (same as before)
     m_off = re.search(r"OFF_SCORE\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
     m_conf = re.search(r"CONF\s*=\s*([01](?:\.\d+)?|\.\d+)", content, flags=re.I)
-
-    # Default OFF_SCORE
-    if m_off:
-        off_score = float(m_off.group(1))
-    elif label == "OFF-TASK":
-        off_score = 0.8
-    elif label == "ABSTAIN":
-        off_score = 0.5
-    else:
-        off_score = 0.2
-
+    
+    off_score = float(m_off.group(1)) if m_off else 0.5
     conf = float(m_conf.group(1)) if m_conf else 0.5
-
+    
+    # Clamp values
     off_score = min(max(off_score, 0.0), 1.0)
     conf = min(max(conf, 0.0), 1.0)
-
+    
+    # Extract REASON
     m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
     reason = m_reason.group(1).strip() if m_reason else ""
-
-    # FN-biased normalization
-    if label == "OFF-TASK" and off_score < off_threshold:
-        off_score = off_threshold
-
-    # NEW: Extract optional factor scores from LLM
-    factors = {}
-    factor_names = [
-        "WINDOW_RELEVANCE",
-        "TYPING_ENGAGEMENT", 
-        "CONTEXT_TRAJECTORY",
-        "DWELL_PENALTY",
-    ]
     
-    for factor_name in factor_names:
-        # Match formats like: WINDOW_RELEVANCE=0.8 or WINDOW_RELEVANCE = -0.3
-        m = re.search(rf"{factor_name}\s*=\s*([-+]?[01](?:\.\d+)?|[-+]?\.\d+)", content, flags=re.I)
-        if m:
-            try:
-                score = float(m.group(1))
-                # Clamp to [-1, 1]
-                score = min(max(score, -1.0), 1.0)
-                factors[factor_name.lower()] = score
-            except ValueError:
-                pass
-
-    return label, reason, off_score, conf, factors
-
+    # Look up category in categories list
+    category_id = None
+    is_productive = None
+    
+    if categories and category_name:
+        # Find matching category (case-insensitive)
+        for cat in categories:
+            if cat['name'].lower() == category_name.lower():
+                category_id = cat['category_id']
+                category_name = cat['name']  # Use exact casing from sheet
+                is_productive = cat.get('is_productive', None)
+                break
+    
+    # If category not found, mark as unknown
+    if category_id is None and category_name:
+        category_id = "unknown"
+        is_productive = None
+        print(f"[warn] Category '{category_name}' not found in categories list")
+    elif category_id is None:
+        category_id = "error"
+        category_name = "[PARSE_ERROR]"
+        is_productive = None
+    
+    return category_id, category_name, off_score, conf, reason, is_productive
 
 # ==================== MODIFIED: ASK GPT ====================
 
@@ -576,40 +570,107 @@ def _read_prompt_file(filename: str) -> str:
         return ""
 
 
-def build_prompt(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
+# Updated build_prompt() function for decider.py
+
+def build_prompt(
+    events: List[Tuple[str, str]], 
+    keystroke_summary: str = "",
+    categories: List[Dict] = None,
+    user_goals: str = ""
+) -> str:
+    """
+    Build category-based prompt with user goals and category list.
+    
+    Args:
+        events: List of (timestamp, window_key) tuples
+        keystroke_summary: Summary of recent keystrokes
+        categories: List of category dicts from sheets
+        user_goals: User's current projects and goals
+    
+    Returns:
+        Filled-in prompt string ready for LLM
+    """
     activity_str = ", ".join([k for _, k in events])
     extra = f"\nKeystroke Activity (last 60s): {keystroke_summary}" if keystroke_summary else ""
-
+    
     template = _read_prompt_file("prompt-main.txt")
     if not template:
+        # Fallback if prompt file not found
         return (
-            "You are a focus judge. Determine if the user is ON-TASK or OFF-TASK.\n"
+            "You are a focus judge. Categorize the user's activity.\n"
             f"Recent activity: {activity_str}{extra}\n"
-            "Output: LABEL=<ON-TASK|OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
+            "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
         )
-    return template.replace("[insert here]", activity_str + extra)
+    
+    # Build category list string
+    if categories:
+        category_list = "\n".join([
+            f"- \"{cat['name']}\": {cat['description']} ({'PRODUCTIVE' if cat.get('is_productive') else 'NOT PRODUCTIVE'})"
+            for cat in categories
+        ])
+    else:
+        category_list = "(no categories available)"
+    
+    # Fill in all placeholders
+    filled = template
+    filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
+    filled = filled.replace("[insert categories here]", category_list)
+    filled = filled.replace("[insert here]", activity_str + extra)
+    
+    return filled
 
+# Updated build_critic_prompt() function for decider.py
 
-def build_critic_prompt(events: List[Tuple[str, str]], p1_summary: str, keystroke_summary: str = "") -> str:
+def build_critic_prompt(
+    events: List[Tuple[str, str]], 
+    p1_summary: str, 
+    keystroke_summary: str = "",
+    categories: List[Dict] = None,
+    user_goals: str = ""
+) -> str:
+    """
+    Build critic prompt to review primary model's category choice.
+    
+    Args:
+        events: List of (timestamp, window_key) tuples
+        p1_summary: Primary model's decision summary
+        keystroke_summary: Summary of recent keystrokes
+        categories: List of category dicts from sheets
+        user_goals: User's current projects and goals
+    
+    Returns:
+        Filled-in critic prompt string ready for LLM
+    """
     activity_str = ", ".join([k for _, k in events])
     extra = f"\nKeystroke Activity: {keystroke_summary}" if keystroke_summary else ""
 
     template = _read_prompt_file("prompt-critic.txt")
     if not template:
+        # Fallback if prompt file not found
         return (
-            "You are a strict critic. Improve the classification.\n"
+            "You are a strict critic. Review the classification.\n"
             f"Initial model summary: {p1_summary}\n"
             f"Recent activity: {activity_str}{extra}\n"
-            "Output: LABEL=<ON-TASK|OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
+            "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
         )
-
-    if template.count("[insert here]") >= 2:
-        template = template.replace("[insert here]", p1_summary, 1)
-        template = template.replace("[insert here]", activity_str + extra, 1)
+    
+    # Build category list string
+    if categories:
+        category_list = "\n".join([
+            f"- \"{cat['name']}\": {cat['description']} ({'PRODUCTIVE' if cat.get('is_productive') else 'NOT PRODUCTIVE'})"
+            for cat in categories
+        ])
     else:
-        template += f"\n\nInitial: {p1_summary}\nActivity: {activity_str}{extra}"
-    return template
-
+        category_list = "(no categories available)"
+    
+    # Fill in all placeholders
+    filled = template
+    filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
+    filled = filled.replace("[insert categories here]", category_list)
+    filled = filled.replace("[insert here]", p1_summary)
+    filled = filled.replace("[insert activity here]", activity_str + extra)
+    
+    return filled
 
 def take_screenshot_b64() -> Optional[str]:
     if not ImageGrab:
