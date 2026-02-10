@@ -526,6 +526,9 @@ def _parse_llm_line(
 
 # ==================== MODIFIED: ASK GPT ====================
 
+# Updated ask_gpt() function for decider.py
+# Replace the existing ask_gpt() function with this
+
 def ask_gpt(
     prompt: str,
     model: str,
@@ -533,12 +536,21 @@ def ask_gpt(
     max_tokens: int,
     temperature: float,
     off_threshold: float,
-) -> Tuple[str, str, float, float, Dict[str, float], str]:
+    categories: List[Dict] = None,
+) -> Tuple[str, str, float, float, str, bool, str]:
     """
-    Modified to return factors dict.
+    Call GPT with prompt and parse response for category.
+    
+    Args:
+        prompt: Filled-in prompt string
+        model: Model name (e.g., "gpt-4o-mini")
+        max_tokens: Max response tokens
+        temperature: Sampling temperature
+        off_threshold: Threshold for OFF-TASK (kept for compatibility)
+        categories: List of available categories
     
     Returns:
-        (label, reason, off_score, conf, factors, raw_content)
+        (category_id, category_name, off_score, conf, reason, is_productive, raw_content)
     """
     try:
         resp = openai.chat.completions.create(
@@ -548,11 +560,19 @@ def ask_gpt(
             temperature=temperature,
         )
         content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf, factors = _parse_llm_line(content, off_threshold)
-        return label, reason, off_score, conf, factors, content
+        
+        # Parse response using updated parser
+        category_id, category_name, off_score, conf, reason, is_productive = _parse_llm_line(
+            content, 
+            off_threshold,
+            categories
+        )
+        
+        return category_id, category_name, off_score, conf, reason, is_productive, content
+        
     except Exception as e:
-        return "[ERROR]", str(e), 0.5, 0.5, {}, ""
-
+        # Error handling - return error category
+        return "error", "[ERROR]", 0.5, 0.5, str(e), None, ""
 
 # ==================== REST OF FILE UNCHANGED ====================
 # (Keep all existing functions: build_prompt, build_critic_prompt, 
@@ -685,27 +705,69 @@ def take_screenshot_b64() -> Optional[str]:
         print(f"[warn] screenshot failed: {e}")
         return None
 
+# New ask_gpt_vision_category() function for decider.py
+# Add this NEW function to decider.py (after ask_gpt_vision or near other vision code)
 
-def ask_gpt_vision(
+def ask_gpt_vision_category(
     screenshot_b64: str,
     events: List[Tuple[str, str]],
-    main_reason: str,
+    primary_category: str,
+    primary_reason: str,
+    critic_category: str,
     critic_reason: str,
     *,
     model: str,
     max_tokens: int,
     off_threshold: float,
+    categories: List[Dict] = None,
 ) -> Tuple[str, str, float, float]:
+    """
+    Vision tiebreaker for category disagreement.
+    
+    Args:
+        screenshot_b64: Base64-encoded screenshot
+        events: Recent window events
+        primary_category: Primary model's category choice
+        primary_reason: Primary model's reasoning
+        critic_category: Critic's category choice
+        critic_reason: Critic's reasoning
+        model: Vision model name
+        max_tokens: Max tokens
+        off_threshold: OFF threshold
+        categories: Available categories
+    
+    Returns:
+        (category_id, category_name, off_score, conf)
+    """
     activity_str = ", ".join([k for _, k in events])
-    prompt = (
-        "You are the final judge. Resolving a disagreement.\n"
-        f"Context: {activity_str}\n"
-        f"Main Model said ON-TASK: {main_reason}\n"
-        f"Critic Model said OFF-TASK: {critic_reason}\n\n"
-        "Look at the screen. What is the user *actually* doing?\n"
-        "Output strict single line format:\n"
-        "LABEL=<ON-TASK|OFF-TASK> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explanation>"
-    )
+    
+    # Build category list
+    if categories:
+        category_list = "\n".join([
+            f"- \"{cat['name']}\": {cat['description']}"
+            for cat in categories
+        ])
+    else:
+        category_list = "(no categories available)"
+    
+    prompt = f"""You are the final judge. Resolving a category disagreement.
+
+AVAILABLE CATEGORIES:
+{category_list}
+
+Context: {activity_str}
+
+Primary Model said: {primary_category}
+Reason: {primary_reason}
+
+Critic Model said: {critic_category}
+Reason: {critic_reason}
+
+Look at the screen. What is the user *actually* doing? Which category is most accurate?
+
+Output strict single line format:
+CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explanation>"""
+
     try:
         resp = openai.chat.completions.create(
             model=model,
@@ -720,11 +782,18 @@ def ask_gpt_vision(
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        label, reason, off_score, conf, _ = _parse_llm_line(content, off_threshold)
-        return label, reason, off_score, conf
+        
+        # Parse using same parser
+        cat_id, cat_name, off_score, conf, reason, is_productive = _parse_llm_line(
+            content, 
+            off_threshold,
+            categories
+        )
+        
+        return cat_id, cat_name, off_score, conf
+        
     except Exception as e:
-        return "[ERROR]", str(e), 0.5, 0.5
-
+        return "error", "[ERROR]", 0.5, 0.5
 
 def _is_risky_context(events: List[Tuple[str, str]], settings: Settings) -> bool:
     text = " ".join([k for _, k in events]).lower()
@@ -753,194 +822,201 @@ def _should_run_critic(p1_label: str, p1_off: float, p1_conf: float, events: Lis
 
     return False
 
+# Updated decide_with_critic() function for decider.py
+# Replace the existing decide_with_critic() function with this
 
 def decide_with_critic(
     events_context,
     keystroke_summary: str = "",
     settings: Settings = DEFAULT_SETTINGS,
     window_dwell_info: Optional[Dict[str, Any]] = None,
+    categories: List[Dict] = None,
+    user_goals: str = "",
 ) -> Dict[str, Any]:
     """
-    Modified to include factor scoring.
+    Category-based decision with optional critic verification.
     
     Args:
         events_context: List of (timestamp, window_title)
         keystroke_summary: Summary of keystroke activity
         settings: Configuration
-        window_dwell_info: Optional dwell time tracking dict
+        window_dwell_info: Optional dwell time tracking (not used anymore)
+        categories: List of available categories from sheets
+        user_goals: User's current projects and goals
     
     Returns:
-        Dict with decision info + factor scores
+        Dict with decision info including category
     """
     
-    # Compute local factors
-    computed_factors = compute_factor_scores(
-        events_context,
+    # Build prompt with categories and goals
+    p1_prompt = build_prompt(
+        events_context, 
         keystroke_summary,
-        settings,
-        window_dwell_info
+        categories=categories,
+        user_goals=user_goals
     )
     
-    # Primary model
-    p1_prompt = build_prompt(events_context, keystroke_summary)
-    p1_label, p1_reason, p1_off, p1_conf, p1_factors, _ = ask_gpt(
+    # Primary model call
+    p1_cat_id, p1_cat_name, p1_off, p1_conf, p1_reason, p1_is_productive, p1_raw = ask_gpt(
         p1_prompt,
         settings.model,
         max_tokens=60,
         temperature=0.0,
         off_threshold=settings.off_threshold,
+        categories=categories,
     )
     
-    # Merge LLM factors with computed factors
-    all_factors = {**computed_factors, **p1_factors}
-    
     primary_res = {
-        "label": p1_label,
-        "reason": p1_reason or "",
+        "category_id": p1_cat_id,
+        "category_name": p1_cat_name,
+        "is_productive": p1_is_productive,
         "off": p1_off,
         "conf": p1_conf,
-        "factors": all_factors,
+        "reason": p1_reason or "",
     }
 
-    def mk_ret(label, reason, off, conf, critic_ran, critic_res=None, vision_res=None):
+    def mk_ret(cat_id, cat_name, is_productive, off, conf, reason, critic_ran, critic_res=None, vision_res=None):
         return {
-            "final_label": label,
-            "final_reason": reason,
+            "final_category_id": cat_id,
+            "final_category_name": cat_name,
+            "final_is_productive": is_productive,
             "final_off": off,
             "final_conf": conf,
+            "final_reason": reason,
             "critic_ran": critic_ran,
             "primary": primary_res,
             "critic": critic_res,
             "vision": vision_res,
-            "factors": all_factors,
-            "aggregate_score": aggregate_factor_score(all_factors)[0],
         }
 
-    if p1_label in ("[ERROR]", "[WARN]"):
-        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], False)
+    # Handle errors
+    if p1_cat_id in ("error", "unknown"):
+        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, primary_res["reason"], False)
 
-    # NEW: Apply hybrid decision
-    hybrid_label, hybrid_reason, hybrid_off, hybrid_conf = decide_hybrid_simple(
-        all_factors,
-        p1_label,
-        p1_off,
-        p1_conf,
-        p1_reason,
-        settings.off_threshold,
+    # Check if critic should run
+    if not _should_run_critic_category(p1_cat_id, p1_cat_name, p1_conf, p1_is_productive, events_context, settings):
+        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, p1_reason, False)
+
+    # Run critic
+    p1_summary = f"CATEGORY={p1_cat_name} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
+    c_prompt = build_critic_prompt(
+        events_context, 
+        p1_summary, 
+        keystroke_summary,
+        categories=categories,
+        user_goals=user_goals
     )
 
-    if not _should_run_critic(hybrid_label, hybrid_off, hybrid_conf, events_context, settings):
-        return mk_ret(hybrid_label, hybrid_reason, hybrid_off, hybrid_conf, False)
-
-    # Critic
-    p1_summary = f"LABEL={p1_label} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
-    c_prompt = build_critic_prompt(events_context, p1_summary, keystroke_summary)
-
-    c_label, c_reason, c_off, c_conf, c_factors, _ = ask_gpt(
+    c_cat_id, c_cat_name, c_off, c_conf, c_reason, c_is_productive, c_raw = ask_gpt(
         c_prompt,
         settings.critic_model(),
         max_tokens=settings.critic.max_tokens,
         temperature=settings.critic.temperature,
         off_threshold=settings.off_threshold,
+        categories=categories,
     )
     
     critic_res = {
-        "label": c_label,
-        "reason": c_reason or "",
+        "category_id": c_cat_id,
+        "category_name": c_cat_name,
+        "is_productive": c_is_productive,
         "off": c_off,
         "conf": c_conf,
-        "factors": c_factors,
+        "reason": c_reason or "",
     }
 
-    if c_label in ("[ERROR]", "[WARN]"):
-        return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)
+    # Handle critic errors
+    if c_cat_id in ("error", "unknown"):
+        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, primary_res["reason"], True, critic_res)
 
-    critic_says_off = (c_label == "OFF-TASK") or (c_off >= settings.off_threshold)
+    # Check for disagreement (different categories)
+    critic_disagrees = (c_cat_id != p1_cat_id)
 
-    if critic_says_off:
-        if settings.critic.vision_enabled:
-            print("[info] Disagreement: critic says OFF. Trying vision tiebreak...")
-            b64_img = take_screenshot_b64()
-            if b64_img:
-                v_label, v_reason, v_off, v_conf = ask_gpt_vision(
-                    b64_img,
-                    events_context,
-                    p1_reason,
-                    c_reason,
-                    model=settings.critic.vision_model,
-                    max_tokens=settings.critic.vision_max_tokens,
-                    off_threshold=settings.off_threshold,
-                )
-                if v_label not in ("[ERROR]", "[WARN]"):
-                    vision_res = {
-                        "label": v_label,
-                        "reason": v_reason,
-                        "off": v_off,
-                        "conf": v_conf,
-                    }
-                    return mk_ret(v_label, f"[Vision] {v_reason}", v_off, v_conf, True, critic_res, vision_res)
+    if critic_disagrees and settings.critic.vision_enabled:
+        # Vision tiebreaker
+        print("[info] Category disagreement: primary says {p1_cat_name}, critic says {c_cat_name}. Trying vision tiebreak...")
+        b64_img = take_screenshot_b64()
+        if b64_img:
+            v_cat_id, v_cat_name, v_off, v_conf = ask_gpt_vision_category(
+                b64_img,
+                events_context,
+                p1_cat_name,
+                p1_reason,
+                c_cat_name,
+                c_reason,
+                model=settings.critic.vision_model,
+                max_tokens=settings.critic.vision_max_tokens,
+                off_threshold=settings.off_threshold,
+                categories=categories,
+            )
+            if v_cat_id not in ("error", "unknown"):
+                vision_res = {
+                    "category_id": v_cat_id,
+                    "category_name": v_cat_name,
+                    "off": v_off,
+                    "conf": v_conf,
+                }
+                # Find is_productive from category
+                v_is_productive = None
+                if categories:
+                    for cat in categories:
+                        if cat['category_id'] == v_cat_id:
+                            v_is_productive = cat.get('is_productive')
+                            break
+                
+                return mk_ret(v_cat_id, v_cat_name, v_is_productive, v_off, v_conf, f"[Vision] {c_reason}", True, critic_res, vision_res)
 
-        # fallback to critic
+    # No vision or vision failed - use critic if it disagrees
+    if critic_disagrees:
         final_off = max(p1_off, c_off)
         return mk_ret(
-            "OFF-TASK",
-            f"[Critic] {critic_res['reason'] or primary_res['reason']}",
+            c_cat_id,
+            c_cat_name,
+            c_is_productive,
             final_off,
             c_conf,
+            f"[Critic] {critic_res['reason'] or primary_res['reason']}",
             True,
             critic_res,
         )
 
-    # critic agrees ON-TASK
-    return mk_ret(p1_label, primary_res["reason"], primary_res["off"], primary_res["conf"], True, critic_res)
+    # Critic agrees - use primary
+    return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, p1_reason, True, critic_res)
 
-if __name__ == "__main__":
-    # Test the aggregation function
-    print("Testing aggregate_factor_score()...")
+
+def _should_run_critic_category(
+    cat_id: str,
+    cat_name: str, 
+    conf: float,
+    is_productive: bool,
+    events: List[Tuple[str, str]], 
+    settings: Settings
+) -> bool:
+    """
+    Decide if critic should run based on category classification.
     
-    # Test case 1: Clear OFF-TASK
-    test_factors_1 = {
-        "window_relevance": -0.9,  # YouTube
-        "dwell_time": -0.8,         # Long time, no activity
-        "keystroke_activity": -0.6, # Idle
-        "trajectory": -0.7,         # Drifting
-        "risky_keywords": -0.9      # Risky site
-    }
+    Args:
+        cat_id: Category ID
+        cat_name: Category name
+        conf: Confidence of primary model
+        is_productive: Whether category is productive
+        events: Recent window events
+        settings: Configuration
     
-    score_1, explanation_1 = aggregate_factor_score(test_factors_1)
-    print(f"\nTest 1 (should be OFF-TASK):")
-    print(f"  Score: {score_1:+.2f}")
-    print(f"  Explanation: {explanation_1}")
-    print(f"  Decision: {'OFF-TASK' if score_1 < -0.3 else 'ON-TASK' if score_1 > 0.3 else 'UNCERTAIN'}")
+    Returns:
+        True if critic should run
+    """
+    c = settings.critic
+    if not c.enabled:
+        return False
+
+    # Always run critic on low confidence
+    if conf <= c.trigger_conf_max:
+        return True
     
-    # Test case 2: Clear ON-TASK
-    test_factors_2 = {
-        "window_relevance": 0.9,   # VS Code
-        "dwell_time": 0.5,          # Good dwell + activity
-        "keystroke_activity": 0.7,  # Typing a lot
-        "trajectory": 0.6,          # Stable work
-        "risky_keywords": 0.0       # No risky sites
-    }
+    # Run on ambiguous categories (these can easily be wrong)
+    ambiguous_categories = ["research", "communication", "research & learning"]
+    if cat_name.lower() in ambiguous_categories:
+        return True
     
-    score_2, explanation_2 = aggregate_factor_score(test_factors_2)
-    print(f"\nTest 2 (should be ON-TASK):")
-    print(f"  Score: {score_2:+.2f}")
-    print(f"  Explanation: {explanation_2}")
-    print(f"  Decision: {'OFF-TASK' if score_2 < -0.3 else 'ON-TASK' if score_2 > 0.3 else 'UNCERTAIN'}")
-    
-    # Test case 3: Mixed/Uncertain
-    test_factors_3 = {
-        "window_relevance": 0.6,   # Educational site
-        "dwell_time": -0.3,         # Been here a while, low activity
-        "keystroke_activity": 0.1,  # Some typing
-        "trajectory": 0.0,          # Neutral
-        "risky_keywords": 0.0       # No risky keywords
-    }
-    
-    score_3, explanation_3 = aggregate_factor_score(test_factors_3)
-    print(f"\nTest 3 (should be UNCERTAIN):")
-    print(f"  Score: {score_3:+.2f}")
-    print(f"  Explanation: {explanation_3}")
-    print(f"  Decision: {'OFF-TASK' if score_3 < -0.3 else 'ON-TASK' if score_3 > 0.3 else 'UNCERTAIN'}")
-    
-    print("\n✓ If these results look reasonable, move to Step 2")
+    return False
