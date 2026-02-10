@@ -8,8 +8,11 @@ from typing import List, Optional
 tracing = False
 
 @dataclass(frozen=True)
-class AlertSettings:
+class PopupSettings:
+    """Settings for off-task popup alerts."""
     enabled: bool = True
+    duration: int = 5  # seconds to show popup
+    sound_enabled: bool = True
     repeat_while_offtask: bool = True
     cooldown_sec: float = 5.0   # re-alert every 5s while OFF-TASK
 
@@ -90,8 +93,18 @@ class Settings:
     # General
     log_dir: str = r".\logs"
     model: str = "gpt-4o-mini"
-    interval_sec: float = 3.0
-    max_events: int = 10
+    
+    # Timing settings for runner
+    poll_interval: float = 2.0  # How often to collect window events (seconds)
+    decision_interval: float = 60.0  # How often to make decisions (seconds)
+    
+    # Context window
+    context_window_size: int = 30  # Number of recent events to keep
+    min_events: int = 5  # Minimum events before making first decision
+    
+    # Legacy settings (kept for compatibility)
+    interval_sec: float = 3.0  # Old name for poll_interval
+    max_events: int = 10  # Old context window size
 
     # OFF-TASK threshold
     off_threshold: float = 0.60
@@ -107,7 +120,7 @@ class Settings:
     sheets: SheetsSettings = field(default_factory=SheetsSettings)
     keystrokes: KeystrokeSettings = field(default_factory=KeystrokeSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
-    alerts: AlertSettings = field(default_factory=AlertSettings)
+    popup: PopupSettings = field(default_factory=PopupSettings)  # Renamed from 'alerts'
     user_goals: UserGoalsSettings = field(default_factory=UserGoalsSettings)
 
     def critic_model(self) -> str:
@@ -144,3 +157,15 @@ DEFAULT_SETTINGS = Settings(
         replay_realtime=not tracing,
     ),
 )
+
+
+def load_settings() -> Settings:
+    """
+    Load settings from config file or environment.
+    
+    For now, just returns DEFAULT_SETTINGS.
+    In the future, this could load from YAML/JSON config files.
+    """
+    # TODO: Add config file loading here if needed
+    # For now, just use defaults
+    return DEFAULT_SETTINGS
