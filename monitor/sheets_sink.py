@@ -67,7 +67,7 @@ class SheetsSink:
         self.buffer: List[List[str]] = []
         self.last_flush_time = time.time()
 
-        # NEW: Categories worksheet reference
+        # Categories worksheet reference
         self.categories_ws = None
         self._categories_cache: Optional[List[Dict]] = None
 
@@ -98,12 +98,12 @@ class SheetsSink:
             self.categories_ws = self.sh.add_worksheet(
                 title="Categories",
                 rows="50",
-                cols="7",
+                cols="6",
                 index=0  # Put at beginning of workbook
             )
             # Write headers
-            headers = ["category_id", "name", "description", "color", "emoji", "is_productive", "created_at"]
-            self.categories_ws.update("A1:G1", [headers], value_input_option="RAW")
+            headers = ["category_id", "name", "description", "color", "is_productive", "created_at"]
+            self.categories_ws.update("A1:F1", [headers], value_input_option="RAW")
             
             # Seed default categories
             self._seed_default_categories()
@@ -115,16 +115,20 @@ class SheetsSink:
         
         defaults = [
             # Productive categories
-            ["deep_work", "Deep Work", "VS Code, PyCharm, coding, writing, focused tasks. Examples: .py files, homework assignments, project work", "#2ecc71", "💻", "TRUE", now_str],
-            ["homework", "Homework", "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "#9b59b6", "📝", "TRUE", now_str],
-            ["research", "Research & Learning", "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "#3498db", "📚", "TRUE", now_str],
-            ["communication", "Communication", "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "#f39c12", "💬", "TRUE", now_str],
+            ["deep_work", "Deep Work", "VS Code, PyCharm, coding, writing, focused tasks. Examples: .py files, homework assignments, project work", "#2ecc71", "TRUE", now_str],
+            ["homework", "Homework", "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "#9b59b6", "TRUE", now_str],
+            ["research", "Research & Learning", "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "#3498db", "TRUE", now_str],
+            ["communication", "Communication", "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "#f39c12", "TRUE", now_str],
             
             # Non-productive categories
-            ["social_media", "Social Media", "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "#e74c3c", "📱", "FALSE", now_str],
-            ["entertainment", "Entertainment", "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "#c0392b", "🎬", "FALSE", now_str],
-            ["gaming", "Gaming", "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "#8e44ad", "🎮", "FALSE", now_str],
-            ["shopping", "Shopping", "Amazon, eBay, AliExpress, online shopping, browsing products", "#d35400", "🛒", "FALSE", now_str],
+            ["social_media", "Social Media", "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "#e74c3c", "FALSE", now_str],
+            ["entertainment", "Entertainment", "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "#c0392b", "FALSE", now_str],
+            ["gaming", "Gaming", "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "#8e44ad", "FALSE", now_str],
+            ["shopping", "Shopping", "Amazon, eBay, AliExpress, online shopping, browsing products", "#d35400", "FALSE", now_str],
+            ["other", "Other Off-Task", "Any other off-task activity that doesn't fit the above categories", "#95a5a6", "FALSE", now_str],
+            
+            # Ambiguous
+            ["ambiguous", "Ambiguous", "Activity that cannot be clearly categorized as productive or non-productive from available context", "#bdc3c7", "", now_str],
         ]
         
         self.categories_ws.append_rows(defaults, value_input_option="USER_ENTERED")
@@ -132,7 +136,7 @@ class SheetsSink:
     def get_categories(self) -> List[Dict]:
         """
         Load all categories from Categories sheet.
-        Returns list of dicts with keys: category_id, name, description, color, emoji, is_productive, created_at
+        Returns list of dicts with keys: category_id, name, description, color, is_productive, created_at
         """
         if self._categories_cache is not None:
             return self._categories_cache
@@ -146,19 +150,25 @@ class SheetsSink:
         categories = []
         for r in records:
             cat = dict(r)
-            # Convert is_productive to boolean
+            # Convert is_productive to boolean (empty string = None for Ambiguous)
             if isinstance(cat.get('is_productive'), str):
-                cat['is_productive'] = cat['is_productive'].upper() in ('TRUE', 'YES', '1')
+                val = cat['is_productive'].strip().upper()
+                if val in ('TRUE', 'YES', '1'):
+                    cat['is_productive'] = True
+                elif val in ('FALSE', 'NO', '0'):
+                    cat['is_productive'] = False
+                else:
+                    cat['is_productive'] = None
             categories.append(cat)
         
         self._categories_cache = categories
         return categories
 
     def _expected_headers(self) -> List[str]:
-        """Define the headers for daily Focus Logs sheets - NEW SCHEMA."""
+        """Define the headers for daily Focus Logs sheets."""
         base = [
             "timestamp",
-            # Category fields (NEW)
+            # Category fields
             "category_id",
             "category_name",
             "is_productive",
@@ -244,7 +254,7 @@ class SheetsSink:
     # ------------------- internal formatting -------------------
 
     def _flatten_row(self, record: Dict[str, Any]) -> List[str]:
-        """Convert record dict to row list matching headers - NEW SCHEMA."""
+        """Convert record dict to row list matching headers."""
         def get(k, default=""):
             v = record.get(k, default)
             return "" if v is None else str(v)

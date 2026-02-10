@@ -172,23 +172,8 @@ def _show_offtask_alert(
     cat_name = decision.get("final_category_name", "Unknown")
     reason = decision.get("final_reason", "")
 
-    # Find emoji from category info if available
-    primary = decision.get("primary", {})
-    emoji = ""
-    # Fall back to generic emoji based on known categories
-    emoji_map = {
-        "social media": "📱",
-        "entertainment": "🎬",
-        "gaming": "🎮",
-        "shopping": "🛒",
-    }
-    for key, em in emoji_map.items():
-        if key in cat_name.lower():
-            emoji = em
-            break
-
     title = "Focus Alert"
-    msg = f"{emoji} {cat_name}"
+    msg = f"Off-task: {cat_name}"
     if reason:
         msg += f"\n{reason}"
 

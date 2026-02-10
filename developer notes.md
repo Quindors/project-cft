@@ -1,142 +1,105 @@
-# cft → Category-Based System: Migration Checklist
+## cft → Category-Based System: Migration Checklist
 
-## Phase 1: Data Model
+## Phase 1: Data Model ✅
 
-- [ ] Create "Categories" sheet in Google Sheets
-  - [ ] Columns: `category_id`, `name`, `description`, `is_productive`, `created_at`
-  - [ ] Seed with default categories (Deep Work, Homework, Research, Communication, Social Media, Entertainment, Gaming, Shopping, Ambiguous)
-  - [ ] Add `get_categories()` method to `sheets_sink.py`
+- [x] Create "Categories" sheet in Google Sheets
+  - [x] Columns: `category_id`, `name`, `description`, `is_productive`, `created_at`
+  - [x] Seed with default categories (Deep Work, Homework, Research & Learning, Communication, Social Media, Entertainment, Gaming, Shopping, Other Off-Task, Ambiguous)
+  - [x] Add `get_categories()` method to `sheets_sink.py`
 
-- [ ] Update daily "Focus Logs" sheet schema
-  - [ ] Add `category_id` column
-  - [ ] Add `category_name` column
-  - [ ] Add `is_productive` column (derived from category)
-  - [ ] Remove old `label` column
-  - [ ] Update `_expected_headers()` in `sheets_sink.py`
+- [x] Update daily "Focus Logs" sheet schema
+  - [x] Add `category_id` column
+  - [x] Add `category_name` column
+  - [x] Add `is_productive` column (derived from category)
+  - [x] Remove old `label` column
+  - [x] Update `_expected_headers()` in `sheets_sink.py`
 
-## Phase 2: User Goals
+## Phase 2: User Goals ✅
 
-- [ ] Create `user_goals.txt` file in project root
-  - [ ] Add template with example goals
-  - [ ] Document format in README
+- [x] Create `user_goals.txt` file in project root
+  - [x] Add template with example goals
+- [x] Add goals loading to `config.py`
+  - [x] Read goals from file
+  - [x] Provide sensible default if file missing
 
-- [ ] Add goals loading to `config.py`
-  - [ ] Read goals from file
-  - [ ] Provide sensible default if file missing
+## Phase 3: LLM Prompts ✅
 
-## Phase 3: LLM Prompts
+- [x] Update `prompt-main.txt`
+  - [x] Add USER'S GOALS section
+  - [x] Add AVAILABLE CATEGORIES section
+  - [x] Change output from LABEL to CATEGORY
+  - [x] Keep OFF_SCORE, CONF, REASON
 
-- [ ] Update `prompt-main.txt`
-  - [ ] Add USER'S GOALS section
-  - [ ] Add AVAILABLE CATEGORIES section
-  - [ ] Change output from LABEL to CATEGORY
-  - [ ] Keep OFF_SCORE, CONF, REASON for now
+- [x] Update `prompt-critic.txt`
+  - [x] Add categories context
+  - [x] Change to category-based reasoning
 
-- [ ] Update `prompt-critic.txt`
-  - [ ] Add categories context
-  - [ ] Change to category-based reasoning
+## Phase 4: Decision Logic ✅
 
-## Phase 4: Decision Logic
+- [x] Modify `build_prompt()` in `decider.py`
+- [x] Update `_parse_llm_line()` in `decider.py`
+- [x] Update `ask_gpt()` in `decider.py`
+- [x] Simplify `decide_with_critic()` in `decider.py`
+  - [x] Remove factor scoring calls
+  - [x] Remove `decide_hybrid_simple()`
+  - [x] Keep critic + vision tiebreaker logic
+  - [x] Update trigger conditions for critic
 
-- [ ] Modify `build_prompt()` in `decider.py`
-  - [ ] Load categories from sheets
-  - [ ] Load user goals from file
-  - [ ] Build category list for prompt
-  - [ ] Pass to LLM
+## Phase 5: Remove Factor Scoring ✅
 
-- [ ] Update `_parse_llm_line()` in `decider.py`
-  - [ ] Extract CATEGORY instead of LABEL
-  - [ ] Look up category in categories list
-  - [ ] Derive `is_productive` from category
-  - [ ] Remove factor extraction code
+- [x] Delete from `decider.py`:
+  - [x] `compute_factor_scores()`
+  - [x] `aggregate_factor_score()`
+  - [x] `decide_hybrid_simple()`
+  - [x] `_compute_window_relevance()`
+  - [x] `_compute_dwell_factor()`
+  - [x] `_compute_keystroke_factor()`
+  - [x] `_compute_trajectory_factor()`
+  - [x] `_compute_risky_keyword_factor()`
+- [x] Remove factor columns from sheets schema
+- [x] Remove from `runner.py`: dwell time tracking, keystroke accumulation, factor display
+- [x] Remove `risky_keywords` from `config.py`
 
-- [ ] Update `ask_gpt()` in `decider.py`
-  - [ ] Return category info instead of label
-  - [ ] Simplify return signature
+## Phase 6: Critic & Vision Updates ✅
 
-- [ ] Simplify `decide_with_critic()` in `decider.py`
-  - [ ] Remove factor scoring calls
-  - [ ] Remove `decide_hybrid_simple()`
-  - [ ] Keep critic + vision tiebreaker logic
-  - [ ] Update trigger conditions for critic (low confidence, ambiguous categories)
+- [x] Update critic trigger logic (low confidence, ambiguous categories)
+- [x] Update vision tiebreaker (handles category disagreement)
 
-## Phase 5: Remove Factor Scoring
+## Phase 7: Popup Updates ✅
 
-- [ ] Delete from `decider.py`:
-  - [ ] `compute_factor_scores()`
-  - [ ] `aggregate_factor_score()`
-  - [ ] `decide_hybrid_simple()`
-  - [ ] `_compute_window_relevance()`
-  - [ ] `_compute_dwell_factor()`
-  - [ ] `_compute_keystroke_factor()`
-  - [ ] `_compute_trajectory_factor()`
-  - [ ] `_compute_risky_keyword_factor()`
+- [x] Show emoji + category name
+- [x] Show reason
 
-- [ ] Remove factor columns from sheets schema
-  - [ ] Delete: `factors_score`, `factor_window_relevance`, `factor_dwell_time`, `factor_keystroke`, `factor_trajectory`, `factor_risky`
+## Phase 8: Category Management ✅
 
-- [ ] Remove from `runner.py`:
-  - [ ] Dwell time tracking code
-  - [ ] Keystroke accumulation
-  - [ ] Factor display in console output
+- [x] Document in README
+  - [x] How to edit categories in Google Sheets
+  - [x] Category schema explanation
+  - [x] How to add new categories
 
-- [ ] Remove `risky_keywords` from `config.py`
+## Phase 9: Recategorization ✅
 
-## Phase 6: Critic & Vision Updates
+- [x] Document in README how to change category_id in logs sheet
 
-- [ ] Update critic trigger logic
-  - [ ] Trigger on low confidence
-  - [ ] Trigger on ambiguous categories (Research, Communication)
+## Phase 10: Cleanup ✅
 
-- [ ] Update vision tiebreaker
-  - [ ] Handle category disagreement (not just ON/OFF)
-  - [ ] Return category choice
+- [x] Remove unused files (see below)
+- [x] Remove factor-related test files
 
-## Phase 7: Popup Updates
+### Files removed:
+- `2scales.py`
+- `sliding_window_simple.py`
+- `analyse-simple.py`
+- `smtest.py`
+- `test2.py`
+- `test_realistic_dwell.py`
+- `testcats.py`
+- `train_prompts.py` (references old schema)
+- Root `runner.py` (moved to `monitor/runner.py`)
 
-- [ ] Modify `alerts.py`
-  - [ ] Show emoji + category name
-  - [ ] Show reason
-
-- [ ] Update `runner.py` alert messages
-  - [ ] Display category instead of ON-TASK/OFF-TASK
-  - [ ] Format: "📱 Social Media: Discord chatting"
-
-## Phase 8: Category Management
-
-- [ ] Document in README
-  - [ ] How to edit categories in Google Sheets
-  - [ ] Category schema explanation
-  - [ ] How to add new categories
-
-- [ ] Add validation
-  - [ ] Warn if category in logs doesn't exist in Categories sheet
-
-## Phase 9: Recategorization
-
-- [ ] Document in README
-  - [ ] How to change category_id in logs sheet
-  - [ ] What happens when category is corrected
-
-- [ ] (Optional) Add bulk recategorization script
-  - [ ] Update all events matching pattern
-  - [ ] Update date range
-
-## Phase 10: Testing & Cleanup
-
-- [ ] Update test traces with expected categories
-- [ ] Test with `monitor-sheets.py` in trace mode
-- [ ] Remove unused code:
-  - [ ] `2scales.py`
-  - [ ] `sliding_window_simple.py`
-  - [ ] `analyse-simple.py`
-  - [ ] Factor-related test files
-
-- [ ] Update README with new architecture
-
+---
 
 # Todo
-## 
 
 ## devops
 - start hosting it
@@ -144,17 +107,18 @@
 
 ## analytics
 - check dashboard accuracy
+- redesign dashboard for category breakdown
 - weekly report
 
 ## bugs/improvements
 - have the popup actually pop up on the front of the screen
 - have the popup auto-close after 3 seconds
 - increase startup speed of monitor-sheets.py
-- disable vision tiebreak when testing??
+- disable vision tiebreak when testing
 
-## how can I maintain user privacy when recording data to fine tune the model?
-- maybe find some real-world products that counter the privacy issue that use a similar ai format to my project
-- probably just like conceptual things that i can implement, like password redaction or smth
+## privacy
+- find real-world products with similar AI format for privacy reference
+- password redaction or similar
 
 ## 12/15
 Abstain as a first-class outcome: reliability increases massively when the system is allowed to say “UNKNOWN / NEEDS REVIEW” instead of guessing.
