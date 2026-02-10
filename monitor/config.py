@@ -24,8 +24,6 @@ class CriticSettings:
     temperature: float = 0.0
 
     trigger_conf_max: float = 0.70
-    trigger_off_min: float = 0.30
-    trigger_risky_keywords: bool = True
 
     # Vision tiebreaker
     vision_enabled: bool = True
@@ -106,33 +104,23 @@ class Settings:
     interval_sec: float = 3.0  # Old name for poll_interval
     max_events: int = 10  # Old context window size
 
-    # OFF-TASK threshold
+    # OFF-TASK threshold (used by LLM parsing)
     off_threshold: float = 0.60
-
-    risky_keywords: List[str] = field(default_factory=lambda: [
-        "youtube", "youtu.be", "reddit", "discord", "twitter", "x.com",
-        "instagram", "tiktok", "netflix", "twitch", "hulu", "prime video",
-        "steam", "epic games", "roblox", "minecraft",
-        "shopping", "amazon", "ebay", "aliexpress",
-    ])
 
     critic: CriticSettings = field(default_factory=CriticSettings)
     sheets: SheetsSettings = field(default_factory=SheetsSettings)
     keystrokes: KeystrokeSettings = field(default_factory=KeystrokeSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
-    popup: PopupSettings = field(default_factory=PopupSettings)  # Renamed from 'alerts'
+    popup: PopupSettings = field(default_factory=PopupSettings)
     user_goals: UserGoalsSettings = field(default_factory=UserGoalsSettings)
 
     def critic_model(self) -> str:
         return self.critic.model or self.model
     
     def load_user_goals(self) -> str:
-        """
-        Load user goals from file, or return default if file doesn't exist.
-        """
+        """Load user goals from file, or return default if file doesn't exist."""
         goals_path = self.user_goals.goals_file
         
-        # Try to read from file
         if os.path.exists(goals_path):
             try:
                 with open(goals_path, 'r', encoding='utf-8') as f:
@@ -146,7 +134,6 @@ class Settings:
         else:
             print(f"[info] {goals_path} not found, using default goals")
         
-        # Fall back to default
         return self.user_goals.default_goals.strip()
 
 
@@ -160,12 +147,5 @@ DEFAULT_SETTINGS = Settings(
 
 
 def load_settings() -> Settings:
-    """
-    Load settings from config file or environment.
-    
-    For now, just returns DEFAULT_SETTINGS.
-    In the future, this could load from YAML/JSON config files.
-    """
-    # TODO: Add config file loading here if needed
-    # For now, just use defaults
+    """Load settings. For now, returns DEFAULT_SETTINGS."""
     return DEFAULT_SETTINGS
