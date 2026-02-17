@@ -11,11 +11,17 @@ from typing import List, Tuple, Optional, Any
 
 from monitor.config import Settings, DEFAULT_SETTINGS
 
+# pynput needs X11 on Linux / WSL — catch ALL errors, not just ImportError
 try:
     from pynput import keyboard
-except ImportError:
+except Exception as e:
     keyboard = None
-    print("[warn] pynput not installed. Live KeyLogger disabled. pip install pynput")
+    _pynput_err = str(e)
+    if "No module" in str(e):
+        print("[warn] pynput not installed. Live KeyLogger disabled. pip install pynput")
+    else:
+        print(f"[warn] pynput available but cannot start (no X11/display): {type(e).__name__}")
+        print("[warn] Live KeyLogger disabled. Keystroke capture requires a display server.")
 
 
 def _tail_lines(path: str, max_lines: int = 300) -> List[str]:
@@ -102,7 +108,7 @@ class KeyLogger:
 
     def start(self):
         if not keyboard:
-            print("[warn] KeyLogger disabled: pynput not available.")
+            print("[warn] KeyLogger disabled: pynput not available on this platform.")
             return
         self.flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
         self.flush_thread.start()

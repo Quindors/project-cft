@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-# Active window logger (Windows-only)
-# Output JSONL (compatible with your focus monitor):
-#   {"timestamp":"YYYY-MM-DD HH:MM:SS","key":"WIN:<title>"}
+"""
+Active window logger (cross-platform)
+Output JSONL: {"timestamp":"YYYY-MM-DD HH:MM:SS","key":"WIN:<title>"}
 
-import os, time, json
+Supports:
+  - Windows: Win32 API via ctypes
+  - Linux (X11): xdotool
+"""
+
+import os, sys, time, json, subprocess, platform
 from datetime import datetime
-import pyautogui
 
 # ---------- paths ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -16,13 +20,96 @@ def daily_log_path(dt: datetime) -> str:
     return os.path.join(LOG_DIR, f"windows_{dt.strftime('%Y-%m-%d')}.jsonl")
 
 # ---------- tunables ----------
-POLL_SEC = float(os.getenv("BL_POLL_SEC", "0.7"))        # loop cadence
-TITLE_MAXLEN = int(os.getenv("BL_TITLE_MAXLEN", "180"))  # trim very long titles
+POLL_SEC = float(os.getenv("BL_POLL_SEC", "0.7"))
+TITLE_MAXLEN = int(os.getenv("BL_TITLE_MAXLEN", "180"))
+
+# ---------- platform detection ----------
+PLATFORM = platform.system()  # "Windows", "Linux", "Darwin"
+
+def _is_wsl() -> bool:
+    """Detect if running inside WSL."""
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except Exception:
+        return False
+
+IS_WSL = PLATFORM == "Linux" and _is_wsl()
+
+# ---------- active window: Windows ----------
+def _get_active_window_windows() -> str:
+    """Get active window title using Win32 API."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return ""
+    length = user32.GetWindowTextLengthW(hwnd)
+    if length == 0:
+        return ""
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value or ""
+
+# ---------- active window: Linux (X11) ----------
+def _get_active_window_linux() -> str:
+    """Get active window title using xdotool."""
+    try:
+        result = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowname"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("[error] xdotool not found. Install it: sudo apt install xdotool", file=sys.stderr)
+    except Exception:
+        pass
+    return ""
+
+# ---------- active window: WSL ----------
+def _get_active_window_wsl() -> str:
+    """Get active window title from Windows host via PowerShell."""
+    try:
+        ps_cmd = (
+            "Add-Type -TypeDefinition '"
+            "using System; using System.Runtime.InteropServices; "
+            "public class W { "
+            "[DllImport(\"user32.dll\")] public static extern IntPtr GetForegroundWindow(); "
+            "[DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder t, int m); "
+            "}"
+            "'; "
+            "$h=[W]::GetForegroundWindow(); "
+            "$b=New-Object System.Text.StringBuilder 256; "
+            "[void][W]::GetWindowText($h,$b,256); "
+            "$b.ToString()"
+        )
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except FileNotFoundError:
+        print("[error] powershell.exe not found in WSL PATH", file=sys.stderr)
+    except Exception:
+        pass
+    return ""
+
+# ---------- pick the right function ----------
+if PLATFORM == "Windows":
+    get_active_window = _get_active_window_windows
+elif IS_WSL:
+    get_active_window = _get_active_window_wsl
+elif PLATFORM == "Linux":
+    get_active_window = _get_active_window_linux
+else:
+    print(f"[error] Unsupported platform: {PLATFORM}", file=sys.stderr)
+    sys.exit(1)
 
 # ---------- state ----------
 _current_day = datetime.now().date()
 _current_path = daily_log_path(datetime.now())
-last_handle = None
 last_win_key = ""
 
 # ---------- utils ----------
@@ -34,7 +121,6 @@ def _clean(s: str, maxlen: int) -> str:
     return (s[:maxlen - 1] + "…") if (len(s) > maxlen) else s
 
 def _append_record(key_text: str):
-    """Append one log record to today's JSONL file."""
     global _current_day, _current_path
     rec = {"timestamp": _now_str(), "key": key_text}
     now = datetime.now()
@@ -46,27 +132,21 @@ def _append_record(key_text: str):
 
 # ---------- main ----------
 def main():
-    global last_handle, last_win_key
-    print(f"[info] Active window logger → {LOG_DIR}\\windows_YYYY-MM-DD.jsonl")
+    global last_win_key
+
+    mode = "WSL→Windows" if IS_WSL else PLATFORM
+    print(f"[info] Active window logger ({mode}) → {LOG_DIR}/windows_YYYY-MM-DD.jsonl")
 
     try:
         while True:
-            aw = pyautogui.getActiveWindow()
-            if aw is None:
-                time.sleep(POLL_SEC)
-                continue
+            title = _clean(get_active_window(), TITLE_MAXLEN)
 
-            hwnd = getattr(aw, "_hWnd", None)
-            title = _clean(aw.title or "", TITLE_MAXLEN)
-
-            # Always check for title changes, not just handle changes
             if title:
                 win_key = f"WIN:{title}"
                 if win_key != last_win_key:
                     _append_record(win_key)
                     last_win_key = win_key
 
-            last_handle = hwnd
             time.sleep(POLL_SEC)
 
     except KeyboardInterrupt:

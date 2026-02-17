@@ -33,7 +33,8 @@ def run_monitor_loop(
     if categories:
         print(f"[runner] Loaded {len(categories)} categories:")
         for cat in categories:
-            status = "✓" if cat.get("is_productive") else "✗"
+            prod = cat.get("is_productive")
+            status = "✓" if prod is True else ("✗" if prod is False else "?")
             print(f"[runner]   {status} {cat.get('emoji', '')} {cat['name']}")
     else:
         print("[runner] No categories loaded (using fallback prompts)")
