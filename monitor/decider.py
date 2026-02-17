@@ -9,7 +9,7 @@ from monitor.config import Settings, DEFAULT_SETTINGS
 
 try:
     from PIL import ImageGrab
-except ImportError:
+except Exception:
     ImageGrab = None
     print("[warn] Pillow not installed. Vision tiebreaker disabled. pip install Pillow")
 
