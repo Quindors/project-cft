@@ -5,31 +5,24 @@ import os
 import json
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional
 
 from monitor.config import Settings, DEFAULT_SETTINGS
+from monitor.window_capture import get_active_window, get_mode
 
-# pynput needs X11 on Linux / WSL — catch ALL errors, not just ImportError
+# pynput needs X11 on Linux / WSL — catch ALL errors
 try:
     from pynput import keyboard
 except Exception as e:
     keyboard = None
-    _pynput_err = str(e)
     if "No module" in str(e):
         print("[warn] pynput not installed. Live KeyLogger disabled. pip install pynput")
     else:
-        print(f"[warn] pynput available but cannot start (no X11/display): {type(e).__name__}")
+        print(f"[warn] pynput cannot start ({type(e).__name__}): display/X11 not available")
         print("[warn] Live KeyLogger disabled. Keystroke capture requires a display server.")
-
-
-def _tail_lines(path: str, max_lines: int = 300) -> List[str]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.readlines()[-max_lines:]
-    except Exception:
-        return []
 
 
 def format_keys_as_text(keys: List[str]) -> str:
@@ -48,23 +41,72 @@ def format_keys_as_text(keys: List[str]) -> str:
     return "".join(out)
 
 
-class KeyLogger:
-    def __init__(self, log_dir: str):
-        self.buffer = []
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
+# ==================== BASE CLASSES ====================
 
-        self.log_dir = log_dir
-        os.makedirs(self.log_dir, exist_ok=True)
+class EventSource:
+    def now_dt(self) -> datetime: ...
+    def poll(self) -> Optional[str]: ...
+    def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]: ...
 
-        self.current_day = datetime.now().date()
-        self.curr_path = self._daily_log_path(datetime.now())
 
-        self.listener = None
-        self.flush_thread = None
+class KeystrokeSource:
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str: ...
+    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str: ...
 
-    def _daily_log_path(self, dt: datetime) -> str:
-        return os.path.join(self.log_dir, f"keystrokes_{dt:%Y-%m-%d}.jsonl")
+
+# ==================== LIVE SOURCES (IN-MEMORY) ====================
+
+class LiveEventSource(EventSource):
+    """Captures active window titles in memory. No file I/O."""
+
+    TITLE_MAXLEN = 180
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._buffer: deque[Tuple[datetime, str]] = deque(maxlen=500)
+        self._last_title: str = ""
+
+    def now_dt(self) -> datetime:
+        return datetime.now()
+
+    def poll(self) -> Optional[str]:
+        """
+        Check current window. Append to buffer if title changed.
+        Returns the new title, or None if unchanged.
+        """
+        title = get_active_window()
+        if not title:
+            return None
+
+        # Trim long titles
+        if len(title) > self.TITLE_MAXLEN:
+            title = title[:self.TITLE_MAXLEN - 1] + "…"
+
+        win_key = f"WIN:{title}"
+
+        if win_key != self._last_title:
+            self._buffer.append((datetime.now(), win_key))
+            self._last_title = win_key
+            return win_key
+
+        return None
+
+    def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
+        """Return the most recent events as (timestamp_str, key) tuples."""
+        items = list(self._buffer)[-limit:]
+        return [(dt.strftime("%Y-%m-%d %H:%M:%S"), key) for dt, key in items]
+
+
+class LiveKeystrokeSource(KeystrokeSource):
+    """Captures keystrokes in memory via pynput. No file I/O."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self._buffer: deque[Tuple[datetime, str]] = deque(maxlen=5000)
+        self._lock = threading.Lock()
+        self._listener = None
 
     def _token_from_key(self, k) -> str:
         try:
@@ -77,82 +119,51 @@ class KeyLogger:
             pass
         return str(k)
 
-    def on_press(self, key):
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def _on_press(self, key):
         token = self._token_from_key(key)
-        with self.lock:
-            self.buffer.append({"timestamp": ts, "key": token})
+        with self._lock:
+            self._buffer.append((datetime.now(), token))
 
-    def _flush_loop(self):
-        while not self.stop_event.is_set():
-            time.sleep(1.0)
-
-            with self.lock:
-                records = self.buffer[:]
-                self.buffer.clear()
-
-            now = datetime.now()
-            if now.date() != self.current_day:
-                self.current_day = now.date()
-                self.curr_path = self._daily_log_path(now)
-
-            if not records:
-                continue
-
-            try:
-                with open(self.curr_path, "a", encoding="utf-8") as f:
-                    for rec in records:
-                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            except Exception as e:
-                print(f"[error] keylog flush: {e}")
-
-    def start(self):
+    def start(self) -> None:
         if not keyboard:
             print("[warn] KeyLogger disabled: pynput not available on this platform.")
             return
-        self.flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
-        self.flush_thread.start()
-        self.listener = keyboard.Listener(on_press=self.on_press)
-        self.listener.start()
-        print(f"[info] KeyLogger started. Logs in {self.log_dir}")
+        self._listener = keyboard.Listener(on_press=self._on_press)
+        self._listener.start()
+        print("[info] KeyLogger started (in-memory)")
 
-    def stop(self):
-        if not keyboard:
-            return
-        if self.listener:
-            self.listener.stop()
-        self.stop_event.set()
-        if self.flush_thread:
-            self.flush_thread.join(timeout=2.0)
+    def stop(self) -> None:
+        if self._listener:
+            self._listener.stop()
 
+    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
+        """Summarize recent keystrokes for the LLM prompt."""
+        cutoff = now_dt - timedelta(seconds=window_seconds)
 
-def _read_last_events_file(path: str, limit: int) -> List[Tuple[str, str]]:
-    events: List[Tuple[str, str]] = []
-    if not os.path.exists(path):
-        return events
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            lines = f.readlines()[-limit:]
-        for line in lines:
-            try:
-                rec = json.loads(line)
-                ts, key = rec.get("timestamp"), rec.get("key")
-                if ts and key:
-                    events.append((ts, key))
-            except Exception:
-                continue
-    except Exception:
-        return []
-    events.sort(key=lambda x: x[0])
-    return events[-limit:]
+        with self._lock:
+            recent = [(dt, k) for dt, k in self._buffer if dt >= cutoff]
+
+        if not recent:
+            return "Idle (0 keys)"
+
+        count = len(recent)
+        special_keys = set()
+        for _, k in recent:
+            if len(k) > 1 or k.startswith("Key."):
+                special_keys.add(k)
+
+        special_str = ", ".join(list(special_keys)[:5])
+        return f"{count} keys typed. Special: [{special_str}]"
+
+    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
+        """Reconstruct typed text between two timestamps."""
+        with self._lock:
+            keys = [k for dt, k in self._buffer if start_dt < dt <= end_dt]
+
+        return format_keys_as_text(keys)
 
 
-@dataclass
-class TraceData:
-    win: List[Tuple[datetime, str]]
-    keys: List[Tuple[datetime, str]]
-    sim_start: datetime
-
+# ==================== TRACE SOURCES (FILE-BASED, FOR TESTING) ====================
 
 def _load_trace(path: str) -> List[Tuple[datetime, str]]:
     out: List[Tuple[datetime, str]] = []
@@ -169,6 +180,13 @@ def _load_trace(path: str) -> List[Tuple[datetime, str]]:
                 continue
     out.sort(key=lambda x: x[0])
     return out
+
+
+@dataclass
+class TraceData:
+    win: List[Tuple[datetime, str]]
+    keys: List[Tuple[datetime, str]]
+    sim_start: datetime
 
 
 def load_trace_data(settings: Settings) -> TraceData:
@@ -191,30 +209,17 @@ class TraceSession:
         return self.trace.sim_start + timedelta(seconds=elapsed)
 
 
-class EventSource:
-    def now_dt(self) -> datetime: ...
-    def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]: ...
-
-
-class LiveEventSource(EventSource):
-    def __init__(self, settings: Settings):
-        self.settings = settings
-
-    def now_dt(self) -> datetime:
-        return datetime.now()
-
-    def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
-        path = os.path.join(self.settings.log_dir, f"windows_{now_dt:%Y-%m-%d}.jsonl")
-        return _read_last_events_file(path, limit)
-
-
 class TraceEventSource(EventSource):
     def __init__(self, session: TraceSession):
         self.session = session
-        self.sim_start = session.trace.sim_start  # for printing
+        self.sim_start = session.trace.sim_start
 
     def now_dt(self) -> datetime:
         return self.session.now_dt()
+
+    def poll(self) -> Optional[str]:
+        """No-op for trace mode — events come from the file."""
+        return None
 
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
         eligible = [x for x in self.session.trace.win if x[0] <= now_dt]
@@ -223,77 +228,6 @@ class TraceEventSource(EventSource):
 
     def event_times(self):
         return sorted({dt for (dt, _key) in self.session.trace.win})
-
-
-class KeystrokeSource:
-    def start(self) -> None: ...
-    def stop(self) -> None: ...
-    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str: ...
-    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str: ...
-
-
-class LiveKeystrokeSource(KeystrokeSource):
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self.log_dir = settings.keystrokes.key_log_dir
-        self.logger = KeyLogger(self.log_dir) if settings.keystrokes.enable_live_keylogger else None
-
-    def start(self) -> None:
-        if self.logger:
-            self.logger.start()
-
-    def stop(self) -> None:
-        if self.logger:
-            self.logger.stop()
-
-    def _path_for_day(self, dt: datetime) -> str:
-        return os.path.join(self.log_dir, f"keystrokes_{dt:%Y-%m-%d}.jsonl")
-
-    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
-        path = self._path_for_day(now_dt)
-        if not os.path.exists(path):
-            return ""
-
-        threshold = time.time() - window_seconds
-        lines = _tail_lines(path, max_lines=500)
-
-        count = 0
-        special_keys = set()
-
-        for line in reversed(lines):
-            try:
-                rec = json.loads(line)
-                dt = datetime.strptime(rec["timestamp"], "%Y-%m-%d %H:%M:%S")
-                if dt.timestamp() < threshold:
-                    break
-                count += 1
-                key = rec.get("key", "")
-                if key and (len(key) > 1 or str(key).startswith("Key.")):
-                    special_keys.add(str(key))
-            except Exception:
-                continue
-
-        if count == 0:
-            return "Idle (0 keys)"
-        special_str = ", ".join(list(special_keys)[:5])
-        return f"{count} keys typed. Special: [{special_str}]"
-
-    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
-        path = self._path_for_day(end_dt)
-        if not os.path.exists(path):
-            return ""
-
-        lines = _tail_lines(path, max_lines=2000)
-        keys_interval: List[str] = []
-        for line in lines:
-            try:
-                rec = json.loads(line)
-                dt = datetime.strptime(rec["timestamp"], "%Y-%m-%d %H:%M:%S")
-                if start_dt < dt <= end_dt:
-                    keys_interval.append(rec.get("key", ""))
-            except Exception:
-                continue
-        return format_keys_as_text(keys_interval)
 
 
 class TraceKeystrokeSource(KeystrokeSource):
@@ -319,6 +253,8 @@ class TraceKeystrokeSource(KeystrokeSource):
         return format_keys_as_text(keys)
 
 
+# ==================== FACTORY ====================
+
 def make_sources(
     use_trace: Optional[bool] = None,
     settings: Settings = DEFAULT_SETTINGS,
@@ -331,4 +267,5 @@ def make_sources(
         session = TraceSession(trace=trace, wall_start=time.time(), speed=settings.trace.trace_speed)
         return TraceEventSource(session), TraceKeystrokeSource(session)
 
+    print(f"[info] Window capture mode: {get_mode()}")
     return LiveEventSource(settings), LiveKeystrokeSource(settings)
