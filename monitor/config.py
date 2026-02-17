@@ -48,11 +48,6 @@ class SheetsSettings:
     idle_flush_sec: float = 15.0
     max_retries: int = 6
     backoff_base: float = 0.8
-
-
-@dataclass(frozen=True)
-class KeystrokeSettings:
-    key_log_dir: str = os.path.join(".", "logs")
     capture_typed_text: bool = True
     enable_live_keylogger: bool = True
 
@@ -89,7 +84,6 @@ When I use:
 @dataclass(frozen=True)
 class Settings:
     # General
-    log_dir: str = r".\logs"
     model: str = "gpt-4o-mini"
     
     # Timing settings for runner
@@ -109,7 +103,6 @@ class Settings:
 
     critic: CriticSettings = field(default_factory=CriticSettings)
     sheets: SheetsSettings = field(default_factory=SheetsSettings)
-    keystrokes: KeystrokeSettings = field(default_factory=KeystrokeSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
     user_goals: UserGoalsSettings = field(default_factory=UserGoalsSettings)

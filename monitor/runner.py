@@ -57,7 +57,10 @@ def run_monitor_loop(
         while True:
             now_dt = event_src.now_dt()
 
-            # --- collect window events ---
+            # --- poll for new window title (in-memory capture) ---
+            event_src.poll()
+
+            # --- collect recent events from buffer ---
             recent = event_src.last_events(now_dt, limit=settings.context_window_size)
             if recent:
                 events_buffer = recent          # replace with freshest snapshot

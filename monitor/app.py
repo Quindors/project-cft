@@ -17,8 +17,6 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
 
     require_openai_api_key(openai)
 
-    os.makedirs(settings.log_dir, exist_ok=True)
-
     event_src, key_src = make_sources(settings=settings)
 
     testing_mode = settings.trace.use_trace_file
@@ -40,8 +38,6 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
 
     if settings.trace.use_trace_file and hasattr(event_src, "sim_start"):
         print(f"[info] TRACE MODE ON. sim_start={event_src.sim_start}")
-    else:
-        print(f"[info] watching {settings.log_dir}")
 
     key_src.start()
     try:
