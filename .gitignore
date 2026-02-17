@@ -6,4 +6,3 @@ list.md
 venv/*
 monitor/__pycache__
 user-goals.txt
-.gitignore
