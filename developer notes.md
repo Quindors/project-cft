@@ -1,3 +1,11 @@
+What Cronus does differently from your setup:
+
+1. Local OCR to read screen content (not just window titles) — this gives them richer context for classification
+2. Local processing — they emphasize that data stays on-device, which suggests they're either running a local model or doing the classification logic client-side in the Electron app
+3. MongoDB for their database (vs. your Google Sheets)
+4. Electron + React + TypeScript for the desktop app (vs. your Python scripts)
+5. tRPC server for their backend API
+
 ## cft → Category-Based System: Migration Checklist
 
 ## Phase 1: Data Model ✅
