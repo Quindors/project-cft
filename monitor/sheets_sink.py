@@ -284,6 +284,7 @@ class SheetsSink:
         ]
 
         events = record.get("events") or []
+        events = events[-self.cfg.max_event_cols:]
         for i in range(self.cfg.max_event_cols):
             if i < len(events) and isinstance(events[i], dict):
                 row.append(str(events[i].get("key", "")) or "")

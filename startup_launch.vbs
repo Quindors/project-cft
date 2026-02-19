@@ -3,7 +3,7 @@
 
 Set WshShell = CreateObject("WScript.Shell")
 
-projectPath = "C:\Users\abl96\Downloads\project cft"
+projectPath = "\\wsl.localhost\Ubuntu\home\abl96\projects\project-cft"
 WshShell.CurrentDirectory = projectPath
 
 pythonExe = "C:\Users\abl96\AppData\Local\Microsoft\WindowsApps\python.exe"

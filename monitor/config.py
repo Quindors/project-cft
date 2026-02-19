@@ -88,7 +88,7 @@ class Settings:
     
     # Timing settings for runner
     poll_interval: float = 2.0  # How often to collect window events (seconds)
-    decision_interval: float = 60.0  # How often to make decisions (seconds)
+    decision_interval: float = 10.0  # How often to make decisions (seconds)
     
     # Context window
     context_window_size: int = 30  # Number of recent events to keep

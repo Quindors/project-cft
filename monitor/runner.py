@@ -95,6 +95,7 @@ def run_monitor_loop(
                     categories=categories,
                     user_goals=user_goals,
                 )
+                print(f"[debug] primary raw: {decision.get('primary', {})}")
 
                 last_decision_time = time.time()
 

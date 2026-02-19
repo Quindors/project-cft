@@ -118,7 +118,7 @@ def _parse_llm_line(
     content = (content or "").strip()
 
     # Extract CATEGORY
-    m_category = re.search(r"CATEGORY\s*=\s*(.+?)(?:\||$)", content, flags=re.I)
+    m_category = re.search(r"CATEGORY\s*=\s*(.+?)(?:\||\n|$)", content, flags=re.I)
     category_name = m_category.group(1).strip().strip('"').strip("'") if m_category else None
 
     # Extract OFF_SCORE and CONF
@@ -336,7 +336,7 @@ def decide_with_critic(
     p1_cat_id, p1_cat_name, p1_off, p1_conf, p1_reason, p1_is_productive, p1_raw = ask_gpt(
         p1_prompt,
         settings.model,
-        max_tokens=60,
+        max_tokens=150,
         temperature=0.0,
         off_threshold=settings.off_threshold,
         categories=categories,
