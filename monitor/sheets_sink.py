@@ -50,16 +50,16 @@ class NullSink:
     
     def get_categories(self):
         return [
-            {"category_id": "deep_work", "name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
-            {"category_id": "homework", "name": "Homework", "description": "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "is_productive": True},
-            {"category_id": "research", "name": "Research & Learning", "description": "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "is_productive": True},
-            {"category_id": "communication", "name": "Communication", "description": "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "is_productive": True},
-            {"category_id": "social_media", "name": "Social Media", "description": "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "is_productive": False},
-            {"category_id": "entertainment", "name": "Entertainment", "description": "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "is_productive": False},
-            {"category_id": "gaming", "name": "Gaming", "description": "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "is_productive": False},
-            {"category_id": "shopping", "name": "Shopping", "description": "Amazon, eBay, AliExpress, online shopping, browsing products", "is_productive": False},
-            {"category_id": "other", "name": "Other Off-Task", "description": "Any other off-task activity that doesn't fit the above categories", "is_productive": False},
-            {"category_id": "ambiguous", "name": "Ambiguous", "description": "Activity that cannot be clearly categorized from available context", "is_productive": None},
+            {"name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
+            {"name": "Homework", "description": "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "is_productive": True},
+            {"name": "Research & Learning", "description": "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "is_productive": True},
+            {"name": "Communication", "description": "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "is_productive": True},
+            {"name": "Social Media", "description": "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "is_productive": False},
+            {"name": "Entertainment", "description": "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "is_productive": False},
+            {"name": "Gaming", "description": "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "is_productive": False},
+            {"name": "Shopping", "description": "Amazon, eBay, AliExpress, online shopping, browsing products", "is_productive": False},
+            {"name": "Other Off-Task", "description": "Any other off-task activity that doesn't fit the above categories", "is_productive": False},
+            {"name": "Ambiguous", "description": "Activity that cannot be clearly categorized from available context", "is_productive": None},
         ]
 
 
@@ -180,7 +180,6 @@ class SheetsSink:
         base = [
             "timestamp",
             # Category fields
-            "category_id",
             "category_name",
             "is_productive",
             # Main LLM section
@@ -273,7 +272,6 @@ class SheetsSink:
         row: List[str] = [
             get("timestamp"),
             # Category fields
-            get("category_id"),
             get("category_name"),
             get("is_productive"),
             # Main LLM section

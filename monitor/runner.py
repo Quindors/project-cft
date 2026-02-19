@@ -217,7 +217,6 @@ def _run_trace_loop(
         result_record = {
             "timestamp": evt_time.strftime("%Y-%m-%d %H:%M:%S"),
             # Final decision
-            "category_id": decision.get("final_category_id", ""),
             "category_name": cat_name,
             "is_productive": is_productive,
             "off_score": decision.get("final_off", 0.0),
@@ -299,7 +298,6 @@ def _build_record(
     return {
         "timestamp":          now_dt.strftime("%Y-%m-%d %H:%M:%S"),
         # Category
-        "category_id":        decision.get("final_category_id", ""),
         "category_name":      decision.get("final_category_name", ""),
         "is_productive":      decision.get("final_is_productive"),
         # Primary

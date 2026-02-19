@@ -32,9 +32,6 @@ def build_prompt(
     categories: List[Dict] = None,
     user_goals: str = "",
 ) -> str:
-    """
-    Build category-based prompt with user goals and category list.
-    """
     activity_str = ", ".join([k for _, k in events])
     extra = f"\nKeystroke Activity (last 60s): {keystroke_summary}" if keystroke_summary else ""
 
@@ -46,7 +43,6 @@ def build_prompt(
             "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
         )
 
-    # Build category list string
     if categories:
         category_list = "\n".join([
             f"- \"{cat['name']}\": {cat['description']} "
@@ -70,9 +66,6 @@ def build_critic_prompt(
     categories: List[Dict] = None,
     user_goals: str = "",
 ) -> str:
-    """
-    Build critic prompt to review primary model's category choice.
-    """
     activity_str = ", ".join([k for _, k in events])
     extra = f"\nKeystroke Activity: {keystroke_summary}" if keystroke_summary else ""
 
@@ -106,14 +99,13 @@ def build_critic_prompt(
 
 def _parse_llm_line(
     content: str,
-    off_threshold: float,
     categories: List[Dict] = None,
-) -> Tuple[str, str, float, float, str, bool]:
+) -> Tuple[str, float, float, str, Optional[bool]]:
     """
     Parse LLM response to extract category and other info.
 
     Returns:
-        (category_id, category_name, off_score, conf, reason, is_productive)
+        (category_name, off_score, conf, reason, is_productive)
     """
     content = (content or "").strip()
 
@@ -135,28 +127,22 @@ def _parse_llm_line(
     m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
     reason = m_reason.group(1).strip() if m_reason else ""
 
-    # Look up category
-    category_id = None
+    # Look up category in list
     is_productive = None
 
     if categories and category_name:
         for cat in categories:
             if cat["name"].lower() == category_name.lower():
-                category_id = cat["category_id"]
                 category_name = cat["name"]  # exact casing from sheet
                 is_productive = cat.get("is_productive", None)
                 break
+        else:
+            print(f"[warn] Category '{category_name}' not found in categories list")
 
-    if category_id is None and category_name:
-        category_id = "unknown"
-        is_productive = None
-        print(f"[warn] Category '{category_name}' not found in categories list")
-    elif category_id is None:
-        category_id = "error"
+    if not category_name:
         category_name = "[PARSE_ERROR]"
-        is_productive = None
 
-    return category_id, category_name, off_score, conf, reason, is_productive
+    return category_name, off_score, conf, reason, is_productive
 
 
 # ==================== LLM CALLS ====================
@@ -167,14 +153,13 @@ def ask_gpt(
     *,
     max_tokens: int,
     temperature: float,
-    off_threshold: float,
     categories: List[Dict] = None,
-) -> Tuple[str, str, float, float, str, bool, str]:
+) -> Tuple[str, float, float, str, Optional[bool], str]:
     """
     Call GPT with prompt and parse response for category.
 
     Returns:
-        (category_id, category_name, off_score, conf, reason, is_productive, raw_content)
+        (category_name, off_score, conf, reason, is_productive, raw_content)
     """
     try:
         resp = openai.chat.completions.create(
@@ -185,13 +170,13 @@ def ask_gpt(
         )
         content = (resp.choices[0].message.content or "").strip()
 
-        category_id, category_name, off_score, conf, reason, is_productive = _parse_llm_line(
-            content, off_threshold, categories
+        category_name, off_score, conf, reason, is_productive = _parse_llm_line(
+            content, categories
         )
-        return category_id, category_name, off_score, conf, reason, is_productive, content
+        return category_name, off_score, conf, reason, is_productive, content
 
     except Exception as e:
-        return "error", "[ERROR]", 0.5, 0.5, str(e), None, ""
+        return "[ERROR]", 0.5, 0.5, str(e), None, ""
 
 
 # ==================== VISION ====================
@@ -220,14 +205,13 @@ def ask_gpt_vision_category(
     *,
     model: str,
     max_tokens: int,
-    off_threshold: float,
     categories: List[Dict] = None,
-) -> Tuple[str, str, float, float]:
+) -> Tuple[str, float, float]:
     """
     Vision tiebreaker for category disagreement.
 
     Returns:
-        (category_id, category_name, off_score, conf)
+        (category_name, off_score, conf)
     """
     activity_str = ", ".join([k for _, k in events])
 
@@ -271,23 +255,20 @@ CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explan
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        cat_id, cat_name, off_score, conf, reason, is_productive = _parse_llm_line(
-            content, off_threshold, categories
+        cat_name, off_score, conf, reason, is_productive = _parse_llm_line(
+            content, categories
         )
-        return cat_id, cat_name, off_score, conf
+        return cat_name, off_score, conf
 
     except Exception as e:
-        return "error", "[ERROR]", 0.5, 0.5
+        return "[ERROR]", 0.5, 0.5
 
 
 # ==================== CRITIC LOGIC ====================
 
-def _should_run_critic_category(
-    cat_id: str,
+def _should_run_critic(
     cat_name: str,
     conf: float,
-    is_productive: bool,
-    events: List[Tuple[str, str]],
     settings: Settings,
 ) -> bool:
     """Decide if critic should run based on category classification."""
@@ -300,7 +281,7 @@ def _should_run_critic_category(
         return True
 
     # Run on ambiguous categories
-    ambiguous_categories = ["research", "communication", "research & learning"]
+    ambiguous_categories = ["research & learning", "communication", "ambiguous"]
     if cat_name.lower() in ambiguous_categories:
         return True
 
@@ -320,8 +301,9 @@ def decide_with_critic(
     """
     Category-based decision with optional critic verification.
 
-    Returns:
-        Dict with decision info including category.
+    Returns dict with:
+        final_category_name, final_is_productive, final_off, final_conf,
+        final_reason, critic_ran, primary, critic, vision
     """
 
     # Build prompt with categories and goals
@@ -333,27 +315,24 @@ def decide_with_critic(
     )
 
     # Primary model call
-    p1_cat_id, p1_cat_name, p1_off, p1_conf, p1_reason, p1_is_productive, p1_raw = ask_gpt(
+    p1_name, p1_off, p1_conf, p1_reason, p1_prod, p1_raw = ask_gpt(
         p1_prompt,
         settings.model,
         max_tokens=150,
         temperature=0.0,
-        off_threshold=settings.off_threshold,
         categories=categories,
     )
 
     primary_res = {
-        "category_id": p1_cat_id,
-        "category_name": p1_cat_name,
-        "is_productive": p1_is_productive,
+        "category_name": p1_name,
+        "is_productive": p1_prod,
         "off": p1_off,
         "conf": p1_conf,
         "reason": p1_reason or "",
     }
 
-    def mk_ret(cat_id, cat_name, is_productive, off, conf, reason, critic_ran, critic_res=None, vision_res=None):
+    def mk_ret(cat_name, is_productive, off, conf, reason, critic_ran, critic_res=None, vision_res=None):
         return {
-            "final_category_id": cat_id,
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
             "final_off": off,
@@ -366,15 +345,15 @@ def decide_with_critic(
         }
 
     # Handle errors
-    if p1_cat_id in ("error", "unknown"):
-        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, primary_res["reason"], False)
+    if p1_name in ("[ERROR]", "[PARSE_ERROR]"):
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], False)
 
     # Check if critic should run
-    if not _should_run_critic_category(p1_cat_id, p1_cat_name, p1_conf, p1_is_productive, events_context, settings):
-        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, p1_reason, False)
+    if not _should_run_critic(p1_name, p1_conf, settings):
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
 
     # Run critic
-    p1_summary = f"CATEGORY={p1_cat_name} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
+    p1_summary = f"CATEGORY={p1_name} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
     c_prompt = build_critic_prompt(
         events_context,
         p1_summary,
@@ -383,71 +362,67 @@ def decide_with_critic(
         user_goals=user_goals,
     )
 
-    c_cat_id, c_cat_name, c_off, c_conf, c_reason, c_is_productive, c_raw = ask_gpt(
+    c_name, c_off, c_conf, c_reason, c_prod, c_raw = ask_gpt(
         c_prompt,
         settings.critic_model(),
         max_tokens=settings.critic.max_tokens,
         temperature=settings.critic.temperature,
-        off_threshold=settings.off_threshold,
         categories=categories,
     )
 
     critic_res = {
-        "category_id": c_cat_id,
-        "category_name": c_cat_name,
-        "is_productive": c_is_productive,
+        "category_name": c_name,
+        "is_productive": c_prod,
         "off": c_off,
         "conf": c_conf,
         "reason": c_reason or "",
     }
 
     # Handle critic errors
-    if c_cat_id in ("error", "unknown"):
-        return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, primary_res["reason"], True, critic_res)
+    if c_name in ("[ERROR]", "[PARSE_ERROR]"):
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], True, critic_res)
 
     # Check for disagreement
-    critic_disagrees = (c_cat_id != p1_cat_id)
+    critic_disagrees = (c_name.lower() != p1_name.lower())
 
     if critic_disagrees and settings.critic.vision_enabled:
-        print(f"[info] Category disagreement: primary={p1_cat_name}, critic={c_cat_name}. Trying vision tiebreak...")
+        print(f"[info] Category disagreement: primary={p1_name}, critic={c_name}. Trying vision tiebreak...")
         b64_img = take_screenshot_b64()
         if b64_img:
-            v_cat_id, v_cat_name, v_off, v_conf = ask_gpt_vision_category(
+            v_name, v_off, v_conf = ask_gpt_vision_category(
                 b64_img,
                 events_context,
-                p1_cat_name,
+                p1_name,
                 p1_reason,
-                c_cat_name,
+                c_name,
                 c_reason,
                 model=settings.critic.vision_model,
                 max_tokens=settings.critic.vision_max_tokens,
-                off_threshold=settings.off_threshold,
                 categories=categories,
             )
-            if v_cat_id not in ("error", "unknown"):
+            if v_name not in ("[ERROR]", "[PARSE_ERROR]"):
                 vision_res = {
-                    "category_id": v_cat_id,
-                    "category_name": v_cat_name,
+                    "category_name": v_name,
                     "off": v_off,
                     "conf": v_conf,
                 }
-                v_is_productive = None
+                v_prod = None
                 if categories:
                     for cat in categories:
-                        if cat["category_id"] == v_cat_id:
-                            v_is_productive = cat.get("is_productive")
+                        if cat["name"].lower() == v_name.lower():
+                            v_prod = cat.get("is_productive")
                             break
 
-                return mk_ret(v_cat_id, v_cat_name, v_is_productive, v_off, v_conf, f"[Vision] {c_reason}", True, critic_res, vision_res)
+                return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {c_reason}", True, critic_res, vision_res)
 
     # No vision or vision failed — use critic if it disagrees
     if critic_disagrees:
         final_off = max(p1_off, c_off)
         return mk_ret(
-            c_cat_id, c_cat_name, c_is_productive, final_off, c_conf,
+            c_name, c_prod, final_off, c_conf,
             f"[Critic] {critic_res['reason'] or primary_res['reason']}",
             True, critic_res,
         )
 
     # Critic agrees — use primary
-    return mk_ret(p1_cat_id, p1_cat_name, p1_is_productive, p1_off, p1_conf, p1_reason, True, critic_res)
+    return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, critic_res)
