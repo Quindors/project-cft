@@ -13,7 +13,7 @@ from typing import List, Tuple, Dict, Any, Optional, Callable
 
 from monitor.config import Settings
 from monitor.decider import decide_with_critic
-from monitor.sources import EventSource, KeystrokeSource
+from monitor.sources import EventSource, KeystrokeSource, TraceEventSource
 
 
 def run_monitor_loop(
@@ -43,11 +43,28 @@ def run_monitor_loop(
     user_goals = settings.load_user_goals()
     print(f"[runner] Loaded user goals ({len(user_goals)} chars)")
 
-    # State
+    # Dispatch to trace or live loop
+    if isinstance(event_src, TraceEventSource):
+        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, user_goals)
+    else:
+        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, user_goals)
+
+
+def _run_live_loop(
+    event_src: EventSource,
+    key_src: KeystrokeSource,
+    sink,
+    show_popup: Callable,
+    settings: Settings,
+    categories: List[Dict],
+    user_goals: str,
+) -> None:
+    """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
+
     events_buffer: List[Tuple[str, str]] = []
     last_decision_time: Optional[float] = None
 
-    print(f"\n[runner] Starting monitoring loop")
+    print(f"\n[runner] Starting LIVE monitoring loop")
     print(f"[runner] Poll interval: {settings.poll_interval}s")
     print(f"[runner] Decision interval: {settings.decision_interval}s")
     print(f"[runner] Context window: {settings.context_window_size} events")
@@ -63,7 +80,7 @@ def run_monitor_loop(
             # --- collect recent events from buffer ---
             recent = event_src.last_events(now_dt, limit=settings.context_window_size)
             if recent:
-                events_buffer = recent          # replace with freshest snapshot
+                events_buffer = recent
 
             # --- ensure correct daily sheet ---
             sink.ensure_day(now_dt.date())
@@ -75,17 +92,16 @@ def run_monitor_loop(
             )
 
             if should_decide and len(events_buffer) >= settings.min_events:
-                # Get keystroke summary
                 keystroke_summary = key_src.summary(now_dt, window_seconds=60)
 
-                # Get typed text for logging
                 if last_decision_time is not None:
                     prev_dt = datetime.fromtimestamp(last_decision_time)
                 else:
                     prev_dt = now_dt
                 typed_text = key_src.typed_text_between(prev_dt, now_dt)
 
-                # Make decision
+                last_decision_time = time.time()
+
                 print(f"\n[runner] Making decision on {len(events_buffer)} events...")
                 decision = decide_with_critic(
                     events_context=events_buffer,
@@ -95,41 +111,106 @@ def run_monitor_loop(
                     categories=categories,
                     user_goals=user_goals,
                 )
-                print(f"[debug] primary raw: {decision.get('primary', {})}")
 
-                last_decision_time = time.time()
+                # Log to console
+                _log_decision(decision)
 
-                # --- log to console ---
-                cat_name = decision.get("final_category_name", "Unknown")
-                is_productive = decision.get("final_is_productive")
-                conf = decision.get("final_conf", 0.0)
-                reason = decision.get("final_reason", "")
-                critic_ran = decision.get("critic_ran", False)
-
-                p_emoji = "✓" if is_productive else "✗"
-                c_emoji = "🔍" if critic_ran else "  "
-                print(f"[runner] {c_emoji} {p_emoji} {cat_name} (conf={conf:.2f})")
-                print(f"[runner]   {reason}")
-
-                # --- write to sheets ---
+                # Write to sheets
                 record = _build_record(decision, events_buffer, typed_text, now_dt)
                 sink.enqueue_record(record)
                 flush_result = sink.flush_if_needed()
                 if flush_result:
                     print(f"[runner] Flushed to sheets (appended={flush_result.appended}, updated={flush_result.updated})")
 
-                # --- popup alert if off-task ---
-                if is_productive is False and settings.popup.enabled:
+                # Popup alert if off-task
+                if decision.get("final_is_productive") is False and settings.popup.enabled:
                     _show_offtask_alert(show_popup, decision, settings)
 
-            # sleep until next poll
             time.sleep(settings.poll_interval)
 
     except KeyboardInterrupt:
         print("\n[runner] Interrupted by user")
 
 
+def _run_trace_loop(
+    event_src: TraceEventSource,
+    key_src: KeystrokeSource,
+    sink,
+    show_popup: Callable,
+    settings: Settings,
+    categories: List[Dict],
+    user_goals: str,
+) -> None:
+    """Trace mode loop — iterates through event timestamps directly, no sleeping."""
+
+    event_times = event_src.event_times()
+    if not event_times:
+        print("[runner] No events in trace file.")
+        return
+
+    print(f"\n[runner] Starting TRACE monitoring loop")
+    print(f"[runner] {len(event_times)} event timestamps in trace")
+    print(f"[runner] Sim range: {event_times[0]} -> {event_times[-1]}")
+    print(f"[runner] Min events for decision: {settings.min_events}\n")
+
+    decision_count = 0
+    prev_evt_time = event_times[0]
+
+    for evt_time in event_times:
+        # Get all events visible at this point in time
+        events_buffer = event_src.last_events(evt_time, limit=settings.context_window_size)
+
+        if len(events_buffer) < settings.min_events:
+            continue
+
+        # Ensure correct daily sheet
+        sink.ensure_day(evt_time.date())
+
+        # Get keystroke context
+        keystroke_summary = key_src.summary(evt_time, window_seconds=60)
+        typed_text = key_src.typed_text_between(prev_evt_time, evt_time)
+
+        print(f"\n[runner] Decision at {evt_time} ({len(events_buffer)} events)...")
+        decision = decide_with_critic(
+            events_context=events_buffer,
+            keystroke_summary=keystroke_summary,
+            settings=settings,
+            window_dwell_info=None,
+            categories=categories,
+            user_goals=user_goals,
+        )
+
+        decision_count += 1
+        prev_evt_time = evt_time
+
+        # Log to console
+        _log_decision(decision)
+
+        # Write to sheets
+        record = _build_record(decision, events_buffer, typed_text, evt_time)
+        sink.enqueue_record(record)
+        flush_result = sink.flush_if_needed()
+        if flush_result:
+            print(f"[runner] Flushed to sheets (appended={flush_result.appended}, updated={flush_result.updated})")
+
+    print(f"\n[runner] Trace complete. {decision_count} decisions made.")
+
+
 # --------------- helpers ---------------
+
+def _log_decision(decision: Dict[str, Any]) -> None:
+    """Print decision to console."""
+    cat_name = decision.get("final_category_name", "Unknown")
+    is_productive = decision.get("final_is_productive")
+    conf = decision.get("final_conf", 0.0)
+    reason = decision.get("final_reason", "")
+    critic_ran = decision.get("critic_ran", False)
+
+    p_emoji = "✓" if is_productive else "✗"
+    c_emoji = "🔍" if critic_ran else "  "
+    print(f"[runner] {c_emoji} {p_emoji} {cat_name} (conf={conf:.2f})")
+    print(f"[runner]   {reason}")
+
 
 def _build_record(
     decision: Dict[str, Any],
