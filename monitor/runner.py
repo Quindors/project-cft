@@ -142,6 +142,7 @@ def _run_trace_loop(
     user_goals: str,
 ) -> None:
     """Trace mode loop — iterates through event timestamps directly, no sleeping."""
+    import json, os
 
     event_times = event_src.event_times()
     if not event_times:
@@ -153,7 +154,19 @@ def _run_trace_loop(
     print(f"[runner] Sim range: {event_times[0]} -> {event_times[-1]}")
     print(f"[runner] Min events for decision: {settings.min_events}\n")
 
+    # --- result logging setup ---
+    results_dir = "tests/results"
+    os.makedirs(results_dir, exist_ok=True)
+    run_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_path = os.path.join(results_dir, f"test_results_{run_ts}.jsonl")
+    summary_path = os.path.join(results_dir, f"test_summary_{run_ts}.txt")
+    results_file = open(results_path, "w", encoding="utf-8")
+
     decision_count = 0
+    category_counts: Dict[str, int] = {}
+    productive_count = 0
+    unproductive_count = 0
+    ambiguous_count = 0
     prev_evt_time = event_times[0]
 
     for evt_time in event_times:
@@ -186,6 +199,47 @@ def _run_trace_loop(
         # Log to console
         _log_decision(decision)
 
+        # Track counts
+        cat_name = decision.get("final_category_name", "Unknown")
+        is_productive = decision.get("final_is_productive")
+        category_counts[cat_name] = category_counts.get(cat_name, 0) + 1
+        if is_productive is True:
+            productive_count += 1
+        elif is_productive is False:
+            unproductive_count += 1
+        else:
+            ambiguous_count += 1
+
+        # Write to results JSONL — full decision pipeline
+        primary = decision.get("primary", {})
+        critic = decision.get("critic") or {}
+        vision = decision.get("vision") or {}
+        result_record = {
+            "timestamp": evt_time.strftime("%Y-%m-%d %H:%M:%S"),
+            # Final decision
+            "category_id": decision.get("final_category_id", ""),
+            "category_name": cat_name,
+            "is_productive": is_productive,
+            "off_score": decision.get("final_off", 0.0),
+            "confidence": decision.get("final_conf", 0.0),
+            "reason": decision.get("final_reason", ""),
+            # Pipeline details
+            "primary_category": primary.get("category_name", ""),
+            "primary_conf": primary.get("conf", ""),
+            "primary_reason": primary.get("reason", ""),
+            "critic_ran": decision.get("critic_ran", False),
+            "critic_category": critic.get("category_name", ""),
+            "critic_conf": critic.get("conf", ""),
+            "critic_reason": critic.get("reason", ""),
+            "vision_category": vision.get("category_name", ""),
+            "vision_conf": vision.get("conf", ""),
+            # Context
+            "keystroke_summary": keystroke_summary,
+            "typed_text": typed_text,
+            "events": [k for _, k in events_buffer],
+        }
+        results_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+
         # Write to sheets
         record = _build_record(decision, events_buffer, typed_text, evt_time)
         sink.enqueue_record(record)
@@ -193,7 +247,25 @@ def _run_trace_loop(
         if flush_result:
             print(f"[runner] Flushed to sheets (appended={flush_result.appended}, updated={flush_result.updated})")
 
+    results_file.close()
+
+    # --- write summary ---
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write("Test Results Summary\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total decisions: {decision_count}\n")
+        if decision_count > 0:
+            f.write(f"Productive:   {productive_count} ({productive_count/decision_count*100:.1f}%)\n")
+            f.write(f"Unproductive: {unproductive_count} ({unproductive_count/decision_count*100:.1f}%)\n")
+            f.write(f"Ambiguous:    {ambiguous_count} ({ambiguous_count/decision_count*100:.1f}%)\n")
+            f.write("\nCategory breakdown:\n")
+            for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
+                f.write(f"  {cat}: {count} ({count/decision_count*100:.1f}%)\n")
+        f.write(f"\nDetailed results saved to: {results_path}\n")
+
     print(f"\n[runner] Trace complete. {decision_count} decisions made.")
+    print(f"[runner] Results: {results_path}")
+    print(f"[runner] Summary: {summary_path}")
 
 
 # --------------- helpers ---------------
