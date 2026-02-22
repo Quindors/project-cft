@@ -31,6 +31,8 @@ IMPORTANT RULES:
 
 5) Only output ABSTAIN if you genuinely cannot determine the category from available information
 
+6) Give more weight to recent events (most recent 3 windows)
+
 Output format (strict, single line):
 CATEGORY=<exact category name from list above>
 OFF_SCORE=<0.0-1.0>

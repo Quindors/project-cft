@@ -35,6 +35,7 @@ CRITICAL QUESTIONS TO ASK:
 
 If uncertain or if the category seems wrong, choose a more accurate category.
 If the initial choice is correct, you can agree with it.
+Make sure to give higher weight to more recent events (most recent 3 windows).
 
 Output format (strict, single line):
 CATEGORY=<exact category name from list above>
