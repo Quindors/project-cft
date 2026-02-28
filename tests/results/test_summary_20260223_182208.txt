@@ -1,0 +1,14 @@
+Test Results Summary
+==================================================
+Total decisions: 21
+Productive:   17 (81.0%)
+Unproductive: 0 (0.0%)
+Ambiguous:    4 (19.0%)
+
+Category breakdown:
+  Homework: 10 (47.6%)
+  Deep Work: 6 (28.6%)
+  Ambiguous: 4 (19.0%)
+  Research & Learning: 1 (4.8%)
+
+Detailed results saved to: tests/results/test_results_20260223_182208.jsonl

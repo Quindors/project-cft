@@ -91,7 +91,7 @@ class Settings:
     decision_interval: float = 10.0  # How often to make decisions (seconds)
     
     # Context window
-    context_window_size: int = 30  # Number of recent events to keep
+    context_window_size: int = 10  # Number of recent events to keep
     min_events: int = 5  # Minimum events before making first decision
     
     # Legacy settings (kept for compatibility)

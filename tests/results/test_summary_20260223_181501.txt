@@ -1,0 +1,11 @@
+Test Results Summary
+==================================================
+Total decisions: 21
+Productive:   0 (0.0%)
+Unproductive: 0 (0.0%)
+Ambiguous:    21 (100.0%)
+
+Category breakdown:
+  [PARSE_ERROR]: 21 (100.0%)
+
+Detailed results saved to: tests/results/test_results_20260223_181501.jsonl
