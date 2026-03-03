@@ -26,14 +26,39 @@ def _read_prompt_file(filename: str) -> str:
 
 # ==================== PROMPT BUILDING ====================
 
+def _format_activity(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
+    """Format events with clear separation between current window and history."""
+    if not events:
+        return "(no events)"
+
+    _current_ts, current_win = events[-1]
+
+    parts = [f">>> CURRENT WINDOW (classify this): {current_win}"]
+
+    # Show recent windows (up to 5 before current, newest first)
+    recent = events[max(0, len(events) - 6):-1]
+    if recent:
+        recent_str = "\n".join([f"  {ts}: {win}" for ts, win in reversed(recent)])
+        parts.append(f"RECENT WINDOWS (newest first):\n{recent_str}")
+
+    # Summarize older context
+    older = events[:max(0, len(events) - 6)]
+    if older:
+        unique_older = list(dict.fromkeys([win for _, win in older]))
+        parts.append(f"OLDER CONTEXT ({len(older)} events): {', '.join(unique_older[-5:])}")
+
+    if keystroke_summary:
+        parts.append(f"KEYSTROKE ACTIVITY (last 60s): {keystroke_summary}")
+
+    return "\n".join(parts)
+
 def build_prompt(
     events: List[Tuple[str, str]],
     keystroke_summary: str = "",
     categories: List[Dict] = None,
     user_goals: str = "",
 ) -> str:
-    activity_str = ", ".join([k for _, k in events])
-    extra = f"\nKeystroke Activity (last 60s): {keystroke_summary}" if keystroke_summary else ""
+    activity_str = _format_activity(events, keystroke_summary)
 
     template = _read_prompt_file("prompt-main.txt")
     if not template:
@@ -55,7 +80,7 @@ def build_prompt(
     filled = template
     filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
     filled = filled.replace("[insert categories here]", category_list)
-    filled = filled.replace("[insert here]", activity_str + extra)
+    filled = filled.replace("[insert here]", activity_str)
     return filled
 
 
@@ -66,15 +91,14 @@ def build_critic_prompt(
     categories: List[Dict] = None,
     user_goals: str = "",
 ) -> str:
-    activity_str = ", ".join([k for _, k in events])
-    extra = f"\nKeystroke Activity: {keystroke_summary}" if keystroke_summary else ""
+    activity_str = _format_activity(events, keystroke_summary)
 
     template = _read_prompt_file("prompt-critic.txt")
     if not template:
         return (
             "You are a strict critic. Review the classification.\n"
             f"Initial model summary: {p1_summary}\n"
-            f"Recent activity: {activity_str}{extra}\n"
+            f"Recent activity: {activity_str}\n"
             "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
         )
 
@@ -91,7 +115,7 @@ def build_critic_prompt(
     filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", p1_summary)
-    filled = filled.replace("[insert activity here]", activity_str + extra)
+    filled = filled.replace("[insert activity here]", activity_str)
     return filled
 
 
