@@ -290,10 +290,23 @@ CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explan
 
 # ==================== CRITIC LOGIC ====================
 
+# Known off-task signals in window titles (lowercase for matching)
+_OFF_TASK_SIGNALS = [
+    "twitter", "reddit", "youtube", "discord", "minecraft",
+    "steam", "netflix", "tiktok", "instagram", "twitch",
+    "hulu", "prime video", "roblox", "epic games",
+    "facebook", "snapchat", "telegram",
+]
+
+# Categories that are productive
+_PRODUCTIVE_CATS = ["deep work", "homework", "research & learning", "communication"]
+
+
 def _should_run_critic(
     cat_name: str,
     conf: float,
     settings: Settings,
+    events: list = None,
 ) -> bool:
     """Decide if critic should run based on category classification."""
     c = settings.critic
@@ -308,6 +321,13 @@ def _should_run_critic(
     ambiguous_categories = ["research & learning", "communication", "ambiguous"]
     if cat_name.lower() in ambiguous_categories:
         return True
+
+    # Run critic when current window looks off-task but model said productive
+    if events and cat_name.lower() in _PRODUCTIVE_CATS:
+        current_win = events[-1][1].lower() if events else ""
+        if any(sig in current_win for sig in _OFF_TASK_SIGNALS):
+            print(f"[critic] Triggered: current window contains off-task signal but model said '{cat_name}'")
+            return True
 
     return False
 
@@ -373,7 +393,7 @@ def decide_with_critic(
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], False)
 
     # Check if critic should run
-    if not _should_run_critic(p1_name, p1_conf, settings):
+    if not _should_run_critic(p1_name, p1_conf, settings, events=events_context):
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
 
     # Run critic
