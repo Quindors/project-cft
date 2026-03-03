@@ -178,36 +178,202 @@ class SheetsSink:
     def _expected_headers(self) -> List[str]:
         """Define the headers for daily Focus Logs sheets."""
         base = [
+            # --- User-facing (left side, scannable) ---
             "timestamp",
-            # Category fields
+            "current_window",
             "category_name",
             "is_productive",
-            # Main LLM section
+            "human_label",       # blank = AI is correct
+            # --- AI reasoning ---
+            "confidence",
+            "reason",
+            # --- Debug / pipeline (right side) ---
             "main_label",
-            "primary_confidence",
-            "primary_reason",
-            # Critic section
             "critic_label",
-            "critic_confidence",
-            "critic_reason",
-            # Vision section
-            "vision_label",
-            "vision_confidence",
-            "vision_reason",
-            # Human feedback
-            "human_label",
-            "human_reason",
+            "critic_conf",
             "typed_text",
         ]
-        # Event columns
+        # Event columns (recent context)
         for i in range(1, self.cfg.max_event_cols + 1):
-            base.append(f"e{i}_key")
+            base.append(f"e{i}")
         return base
 
     def _ensure_headers(self):
         headers = self._expected_headers()
         end_col = _col_letter(len(headers))
         self.ws.update(f"A1:{end_col}1", [headers], value_input_option="RAW")
+
+    def _apply_sheet_formatting(self):
+        """Add dropdown validation on human_label and conditional formatting."""
+        headers = self._expected_headers()
+        ws_id = self.ws.id
+
+        # --- Column indices (0-based for Sheets API) ---
+        col_human = headers.index("human_label")
+        col_productive = headers.index("is_productive")
+        col_category = headers.index("category_name")
+
+        # --- Build category names for dropdown ---
+        categories = self.get_categories()
+        cat_names = [c["name"] for c in categories] if categories else []
+
+        requests = []
+
+        # 1) Data validation dropdown on human_label (rows 2-200)
+        if cat_names:
+            requests.append({
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_human,
+                        "endColumnIndex": col_human + 1,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [{"userEnteredValue": n} for n in cat_names],
+                        },
+                        "showCustomUi": True,
+                        "strict": False,  # allow blanks
+                    },
+                }
+            })
+
+        # 2) Conditional formatting: green background on is_productive = TRUE
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_productive,
+                        "endColumnIndex": col_productive + 1,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": "True"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85},
+                        },
+                    },
+                },
+                "index": 0,
+            }
+        })
+
+        # 3) Conditional formatting: red background on is_productive = False
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_productive,
+                        "endColumnIndex": col_productive + 1,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": "False"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.95, "green": 0.85, "blue": 0.85},
+                        },
+                    },
+                },
+                "index": 1,
+            }
+        })
+
+        # 4) Conditional formatting: grey on is_productive = None/empty
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_productive,
+                        "endColumnIndex": col_productive + 1,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "TEXT_EQ",
+                            "values": [{"userEnteredValue": "None"}],
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.92, "green": 0.92, "blue": 0.92},
+                        },
+                    },
+                },
+                "index": 2,
+            }
+        })
+
+        # 5) Conditional formatting: highlight human_label when filled (correction made)
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": ws_id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_human,
+                        "endColumnIndex": col_human + 1,
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "NOT_BLANK",
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8},
+                            "textFormat": {"bold": True},
+                        },
+                    },
+                },
+                "index": 3,
+            }
+        })
+
+        # 6) Freeze header row + auto-resize current_window column
+        requests.append({
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws_id,
+                    "gridProperties": {"frozenRowCount": 1},
+                },
+                "fields": "gridProperties.frozenRowCount",
+            }
+        })
+
+        # 7) Set column widths — wide for current_window and reason, narrow for others
+        col_current = headers.index("current_window")
+        col_reason = headers.index("reason")
+        for col_idx, width in [(col_current, 350), (col_reason, 300), (col_human, 140)]:
+            requests.append({
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": ws_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_idx,
+                        "endIndex": col_idx + 1,
+                    },
+                    "properties": {"pixelSize": width},
+                    "fields": "pixelSize",
+                }
+            })
+
+        # Execute all formatting in one batch call
+        try:
+            self.sh.batch_update({"requests": requests})
+        except Exception as e:
+            print(f"[warn] Sheet formatting failed (non-fatal): {e}")
 
     def _get_or_create_daily_ws(self, day: date):
         title = f"{self.cfg.worksheet_prefix} - {day:%Y-%m-%d}"
@@ -217,6 +383,7 @@ class SheetsSink:
             ws = self.sh.add_worksheet(title=title, rows="200", cols=str(len(self._expected_headers())), index=0)
             self.ws = ws
             self._ensure_headers()
+            self._apply_sheet_formatting()
             return ws
         return ws
 
@@ -263,40 +430,52 @@ class SheetsSink:
 
     # ------------------- internal formatting -------------------
 
+    @staticmethod
+    def _clean_window_title(raw: str) -> str:
+        """Strip WIN: prefix and trim for readability."""
+        s = raw.strip()
+        if s.upper().startswith("WIN:"):
+            s = s[4:]
+        return s
+
     def _flatten_row(self, record: Dict[str, Any]) -> List[str]:
         """Convert record dict to row list matching headers."""
         def get(k, default=""):
             v = record.get(k, default)
             return "" if v is None else str(v)
 
+        # Extract current window (last event, cleaned)
+        events = record.get("events") or []
+        events = events[-self.cfg.max_event_cols:]
+        if events:
+            last = events[-1]
+            raw = str(last.get("key", "")) if isinstance(last, dict) else str(last)
+            current_window = self._clean_window_title(raw)
+        else:
+            current_window = ""
+
         row: List[str] = [
+            # --- User-facing ---
             get("timestamp"),
-            # Category fields
+            current_window,
             get("category_name"),
             get("is_productive"),
-            # Main LLM section
-            get("main_label"),
+            "",  # human_label (blank = AI correct)
+            # --- AI reasoning ---
             get("primary_confidence"),
             get("primary_reason"),
-            # Critic section
+            # --- Debug / pipeline ---
+            get("main_label"),
             get("critic_label"),
             get("critic_confidence"),
-            get("critic_reason"),
-            # Vision section
-            get("vision_label"),
-            get("vision_confidence"),
-            get("vision_reason"),
-            # Human feedback
-            "",  # human_label
-            "",  # human_reason
             get("typed_text"),
         ]
 
-        events = record.get("events") or []
-        events = events[-self.cfg.max_event_cols:]
+        # Event columns (cleaned)
         for i in range(self.cfg.max_event_cols):
-            if i < len(events) and isinstance(events[i], dict):
-                row.append(str(events[i].get("key", "")) or "")
+            if i < len(events):
+                raw = str(events[i].get("key", "")) if isinstance(events[i], dict) else str(events[i])
+                row.append(self._clean_window_title(raw))
             else:
                 row.append("")
         return row

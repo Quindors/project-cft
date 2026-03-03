@@ -386,21 +386,15 @@ def _build_record(
         # Category
         "category_name":      decision.get("final_category_name", ""),
         "is_productive":      decision.get("final_is_productive"),
-        # Primary
-        "main_label":         primary.get("category_name", ""),
+        # AI reasoning
         "primary_confidence": primary.get("conf", ""),
         "primary_reason":     primary.get("reason", ""),
-        # Critic
+        # Pipeline
+        "main_label":         primary.get("category_name", ""),
         "critic_label":       critic.get("category_name", ""),
         "critic_confidence":  critic.get("conf", ""),
-        "critic_reason":      critic.get("reason", ""),
-        # Vision
-        "vision_label":       vision.get("category_name", ""),
-        "vision_confidence":  vision.get("conf", ""),
-        "vision_reason":      "",
-        # Typed text
+        # Context
         "typed_text":         typed_text,
-        # Events list (SheetsSink._flatten_row handles e1_key .. eN_key)
         "events":             [{"key": k} for _, k in events_buffer],
     }
 
