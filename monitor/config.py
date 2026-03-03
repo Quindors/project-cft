@@ -80,6 +80,11 @@ When I use:
 - Social media/gaming: taking breaks or distraction
 """
 
+@dataclass(frozen=True)
+class ScreenshotSettings:
+    enabled: bool = True
+    capture_interval: float = 10.0   # seconds between captures
+    buffer_size: int = 12            # keep last N screenshots in memory
 
 @dataclass(frozen=True)
 class Settings:
