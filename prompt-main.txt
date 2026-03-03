@@ -1,8 +1,5 @@
 You classify what a user is doing RIGHT NOW based on their CURRENT WINDOW.
 
-USER'S CURRENT PROJECTS AND GOALS:
-[insert goals here]
-
 AVAILABLE CATEGORIES:
 [insert categories here]
 

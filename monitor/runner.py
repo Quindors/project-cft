@@ -39,15 +39,11 @@ def run_monitor_loop(
     else:
         print("[runner] No categories loaded (using fallback prompts)")
 
-    # Load user goals
-    user_goals = settings.load_user_goals()
-    print(f"[runner] Loaded user goals ({len(user_goals)} chars)")
-
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
-        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, user_goals)
+        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories)
     else:
-        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, user_goals)
+        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories)
 
 
 def _run_live_loop(
@@ -57,7 +53,6 @@ def _run_live_loop(
     show_popup: Callable,
     settings: Settings,
     categories: List[Dict],
-    user_goals: str,
 ) -> None:
     """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
 
@@ -109,7 +104,6 @@ def _run_live_loop(
                     settings=settings,
                     window_dwell_info=None,
                     categories=categories,
-                    user_goals=user_goals,
                 )
 
                 # Log to console
@@ -139,7 +133,6 @@ def _run_trace_loop(
     show_popup: Callable,
     settings: Settings,
     categories: List[Dict],
-    user_goals: str,
 ) -> None:
     """Trace mode loop — iterates through event timestamps directly, no sleeping."""
     import json, os
@@ -196,7 +189,6 @@ def _run_trace_loop(
             settings=settings,
             window_dwell_info=None,
             categories=categories,
-            user_goals=user_goals,
         )
 
         decision_count += 1

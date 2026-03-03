@@ -61,25 +61,6 @@ class TraceSettings:
     upload_to_sheets: bool = False     # testing mode: don't write to sheets
     replay_realtime: bool = False      # False = run as fast as possible
 
-
-@dataclass(frozen=True)
-class UserGoalsSettings:
-    goals_file: str = "user_goals.txt"
-    
-    # Default goals if file doesn't exist
-    default_goals: str = """
-I'm a student working on:
-- School assignments and homework
-- Personal projects
-- Learning and research
-
-When I use:
-- Code editors: working on projects or learning
-- Note-taking apps: studying or homework
-- Educational sites: learning and research
-- Social media/gaming: taking breaks or distraction
-"""
-
 @dataclass(frozen=True)
 class ScreenshotSettings:
     enabled: bool = True
@@ -110,29 +91,9 @@ class Settings:
     sheets: SheetsSettings = field(default_factory=SheetsSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
-    user_goals: UserGoalsSettings = field(default_factory=UserGoalsSettings)
 
     def critic_model(self) -> str:
         return self.critic.model or self.model
-    
-    def load_user_goals(self) -> str:
-        """Load user goals from file, or return default if file doesn't exist."""
-        goals_path = self.user_goals.goals_file
-        
-        if os.path.exists(goals_path):
-            try:
-                with open(goals_path, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                    if content:
-                        return content
-                    else:
-                        print(f"[warn] {goals_path} is empty, using default goals")
-            except Exception as e:
-                print(f"[warn] Could not read {goals_path}: {e}")
-        else:
-            print(f"[info] {goals_path} not found, using default goals")
-        
-        return self.user_goals.default_goals.strip()
 
 
 DEFAULT_SETTINGS = Settings(

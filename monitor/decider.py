@@ -56,7 +56,6 @@ def build_prompt(
     events: List[Tuple[str, str]],
     keystroke_summary: str = "",
     categories: List[Dict] = None,
-    user_goals: str = "",
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -78,7 +77,6 @@ def build_prompt(
         category_list = "(no categories available)"
 
     filled = template
-    filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", activity_str)
     return filled
@@ -89,7 +87,6 @@ def build_critic_prompt(
     p1_summary: str,
     keystroke_summary: str = "",
     categories: List[Dict] = None,
-    user_goals: str = "",
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -112,7 +109,6 @@ def build_critic_prompt(
         category_list = "(no categories available)"
 
     filled = template
-    filled = filled.replace("[insert goals here]", user_goals or "(no goals specified)")
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", p1_summary)
     filled = filled.replace("[insert activity here]", activity_str)
@@ -340,7 +336,6 @@ def decide_with_critic(
     settings: Settings = DEFAULT_SETTINGS,
     window_dwell_info: Optional[Dict[str, Any]] = None,
     categories: List[Dict] = None,
-    user_goals: str = "",
 ) -> Dict[str, Any]:
     """
     Category-based decision with optional critic verification.
@@ -355,7 +350,6 @@ def decide_with_critic(
         events_context,
         keystroke_summary,
         categories=categories,
-        user_goals=user_goals,
     )
 
     # Primary model call
@@ -403,7 +397,6 @@ def decide_with_critic(
         p1_summary,
         keystroke_summary,
         categories=categories,
-        user_goals=user_goals,
     )
 
     c_name, c_off, c_conf, c_reason, c_prod, c_raw = ask_gpt(

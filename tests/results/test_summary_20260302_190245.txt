@@ -1,0 +1,66 @@
+Test Results Summary
+==================================================
+Total decisions: 21
+Productive:   15 (71.4%)
+Unproductive: 5 (23.8%)
+Ambiguous:    1 (4.8%)
+
+Category breakdown:
+  Research & Learning: 7 (33.3%)
+  Homework: 5 (23.8%)
+  Social Media: 3 (14.3%)
+  Communication: 2 (9.5%)
+  Deep Work: 1 (4.8%)
+  Ambiguous: 1 (4.8%)
+  Entertainment: 1 (4.8%)
+  Gaming: 1 (4.8%)
+
+==================================================
+ACCURACY (vs ground truth labels)
+==================================================
+Labeled events:        21/21
+Category accuracy:     14/21 (66.7%)
+Productivity accuracy: 17/21 (81.0%)
+
+Timestamp              Predicted              Expected                Match   Prod
+--------------------------------------------------------------------------------
+2025-11-24 19:20:35    Deep Work              Deep Work                   ✅      ✅
+2025-11-24 19:21:09    Research & Learning    Deep Work                   ❌      ✅
+2025-11-24 19:21:10    Research & Learning    Deep Work                   ❌      ✅
+2025-11-24 19:21:12    Communication          Social Media                ❌      ❌
+2025-11-24 19:21:16    Communication          Social Media                ❌      ❌
+2025-11-24 19:21:17    Homework               Homework                    ✅      ✅
+2025-11-24 19:22:19    Ambiguous              Ambiguous                   ✅      ✅
+2025-11-24 19:30:05    Homework               Homework                    ✅      ✅
+2025-11-24 19:30:45    Homework               Homework                    ✅      ✅
+2025-11-24 19:35:10    Research & Learning    Research & Learning         ✅      ✅
+2025-11-24 19:38:20    Homework               Homework                    ✅      ✅
+2025-11-24 19:42:00    Research & Learning    Homework                    ❌      ✅
+2025-11-24 19:45:15    Research & Learning    Research & Learning         ✅      ✅
+2025-11-24 19:48:30    Research & Learning    Other Off-Task              ❌      ❌
+2025-11-24 19:50:00    Research & Learning    Other Off-Task              ❌      ❌
+2025-11-24 19:55:10    Social Media           Social Media                ✅      ✅
+2025-11-24 19:58:05    Social Media           Social Media                ✅      ✅
+2025-11-24 20:00:15    Entertainment          Entertainment               ✅      ✅
+2025-11-24 20:10:00    Social Media           Social Media                ✅      ✅
+2025-11-24 20:15:30    Gaming                 Gaming                      ✅      ✅
+2025-11-24 20:45:00    Homework               Homework                    ✅      ✅
+
+MISCLASSIFICATIONS (7):
+--------------------------------------------------------------------------------
+  2025-11-24 19:21:09 | WIN:Script modification guidance - Google Chrome
+    predicted: Research & Learning  ->  expected: Deep Work (productivity correct, wrong category)
+  2025-11-24 19:21:10 | WIN:Rules - Google Sheets - Google Chrome
+    predicted: Research & Learning  ->  expected: Deep Work (productivity correct, wrong category)
+  2025-11-24 19:21:12 | WIN:(1) Chat | hey guys | Microsoft Teams - Google
+    predicted: Communication  ->  expected: Social Media (productivity WRONG: predicted=True, expected=False)
+  2025-11-24 19:21:16 | WIN:(1) Chat | Hu, Yuxin (Student) | Microsoft Tea
+    predicted: Communication  ->  expected: Social Media (productivity WRONG: predicted=True, expected=False)
+  2025-11-24 19:42:00 | WIN:Wolfram|Alpha: Derivatives - Google Chrome
+    predicted: Research & Learning  ->  expected: Homework (productivity correct, wrong category)
+  2025-11-24 19:48:30 | WIN:Riemann zeta function - Wikipedia - Google Chr
+    predicted: Research & Learning  ->  expected: Other Off-Task (productivity WRONG: predicted=True, expected=False)
+  2025-11-24 19:50:00 | WIN:Millennium Prize Problems - Wikipedia - Google
+    predicted: Research & Learning  ->  expected: Other Off-Task (productivity WRONG: predicted=True, expected=False)
+
+Detailed results saved to: tests/results/test_results_20260302_190245.jsonl
