@@ -8,7 +8,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 from monitor.config import Settings, DEFAULT_SETTINGS
 from monitor.window_capture import get_active_window, get_mode
@@ -165,10 +165,16 @@ class LiveKeystrokeSource(KeystrokeSource):
 
 # ==================== TRACE SOURCES (FILE-BASED, FOR TESTING) ====================
 
-def _load_trace(path: str) -> List[Tuple[datetime, str]]:
+def _load_trace(path: str) -> Tuple[List[Tuple[datetime, str]], Dict[str, str]]:
+    """Load trace file. Returns (events, labels_dict).
+
+    labels_dict maps "YYYY-MM-DD HH:MM:SS" -> expected category name.
+    Only populated for events that have an "expected" field.
+    """
     out: List[Tuple[datetime, str]] = []
+    labels: Dict[str, str] = {}
     if not os.path.exists(path):
-        return out
+        return out, labels
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -176,10 +182,12 @@ def _load_trace(path: str) -> List[Tuple[datetime, str]]:
                 ts = datetime.strptime(rec["timestamp"], "%Y-%m-%d %H:%M:%S")
                 key = str(rec.get("key", ""))
                 out.append((ts, key))
+                if "expected" in rec:
+                    labels[rec["timestamp"]] = rec["expected"]
             except Exception:
                 continue
     out.sort(key=lambda x: x[0])
-    return out
+    return out, labels
 
 
 @dataclass
@@ -187,15 +195,16 @@ class TraceData:
     win: List[Tuple[datetime, str]]
     keys: List[Tuple[datetime, str]]
     sim_start: datetime
+    labels: Dict[str, str]
 
 
 def load_trace_data(settings: Settings) -> TraceData:
-    win = _load_trace(settings.trace.trace_win_path)
-    keys = _load_trace(settings.trace.trace_key_path)
+    win, labels = _load_trace(settings.trace.trace_win_path)
+    keys, _ = _load_trace(settings.trace.trace_key_path)
     if not win and not keys:
         raise RuntimeError("Trace mode enabled but both trace files are missing/empty.")
     sim_start = min([x[0] for x in (win[:1] + keys[:1]) if x] or [datetime.now()])
-    return TraceData(win=win, keys=keys, sim_start=sim_start)
+    return TraceData(win=win, keys=keys, sim_start=sim_start, labels=labels)
 
 
 @dataclass
@@ -228,6 +237,11 @@ class TraceEventSource(EventSource):
 
     def event_times(self):
         return sorted({dt for (dt, _key) in self.session.trace.win})
+    
+    def get_label(self, dt: datetime) -> Optional[str]:
+        """Get the expected label for a timestamp, or None if unlabeled."""
+        ts_str = dt.strftime("%Y-%m-%d %H:%M:%S")
+        return self.session.trace.labels.get(ts_str)
 
 
 class TraceKeystrokeSource(KeystrokeSource):
