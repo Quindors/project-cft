@@ -169,6 +169,12 @@ def _run_trace_loop(
     ambiguous_count = 0
     prev_evt_time = event_times[0]
 
+    # --- accuracy tracking ---
+    labeled_count = 0
+    exact_match = 0
+    productivity_match = 0
+    accuracy_details: List[Dict] = []
+
     for evt_time in event_times:
         # Get all events visible at this point in time
         events_buffer = event_src.last_events(evt_time, limit=settings.context_window_size)
@@ -210,6 +216,43 @@ def _run_trace_loop(
         else:
             ambiguous_count += 1
 
+        # --- accuracy comparison ---
+        expected_label = event_src.get_label(evt_time)
+        if expected_label:
+            labeled_count += 1
+            predicted = cat_name
+            is_exact = predicted.lower() == expected_label.lower()
+            if is_exact:
+                exact_match += 1
+
+            # Look up expected productivity from categories list
+            expected_productive = None
+            for cat in categories:
+                if cat["name"].lower() == expected_label.lower():
+                    expected_productive = cat.get("is_productive")
+                    break
+
+            prod_correct = (is_productive == expected_productive)
+            if prod_correct:
+                productivity_match += 1
+
+            status = "✅" if is_exact else ("⚠️ " if prod_correct else "❌")
+            print(f"[eval] {status} predicted={predicted:20s} expected={expected_label:20s}"
+                  f" | prod_match={prod_correct}")
+
+            accuracy_details.append({
+                "timestamp": evt_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "current_window": events_buffer[-1][1] if events_buffer else "",
+                "predicted": predicted,
+                "expected": expected_label,
+                "exact_match": is_exact,
+                "predicted_productive": is_productive,
+                "expected_productive": expected_productive,
+                "productivity_match": prod_correct,
+                "confidence": decision.get("final_conf", 0.0),
+                "critic_ran": decision.get("critic_ran", False),
+            })
+        
         # Write to results JSONL — full decision pipeline
         primary = decision.get("primary", {})
         critic = decision.get("critic") or {}
@@ -233,6 +276,7 @@ def _run_trace_loop(
             "vision_category": vision.get("category_name", ""),
             "vision_conf": vision.get("conf", ""),
             # Context
+            "expected": event_src.get_label(evt_time),
             "keystroke_summary": keystroke_summary,
             "typed_text": typed_text,
             "events": [k for _, k in events_buffer],
@@ -260,11 +304,61 @@ def _run_trace_loop(
             f.write("\nCategory breakdown:\n")
             for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
                 f.write(f"  {cat}: {count} ({count/decision_count*100:.1f}%)\n")
+
+        # --- accuracy section ---
+        if labeled_count > 0:
+            exact_pct = exact_match / labeled_count * 100
+            prod_pct = productivity_match / labeled_count * 100
+            f.write("\n" + "=" * 50 + "\n")
+            f.write("ACCURACY (vs ground truth labels)\n")
+            f.write("=" * 50 + "\n")
+            f.write(f"Labeled events:        {labeled_count}/{decision_count}\n")
+            f.write(f"Category accuracy:     {exact_match}/{labeled_count} ({exact_pct:.1f}%)\n")
+            f.write(f"Productivity accuracy: {productivity_match}/{labeled_count} ({prod_pct:.1f}%)\n")
+
+            f.write(f"\n{'Timestamp':<22s} {'Predicted':<22s} {'Expected':<22s} {'Match':>6s} {'Prod':>6s}\n")
+            f.write("-" * 80 + "\n")
+            for d in accuracy_details:
+                match_sym = "✅" if d["exact_match"] else "❌"
+                prod_sym = "✅" if d["productivity_match"] else "❌"
+                f.write(f"{d['timestamp']:<22s} {d['predicted']:<22s} {d['expected']:<22s} {match_sym:>6s} {prod_sym:>6s}\n")
+
+            errors = [d for d in accuracy_details if not d["exact_match"]]
+            if errors:
+                f.write(f"\nMISCLASSIFICATIONS ({len(errors)}):\n")
+                f.write("-" * 80 + "\n")
+                for d in errors:
+                    if d["productivity_match"]:
+                        prod_note = " (productivity correct, wrong category)"
+                    else:
+                        prod_note = f" (productivity WRONG: predicted={d['predicted_productive']}, expected={d['expected_productive']})"
+                    f.write(f"  {d['timestamp']} | {d['current_window'][:50]}\n")
+                    f.write(f"    predicted: {d['predicted']}  ->  expected: {d['expected']}{prod_note}\n")
+        else:
+            f.write("\nNo ground truth labels found in trace file.\n")
+            f.write("Add \"expected\" field to trace_win.jsonl events to enable accuracy tracking.\n")
+
         f.write(f"\nDetailed results saved to: {results_path}\n")
 
+    # --- console output ---
     print(f"\n[runner] Trace complete. {decision_count} decisions made.")
     print(f"[runner] Results: {results_path}")
     print(f"[runner] Summary: {summary_path}")
+
+    if labeled_count > 0:
+        exact_pct = exact_match / labeled_count * 100
+        prod_pct = productivity_match / labeled_count * 100
+        print(f"\n{'='*50}")
+        print(f"  ACCURACY REPORT")
+        print(f"{'='*50}")
+        print(f"  Category accuracy:     {exact_match}/{labeled_count} ({exact_pct:.1f}%)")
+        print(f"  Productivity accuracy: {productivity_match}/{labeled_count} ({prod_pct:.1f}%)")
+        errors = [d for d in accuracy_details if not d["exact_match"]]
+        if errors:
+            print(f"\n  Misclassifications ({len(errors)}):")
+            for d in errors:
+                print(f"    {d['timestamp']} | {d['predicted']:20s} -> should be {d['expected']}")
+        print(f"{'='*50}")
 
 
 # --------------- helpers ---------------
