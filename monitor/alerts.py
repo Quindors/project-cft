@@ -55,4 +55,25 @@ def _popup_macos(message: str, title: str) -> None:
     """macOS native notification via osascript."""
     try:
         subprocess.Popen(
-            ["osascript"
+            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        print(f"[popup] {title}: {message}")
+
+
+def show_popup(message: str, title: str = "Productivity Alert") -> None:
+    # Sanitize quotes for shell safety
+    message = message.replace("'", "\u2019").replace('"', "\u201C")
+    title = title.replace("'", "\u2019").replace('"', "\u201C")
+
+    if PLATFORM == "Windows":
+        _popup_windows(message, title)
+    elif IS_WSL:
+        _popup_wsl(message, title)
+    elif PLATFORM == "Darwin":
+        _popup_macos(message, title)
+    elif PLATFORM == "Linux":
+        _popup_linux(message, title)
+    else:
+        print(f"[popup] {title}: {message}")
