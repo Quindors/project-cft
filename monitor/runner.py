@@ -39,11 +39,20 @@ def run_monitor_loop(
     else:
         print("[runner] No categories loaded (using fallback prompts)")
 
+    # Load user corrections
+    corrections = sink.load_corrections()
+    if corrections:
+        print(f"[runner] Loaded {len(corrections)} user corrections:")
+        for c in corrections[:5]:
+            print(f"[runner]   {c['window_title'][:40]:40s} {c['ai_category']} -> {c['corrected_category']}")
+        if len(corrections) > 5:
+            print(f"[runner]   ... and {len(corrections) - 5} more")
+
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
-        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories)
+        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, corrections)
     else:
-        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories)
+        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections)
 
 
 def _run_live_loop(
@@ -53,6 +62,8 @@ def _run_live_loop(
     show_popup: Callable,
     settings: Settings,
     categories: List[Dict],
+    corrections: List[Dict] = None,
+
 ) -> None:
     """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
 
@@ -104,6 +115,7 @@ def _run_live_loop(
                     settings=settings,
                     window_dwell_info=None,
                     categories=categories,
+                    corrections=corrections,
                 )
 
                 # Log to console
@@ -133,6 +145,7 @@ def _run_trace_loop(
     show_popup: Callable,
     settings: Settings,
     categories: List[Dict],
+    corrections: List[Dict] = None,
 ) -> None:
     """Trace mode loop — iterates through event timestamps directly, no sleeping."""
     import json, os
@@ -189,6 +202,7 @@ def _run_trace_loop(
             settings=settings,
             window_dwell_info=None,
             categories=categories,
+            corrections=corrections,
         )
 
         decision_count += 1
