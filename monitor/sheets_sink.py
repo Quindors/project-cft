@@ -48,7 +48,7 @@ class NullSink:
     def close(self):
         return
     
-    def load_correction(self):
+    def load_corrections(self):
         return []
 
     def get_categories(self):

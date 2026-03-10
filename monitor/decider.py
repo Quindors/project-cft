@@ -464,7 +464,6 @@ def decide_with_critic(
         max_tokens=150,
         temperature=0.0,
         categories=categories,
-        corrections=corrections,
     )
 
     primary_res = {
@@ -510,7 +509,6 @@ def decide_with_critic(
         settings.critic_model(),
         max_tokens=settings.critic.max_tokens,
         temperature=settings.critic.temperature,
-        categories=categories,
     )
 
     critic_res = {
