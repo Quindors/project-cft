@@ -52,10 +52,72 @@ def _format_activity(events: List[Tuple[str, str]], keystroke_summary: str = "")
 
     return "\n".join(parts)
 
+def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[Dict]:
+    """Check if current window exactly matches a known correction."""
+    if not corrections:
+        return None
+    clean = current_window.strip()
+    # Strip WIN: prefix for matching
+    if clean.upper().startswith("WIN:"):
+        clean = clean[4:]
+    clean_lower = clean.lower()
+    for c in corrections:
+        if c["window_title"].lower() == clean_lower:
+            return c
+    return None
+
+def _build_corrections_prompt(current_window: str, corrections: List[Dict], max_examples: int = 8) -> str:
+    """Build a prompt section from relevant corrections (keyword overlap)."""
+    if not corrections:
+        return ""
+
+    clean = current_window.strip()
+    if clean.upper().startswith("WIN:"):
+        clean = clean[4:]
+    current_words = set(clean.lower().split())
+
+    # Score each correction by keyword overlap with current window
+    scored = []
+    for c in corrections:
+        corr_words = set(c["window_title"].lower().split())
+        overlap = len(current_words & corr_words)
+        if overlap > 0:
+            scored.append((overlap, c))
+
+    # Sort by overlap descending, take top N
+    scored.sort(key=lambda x: -x[0])
+    top = [c for _, c in scored[:max_examples]]
+
+    # Also include corrections with no overlap (user might want them as general rules)
+    # but only if we have room
+    remaining = max_examples - len(top)
+    if remaining > 0:
+        used_titles = {c["window_title"] for c in top}
+        for c in corrections:
+            if c["window_title"] not in used_titles:
+                top.append(c)
+                remaining -= 1
+                if remaining <= 0:
+                    break
+
+    if not top:
+        return ""
+
+    lines = []
+    for c in top:
+        lines.append(f'- "{c["window_title"]}" was {c["ai_category"]} -> corrected to {c["corrected_category"]}')
+
+    return (
+        "LEARNED FROM PAST CORRECTIONS (the user corrected these):\n"
+        + "\n".join(lines)
+        + "\n\nIf the current window is similar to a corrected example, follow the correction."
+    )
+
 def build_prompt(
     events: List[Tuple[str, str]],
     keystroke_summary: str = "",
     categories: List[Dict] = None,
+    corrections: List[Dict] = None,
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -79,6 +141,14 @@ def build_prompt(
     filled = template
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", activity_str)
+
+    # Inject corrections if available
+    if corrections and events:
+        current_win = events[-1][1]
+        corrections_section = _build_corrections_prompt(current_win, corrections)
+        if corrections_section:
+            filled = filled + "\n\n" + corrections_section
+
     return filled
 
 
@@ -87,6 +157,7 @@ def build_critic_prompt(
     p1_summary: str,
     keystroke_summary: str = "",
     categories: List[Dict] = None,
+    corrections: List[Dict] = None,
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -112,6 +183,14 @@ def build_critic_prompt(
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", p1_summary)
     filled = filled.replace("[insert activity here]", activity_str)
+
+    # Inject corrections if available
+    if corrections and events:
+        current_win = events[-1][1]
+        corrections_section = _build_corrections_prompt(current_win, corrections)
+        if corrections_section:
+            filled = filled + "\n\n" + corrections_section
+
     return filled
 
 
@@ -336,6 +415,7 @@ def decide_with_critic(
     settings: Settings = DEFAULT_SETTINGS,
     window_dwell_info: Optional[Dict[str, Any]] = None,
     categories: List[Dict] = None,
+    corrections: List[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Category-based decision with optional critic verification.
@@ -344,12 +424,37 @@ def decide_with_critic(
         final_category_name, final_is_productive, final_off, final_conf,
         final_reason, critic_ran, primary, critic, vision
     """
+    # --- Exact-match shortcut: skip LLM if user already corrected this window ---
+    if corrections and events_context:
+        match = _match_correction(events_context[-1][1], corrections)
+        if match:
+            cat_name = match["corrected_category"]
+            is_productive = None
+            if categories:
+                for cat in categories:
+                    if cat["name"].lower() == cat_name.lower():
+                        cat_name = cat["name"]
+                        is_productive = cat.get("is_productive")
+                        break
+            print(f"[correction] Exact match: '{match['window_title'][:40]}' -> {cat_name} (skipping LLM)")
+            return {
+                "final_category_name": cat_name,
+                "final_is_productive": is_productive,
+                "final_off": 0.0 if is_productive else 1.0,
+                "final_conf": 1.0,
+                "final_reason": f"User correction: was {match['ai_category']}, corrected to {cat_name}",
+                "critic_ran": False,
+                "primary": {"category_name": cat_name, "is_productive": is_productive, "off": 0.0, "conf": 1.0, "reason": "user correction"},
+                "critic": None,
+                "vision": None,
+            }
 
     # Build prompt with categories and goals
     p1_prompt = build_prompt(
         events_context,
         keystroke_summary,
         categories=categories,
+        corrections=corrections,
     )
 
     # Primary model call
@@ -359,6 +464,7 @@ def decide_with_critic(
         max_tokens=150,
         temperature=0.0,
         categories=categories,
+        corrections=corrections,
     )
 
     primary_res = {
