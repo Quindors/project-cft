@@ -48,6 +48,9 @@ class NullSink:
     def close(self):
         return
     
+    def load_correction(self):
+        return []
+
     def get_categories(self):
         return [
             {"name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
@@ -174,6 +177,64 @@ class SheetsSink:
         
         self._categories_cache = categories
         return categories
+    
+    def load_corrections(self, max_sheets: int = 7) -> List[Dict]:
+        """Scan recent daily sheets for human corrections.
+
+        Returns deduplicated list of dicts:
+            {window_title, ai_category, corrected_category}
+        Keyed by window_title (latest correction wins).
+        """
+        headers = self._expected_headers()
+        idx_window = headers.index("current_window")
+        idx_ai = headers.index("category_name")
+        idx_human = headers.index("human_label")
+
+        # Find daily sheets (they start with the worksheet prefix)
+        prefix = self.cfg.worksheet_prefix
+        daily_sheets = []
+        for ws in self.sh.worksheets():
+            if ws.title.startswith(prefix):
+                daily_sheets.append(ws)
+
+        # Sort by title descending (newest first), limit
+        daily_sheets.sort(key=lambda w: w.title, reverse=True)
+        daily_sheets = daily_sheets[:max_sheets]
+
+        # Collect corrections, keyed by window title (latest wins)
+        corrections: Dict[str, Dict] = {}
+
+        for ws in daily_sheets:
+            try:
+                rows = ws.get_all_values()
+            except Exception as e:
+                print(f"[warn] Could not read {ws.title}: {e}")
+                continue
+
+            for row in rows[1:]:  # skip header
+                if len(row) <= max(idx_window, idx_ai, idx_human):
+                    continue
+
+                window = row[idx_window].strip()
+                ai_cat = row[idx_ai].strip()
+                human = row[idx_human].strip()
+
+                if not human or not window:
+                    continue
+                if human.lower() == ai_cat.lower():
+                    continue  # not a correction, user agreed
+
+                # Deduplicate by window title (latest sheet = first in list)
+                if window not in corrections:
+                    corrections[window] = {
+                        "window_title": window,
+                        "ai_category": ai_cat,
+                        "corrected_category": human,
+                    }
+
+        result = list(corrections.values())
+        print(f"[info] Loaded {len(result)} corrections from {len(daily_sheets)} sheets")
+        return result
 
     def _expected_headers(self) -> List[str]:
         """Define the headers for daily Focus Logs sheets."""
