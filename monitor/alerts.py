@@ -25,10 +25,35 @@ def _popup_windows(message: str, title: str) -> None:
 
 
 def _popup_wsl(message: str, title: str) -> None:
-    """Call Windows MessageBox from WSL via PowerShell."""
+    """Show a TopMost WinForms popup from WSL via PowerShell."""
+    message = message.replace("'", "").replace('"', '').replace('\n', '`n')
+    title = title.replace("'", "").replace('"', '')
+
     ps_cmd = (
-        f"Add-Type -AssemblyName System.Windows.Forms; "
-        f"[System.Windows.Forms.MessageBox]::Show('{message}', '{title}', 'OK', 'Information')"
+        "Add-Type -AssemblyName System.Windows.Forms;"
+        "Add-Type -AssemblyName System.Drawing;"
+        " $f = New-Object System.Windows.Forms.Form;"
+        " $f.Text = '" + title + "';"
+        " $f.TopMost = $true;"
+        " $f.StartPosition = 'CenterScreen';"
+        " $f.Size = New-Object System.Drawing.Size(420,200);"
+        " $f.FormBorderStyle = 'FixedDialog';"
+        " $f.MaximizeBox = $false;"
+        " $f.MinimizeBox = $false;"
+        " $lbl = New-Object System.Windows.Forms.Label;"
+        " $lbl.Text = '" + message + "';"
+        " $lbl.AutoSize = $false;"
+        " $lbl.Size = New-Object System.Drawing.Size(380,100);"
+        " $lbl.Location = New-Object System.Drawing.Point(15,15);"
+        " $f.Controls.Add($lbl);"
+        " $btn = New-Object System.Windows.Forms.Button;"
+        " $btn.Text = 'OK';"
+        " $btn.Size = New-Object System.Drawing.Size(80,30);"
+        " $btn.Location = New-Object System.Drawing.Point(160,120);"
+        " $btn.Add_Click({ $f.Close() });"
+        " $f.Controls.Add($btn);"
+        " $f.Add_Shown({ $f.Activate() });"
+        " [void]$f.ShowDialog()"
     )
     try:
         subprocess.Popen(
