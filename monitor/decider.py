@@ -24,6 +24,26 @@ def _read_prompt_file(filename: str) -> str:
         return ""
 
 
+# ==================== TITLE NORMALIZATION ====================
+
+def _normalize_title(title: str) -> str:
+    """Normalize a window title for cache matching.
+
+    - Strip WIN: prefix
+    - Strip leading (N) notification counts
+    - Lowercase
+    - Collapse whitespace
+    """
+    s = title.strip()
+    if s.upper().startswith("WIN:"):
+        s = s[4:]
+    # Strip leading "(2) " or "(15) " notification counts
+    s = re.sub(r"^\(\d+\)\s*", "", s)
+    # Collapse whitespace and lowercase
+    s = " ".join(s.split()).lower()
+    return s
+
+
 # ==================== PROMPT BUILDING ====================
 
 def _format_activity(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
@@ -66,9 +86,34 @@ def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[
             return c
     return None
 
-def _build_corrections_prompt(current_window: str, corrections: List[Dict], max_examples: int = 8) -> str:
-    """Build a prompt section from relevant corrections (keyword overlap)."""
-    if not corrections:
+
+def _match_prior_classification(current_window: str, prior_classifications: List[Dict]) -> Optional[Dict]:
+    """Check if current window matches a prior high-confidence classification.
+
+    Uses normalized title matching (strips WIN:, notification counts, lowercases).
+    Returns the matching dict or None.
+    """
+    if not prior_classifications:
+        return None
+    normalized = _normalize_title(current_window)
+    for p in prior_classifications:
+        if p["normalized_title"] == normalized:
+            return p
+    return None
+
+
+def _build_fewshot_prompt(
+    current_window: str,
+    corrections: List[Dict],
+    prior_classifications: List[Dict] = None,
+    max_examples: int = 8,
+) -> str:
+    """Build a few-shot prompt section from corrections AND prior classifications.
+
+    Human corrections take priority. Prior classifications fill remaining slots,
+    scored by keyword overlap with the current window.
+    """
+    if not corrections and not prior_classifications:
         return ""
 
     clean = current_window.strip()
@@ -76,48 +121,88 @@ def _build_corrections_prompt(current_window: str, corrections: List[Dict], max_
         clean = clean[4:]
     current_words = set(clean.lower().split())
 
-    # Score each correction by keyword overlap with current window
-    scored = []
-    for c in corrections:
-        corr_words = set(c["window_title"].lower().split())
-        overlap = len(current_words & corr_words)
-        if overlap > 0:
-            scored.append((overlap, c))
+    # --- Collect correction examples (highest priority) ---
+    correction_lines = []
+    used_titles = set()
 
-    # Sort by overlap descending, take top N
-    scored.sort(key=lambda x: -x[0])
-    top = [c for _, c in scored[:max_examples]]
-
-    # Also include corrections with no overlap (user might want them as general rules)
-    # but only if we have room
-    remaining = max_examples - len(top)
-    if remaining > 0:
-        used_titles = {c["window_title"] for c in top}
+    if corrections:
+        scored = []
         for c in corrections:
-            if c["window_title"] not in used_titles:
-                top.append(c)
-                remaining -= 1
-                if remaining <= 0:
-                    break
+            corr_words = set(c["window_title"].lower().split())
+            overlap = len(current_words & corr_words)
+            if overlap > 0:
+                scored.append((overlap, c))
+        scored.sort(key=lambda x: -x[0])
 
-    if not top:
-        return ""
+        for _, c in scored[:max_examples]:
+            correction_lines.append(
+                f'- "{c["window_title"]}" was {c["ai_category"]} -> corrected to {c["corrected_category"]}'
+            )
+            used_titles.add(c["window_title"].lower())
 
-    lines = []
-    for c in top:
-        lines.append(f'- "{c["window_title"]}" was {c["ai_category"]} -> corrected to {c["corrected_category"]}')
+        # Fill remaining slots with non-overlapping corrections
+        remaining = max_examples - len(correction_lines)
+        if remaining > 0:
+            for c in corrections:
+                if c["window_title"].lower() not in used_titles:
+                    correction_lines.append(
+                        f'- "{c["window_title"]}" was {c["ai_category"]} -> corrected to {c["corrected_category"]}'
+                    )
+                    used_titles.add(c["window_title"].lower())
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
 
-    return (
-        "LEARNED FROM PAST CORRECTIONS (the user corrected these):\n"
-        + "\n".join(lines)
-        + "\n\nIf the current window is similar to a corrected example, follow the correction."
-    )
+    # --- Collect prior classification examples (fill remaining slots) ---
+    prior_lines = []
+    remaining_slots = max_examples - len(correction_lines)
+
+    if prior_classifications and remaining_slots > 0:
+        scored_prior = []
+        for p in prior_classifications:
+            # Skip if already covered by a correction
+            if p["window_title"].lower() in used_titles:
+                continue
+            # Skip exact match with current window (that's handled by tier 1)
+            if p["normalized_title"] == _normalize_title(current_window):
+                continue
+            prior_words = set(p["window_title"].lower().split())
+            overlap = len(current_words & prior_words)
+            if overlap > 0:
+                scored_prior.append((overlap, p))
+
+        scored_prior.sort(key=lambda x: -x[0])
+
+        for _, p in scored_prior[:remaining_slots]:
+            prior_lines.append(
+                f'- "{p["window_title"]}" -> classified as {p["category_name"]} (conf={p["confidence"]:.2f})'
+            )
+
+    # --- Assemble output ---
+    all_lines = []
+
+    if correction_lines:
+        all_lines.append("LEARNED FROM PAST CORRECTIONS (the user corrected these):")
+        all_lines.extend(correction_lines)
+
+    if prior_lines:
+        all_lines.append("\nSIMILAR WINDOWS PREVIOUSLY CLASSIFIED:")
+        all_lines.extend(prior_lines)
+
+    if all_lines:
+        all_lines.append(
+            "\nIf the current window is similar to a corrected or previously classified example, follow the pattern."
+        )
+
+    return "\n".join(all_lines) if all_lines else ""
+
 
 def build_prompt(
     events: List[Tuple[str, str]],
     keystroke_summary: str = "",
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
+    prior_classifications: List[Dict] = None,
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -125,7 +210,7 @@ def build_prompt(
     if not template:
         return (
             "You are a focus judge. Categorize the user's activity.\n"
-            f"Recent activity: {activity_str}{extra}\n"
+            f"Recent activity: {activity_str}\n"
             "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
         )
 
@@ -142,12 +227,14 @@ def build_prompt(
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", activity_str)
 
-    # Inject corrections if available
-    if corrections and events:
+    # Inject few-shot examples (corrections + prior classifications)
+    if events:
         current_win = events[-1][1]
-        corrections_section = _build_corrections_prompt(current_win, corrections)
-        if corrections_section:
-            filled = filled + "\n\n" + corrections_section
+        fewshot_section = _build_fewshot_prompt(
+            current_win, corrections or [], prior_classifications
+        )
+        if fewshot_section:
+            filled = filled + "\n\n" + fewshot_section
 
     return filled
 
@@ -158,6 +245,7 @@ def build_critic_prompt(
     keystroke_summary: str = "",
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
+    prior_classifications: List[Dict] = None,
 ) -> str:
     activity_str = _format_activity(events, keystroke_summary)
 
@@ -184,12 +272,14 @@ def build_critic_prompt(
     filled = filled.replace("[insert here]", p1_summary)
     filled = filled.replace("[insert activity here]", activity_str)
 
-    # Inject corrections if available
-    if corrections and events:
+    # Inject few-shot examples into critic too
+    if events:
         current_win = events[-1][1]
-        corrections_section = _build_corrections_prompt(current_win, corrections)
-        if corrections_section:
-            filled = filled + "\n\n" + corrections_section
+        fewshot_section = _build_fewshot_prompt(
+            current_win, corrections or [], prior_classifications
+        )
+        if fewshot_section:
+            filled = filled + "\n\n" + fewshot_section
 
     return filled
 
@@ -363,18 +453,7 @@ CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explan
         return "[ERROR]", 0.5, 0.5
 
 
-# ==================== CRITIC LOGIC ====================
-
-# Known off-task signals in window titles (lowercase for matching)
-_OFF_TASK_SIGNALS = [
-    "twitter", "reddit", "youtube", "discord", "minecraft",
-    "steam", "netflix", "tiktok", "instagram", "twitch",
-    "hulu", "prime video", "roblox", "epic games",
-    "facebook", "snapchat", "telegram",
-]
-
-# Categories that are productive
-_PRODUCTIVE_CATS = ["deep work", "homework", "research & learning", "communication"]
+# ==================== SYSTEM WINDOW DETECTION ====================
 
 # Known system/utility windows (lowercase substrings for matching)
 _SYSTEM_WINDOWS = [
@@ -398,6 +477,21 @@ def _is_system_window(title: str) -> bool:
         clean = clean[4:]
     lower = clean.lower()
     return any(pattern in lower for pattern in _SYSTEM_WINDOWS)
+
+
+# ==================== CRITIC LOGIC ====================
+
+# Known off-task signals in window titles (lowercase for matching)
+_OFF_TASK_SIGNALS = [
+    "twitter", "reddit", "youtube", "discord", "minecraft",
+    "steam", "netflix", "tiktok", "instagram", "twitch",
+    "hulu", "prime video", "roblox", "epic games",
+    "facebook", "snapchat", "telegram",
+]
+
+# Categories that are productive
+_PRODUCTIVE_CATS = ["deep work", "homework", "research & learning", "communication"]
+
 
 def _should_run_critic(
     cat_name: str,
@@ -438,15 +532,22 @@ def decide_with_critic(
     window_dwell_info: Optional[Dict[str, Any]] = None,
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
+    prior_classifications: List[Dict] = None,
 ) -> Dict[str, Any]:
     """
     Category-based decision with optional critic verification.
+
+    Decision pipeline (in order):
+        1. User correction exact-match → skip LLM
+        2. System window shortcut → skip LLM
+        3. Prior classification match → skip LLM (tier 1 cache)
+        4. LLM call with few-shot hints from corrections + priors (tier 2)
 
     Returns dict with:
         final_category_name, final_is_productive, final_off, final_conf,
         final_reason, critic_ran, primary, critic, vision
     """
-    # --- Exact-match shortcut: skip LLM if user already corrected this window ---
+    # --- 1. Exact-match shortcut: skip LLM if user already corrected this window ---
     if corrections and events_context:
         match = _match_correction(events_context[-1][1], corrections)
         if match:
@@ -471,7 +572,7 @@ def decide_with_critic(
                 "vision": None,
             }
 
-    # --- System window shortcut: skip LLM for OS-level windows ---
+    # --- 2. System window shortcut: skip LLM for OS-level windows ---
     if events_context and _is_system_window(events_context[-1][1]):
         return {
             "final_category_name": "System",
@@ -486,12 +587,41 @@ def decide_with_critic(
             "vision": None,
         }
 
-    # Build prompt with categories and goals
+    # --- 3. Prior classification match: skip LLM if we've seen this title before ---
+    if prior_classifications and events_context:
+        match = _match_prior_classification(events_context[-1][1], prior_classifications)
+        if match:
+            cat_name = match["category_name"]
+            is_productive = None
+            if categories:
+                for cat in categories:
+                    if cat["name"].lower() == cat_name.lower():
+                        cat_name = cat["name"]
+                        is_productive = cat.get("is_productive")
+                        break
+            print(f"[prior] Cache hit: '{match['window_title'][:40]}' -> {cat_name} (skipping LLM)")
+            return {
+                "final_category_name": cat_name,
+                "final_is_productive": is_productive,
+                "final_off": 0.0 if is_productive else (1.0 if is_productive is False else 0.5),
+                "final_conf": 0.95,
+                "final_reason": f"[Prior] previously classified as {cat_name} (conf={match['confidence']:.2f})",
+                "critic_ran": False,
+                "primary": {"category_name": cat_name, "is_productive": is_productive,
+                             "off": 0.0, "conf": 0.95, "reason": "prior classification cache"},
+                "critic": None,
+                "vision": None,
+            }
+
+    # --- 4. LLM call with few-shot hints (tier 2) ---
+
+    # Build prompt with categories, corrections, and prior classifications
     p1_prompt = build_prompt(
         events_context,
         keystroke_summary,
         categories=categories,
         corrections=corrections,
+        prior_classifications=prior_classifications,
     )
 
     # Primary model call
@@ -539,6 +669,8 @@ def decide_with_critic(
         p1_summary,
         keystroke_summary,
         categories=categories,
+        corrections=corrections,
+        prior_classifications=prior_classifications,
     )
 
     c_name, c_off, c_conf, c_reason, c_prod, c_raw = ask_gpt(
