@@ -248,73 +248,73 @@ class SheetsSink:
         return result
     
     def load_prior_classifications(self, max_sheets: int = 7, min_confidence: float = 0.85) -> List[Dict]:
-    """Scan recent daily sheets for high-confidence prior classifications.
+        """Scan recent daily sheets for high-confidence prior classifications.
 
-    Returns deduplicated list of dicts:
-        {window_title, normalized_title, category_name, confidence}
-    Keyed by normalized window title (latest classification wins).
-    Skips Ambiguous, errors, and rows with human corrections.
-    """
-    headers = self._expected_headers()
-    idx_window = headers.index("current_window")
-    idx_category = headers.index("category_name")
-    idx_conf = headers.index("confidence")
-    idx_human = headers.index("human_label")
+        Returns deduplicated list of dicts:
+            {window_title, normalized_title, category_name, confidence}
+        Keyed by normalized window title (latest classification wins).
+        Skips Ambiguous, errors, and rows with human corrections.
+        """
+        headers = self._expected_headers()
+        idx_window = headers.index("current_window")
+        idx_category = headers.index("category_name")
+        idx_conf = headers.index("confidence")
+        idx_human = headers.index("human_label")
 
-    prefix = self.cfg.worksheet_prefix
-    daily_sheets = []
-    for ws in self.sh.worksheets():
-        if ws.title.startswith(prefix):
-            daily_sheets.append(ws)
+        prefix = self.cfg.worksheet_prefix
+        daily_sheets = []
+        for ws in self.sh.worksheets():
+            if ws.title.startswith(prefix):
+                daily_sheets.append(ws)
 
-    daily_sheets.sort(key=lambda w: w.title, reverse=True)
-    daily_sheets = daily_sheets[:max_sheets]
+        daily_sheets.sort(key=lambda w: w.title, reverse=True)
+        daily_sheets = daily_sheets[:max_sheets]
 
-    classifications: Dict[str, Dict] = {}
-    skip_categories = {"ambiguous", "[error]", "[parse_error]"}
+        classifications: Dict[str, Dict] = {}
+        skip_categories = {"ambiguous", "[error]", "[parse_error]"}
 
-    for ws in daily_sheets:
-        try:
-            rows = ws.get_all_values()
-        except Exception as e:
-            print(f"[warn] Could not read {ws.title}: {e}")
-            continue
-
-        for row in rows[1:]:
-            if len(row) <= max(idx_window, idx_category, idx_conf, idx_human):
-                continue
-
-            window = row[idx_window].strip()
-            category = row[idx_category].strip()
-            conf_str = row[idx_conf].strip()
-            human = row[idx_human].strip()
-
-            if not window or not category:
-                continue
-            if human:
-                continue  # handled by load_corrections
-            if category.lower() in skip_categories:
-                continue
-
+        for ws in daily_sheets:
             try:
-                conf = float(conf_str)
-            except (ValueError, TypeError):
-                continue
-            if conf < min_confidence:
+                rows = ws.get_all_values()
+            except Exception as e:
+                print(f"[warn] Could not read {ws.title}: {e}")
                 continue
 
-            normalized = _normalize_title(window)
-            if normalized not in classifications:
-                classifications[normalized] = {
-                    "window_title": window,
-                    "normalized_title": normalized,
-                    "category_name": category,
-                    "confidence": conf,
-                }
+            for row in rows[1:]:
+                if len(row) <= max(idx_window, idx_category, idx_conf, idx_human):
+                    continue
 
-    result = list(classifications.values())
-    print(f"[info] Loaded {len(result)} prior classifications from {len(daily_sheets)} sheets")
-    return result
+                window = row[idx_window].strip()
+                category = row[idx_category].strip()
+                conf_str = row[idx_conf].strip()
+                human = row[idx_human].strip()
+
+                if not window or not category:
+                    continue
+                if human:
+                    continue  # handled by load_corrections
+                if category.lower() in skip_categories:
+                    continue
+
+                try:
+                    conf = float(conf_str)
+                except (ValueError, TypeError):
+                    continue
+                if conf < min_confidence:
+                    continue
+
+                normalized = _normalize_title(window)
+                if normalized not in classifications:
+                    classifications[normalized] = {
+                        "window_title": window,
+                        "normalized_title": normalized,
+                        "category_name": category,
+                        "confidence": conf,
+                    }
+
+        result = list(classifications.values())
+        print(f"[info] Loaded {len(result)} prior classifications from {len(daily_sheets)} sheets")
+        return result
 
     def _expected_headers(self) -> List[str]:
         """Define the headers for daily Focus Logs sheets."""
