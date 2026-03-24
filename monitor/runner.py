@@ -54,11 +54,24 @@ def run_monitor_loop(
     else:
         print(f"[runner] No user corrections found ({corr_time:.2f}s)")
 
+    # Load prior classifications for cache
+    t = time.time()
+    prior_classifications = sink.load_prior_classifications()
+    prior_time = time.time() - t
+    if prior_classifications:
+        print(f"[runner] Loaded {len(prior_classifications)} prior classifications ({prior_time:.2f}s):")
+        for p in prior_classifications[:5]:
+            print(f"[runner]   {p['normalized_title'][:40]:40s} -> {p['category_name']}")
+        if len(prior_classifications) > 5:
+            print(f"[runner]   ... and {len(prior_classifications) - 5} more")
+    else:
+        print(f"[runner] No prior classifications found ({prior_time:.2f}s)")
+
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
-        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, corrections)
+        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications)
     else:
-        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections)
+        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications)
 
 
 def _run_live_loop(
@@ -69,6 +82,7 @@ def _run_live_loop(
     settings: Settings,
     categories: List[Dict],
     corrections: List[Dict] = None,
+    prior_classifications: List[Dict] = None,
 ) -> None:
     """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
 
@@ -140,6 +154,7 @@ def _run_live_loop(
                     window_dwell_info=None,
                     categories=categories,
                     corrections=corrections,
+                    prior_classifications=prior_classifications,
                 )
                 llm_time = time.time() - t
                 print(f"[runner] LLM pipeline took {llm_time:.2f}s (critic_ran={decision.get('critic_ran', False)})")
@@ -178,6 +193,7 @@ def _run_trace_loop(
     settings: Settings,
     categories: List[Dict],
     corrections: List[Dict] = None,
+    prior_classifications: List[Dict] = None,
 ) -> None:
     """Trace mode loop — iterates through event timestamps directly, no sleeping."""
     import json, os
@@ -237,6 +253,7 @@ def _run_trace_loop(
             window_dwell_info=None,
             categories=categories,
             corrections=corrections,
+            prior_classifications=prior_classifications,
         )
         llm_time = time.time() - t
         print(f"[runner] LLM pipeline took {llm_time:.2f}s")
