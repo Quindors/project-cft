@@ -60,7 +60,7 @@ class NullSink:
         return []
 
     def load_prior_classifications(self, max_sheets=7, min_confidence=0.85):
-    return []
+        return []
 
     def get_categories(self):
         return [
