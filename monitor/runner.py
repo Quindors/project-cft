@@ -29,24 +29,30 @@ def run_monitor_loop(
     """
 
     # Load categories from sheets
+    t = time.time()
     categories = sink.get_categories()
+    cat_time = time.time() - t
     if categories:
-        print(f"[runner] Loaded {len(categories)} categories:")
+        print(f"[runner] Loaded {len(categories)} categories ({cat_time:.2f}s):")
         for cat in categories:
             prod = cat.get("is_productive")
             status = "✓" if prod is True else ("✗" if prod is False else "?")
             print(f"[runner]   {status} {cat['name']}")
     else:
-        print("[runner] No categories loaded (using fallback prompts)")
+        print(f"[runner] No categories loaded ({cat_time:.2f}s) — using fallback prompts")
 
     # Load user corrections
+    t = time.time()
     corrections = sink.load_corrections()
+    corr_time = time.time() - t
     if corrections:
-        print(f"[runner] Loaded {len(corrections)} user corrections:")
+        print(f"[runner] Loaded {len(corrections)} user corrections ({corr_time:.2f}s):")
         for c in corrections[:5]:
             print(f"[runner]   {c['window_title'][:40]:40s} {c['ai_category']} -> {c['corrected_category']}")
         if len(corrections) > 5:
             print(f"[runner]   ... and {len(corrections) - 5} more")
+    else:
+        print(f"[runner] No user corrections found ({corr_time:.2f}s)")
 
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
@@ -63,17 +69,20 @@ def _run_live_loop(
     settings: Settings,
     categories: List[Dict],
     corrections: List[Dict] = None,
-
 ) -> None:
     """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
 
     events_buffer: List[Tuple[str, str]] = []
     last_decision_time: Optional[float] = None
+    decision_count = 0
+    loop_start = time.time()
+    waiting_logged = False
 
     print(f"\n[runner] Starting LIVE monitoring loop")
     print(f"[runner] Poll interval: {settings.poll_interval}s")
     print(f"[runner] Decision interval: {settings.decision_interval}s")
     print(f"[runner] Context window: {settings.context_window_size} events")
+    print(f"[runner] Min events needed: {settings.min_events}")
     print(f"[runner] Press Ctrl+C to stop\n")
 
     try:
@@ -87,6 +96,14 @@ def _run_live_loop(
             recent = event_src.last_events(now_dt, limit=settings.context_window_size)
             if recent:
                 events_buffer = recent
+
+            # --- log event accumulation progress before first decision ---
+            if decision_count == 0 and not waiting_logged:
+                elapsed = time.time() - loop_start
+                print(f"[runner] {len(events_buffer)}/{settings.min_events} events collected ({elapsed:.0f}s since loop start)")
+                if len(events_buffer) >= settings.min_events:
+                    waiting_logged = True
+                    print(f"[runner] Min events reached — waiting for decision interval ({settings.decision_interval}s)...")
 
             # --- ensure correct daily sheet ---
             sink.ensure_day(now_dt.date())
@@ -107,8 +124,15 @@ def _run_live_loop(
                 typed_text = key_src.typed_text_between(prev_dt, now_dt)
 
                 last_decision_time = time.time()
+                decision_count += 1
 
-                print(f"\n[runner] Making decision on {len(events_buffer)} events...")
+                wait_total = time.time() - loop_start if decision_count == 1 else None
+
+                print(f"\n[runner] Decision #{decision_count} on {len(events_buffer)} events...")
+                if wait_total is not None:
+                    print(f"[runner] Time from loop start to first decision: {wait_total:.1f}s")
+
+                t = time.time()
                 decision = decide_with_critic(
                     events_context=events_buffer,
                     keystroke_summary=keystroke_summary,
@@ -117,20 +141,28 @@ def _run_live_loop(
                     categories=categories,
                     corrections=corrections,
                 )
+                llm_time = time.time() - t
+                print(f"[runner] LLM pipeline took {llm_time:.2f}s (critic_ran={decision.get('critic_ran', False)})")
 
                 # Log to console
                 _log_decision(decision)
 
                 # Write to sheets
+                t = time.time()
                 record = _build_record(decision, events_buffer, typed_text, now_dt)
                 sink.enqueue_record(record)
                 flush_result = sink.flush_if_needed()
+                sheets_time = time.time() - t
                 if flush_result:
-                    print(f"[runner] Flushed to sheets (appended={flush_result.appended}, updated={flush_result.updated})")
+                    print(f"[runner] Flushed to sheets ({sheets_time:.2f}s, appended={flush_result.appended}, updated={flush_result.updated})")
 
                 # Popup alert if off-task
                 if decision.get("final_is_productive") is False and settings.popup.enabled:
                     _show_offtask_alert(show_popup, decision, settings)
+
+                if decision_count == 1:
+                    total_boot_to_first = time.time() - loop_start
+                    print(f"\n[runner] === FIRST DECISION COMPLETE — {total_boot_to_first:.1f}s from loop start ===\n")
 
             time.sleep(settings.poll_interval)
 
@@ -196,6 +228,8 @@ def _run_trace_loop(
         typed_text = key_src.typed_text_between(prev_evt_time, evt_time)
 
         print(f"\n[runner] Decision at {evt_time} ({len(events_buffer)} events)...")
+
+        t = time.time()
         decision = decide_with_critic(
             events_context=events_buffer,
             keystroke_summary=keystroke_summary,
@@ -204,6 +238,8 @@ def _run_trace_loop(
             categories=categories,
             corrections=corrections,
         )
+        llm_time = time.time() - t
+        print(f"[runner] LLM pipeline took {llm_time:.2f}s")
 
         decision_count += 1
         prev_evt_time = evt_time
@@ -258,7 +294,7 @@ def _run_trace_loop(
                 "confidence": decision.get("final_conf", 0.0),
                 "critic_ran": decision.get("critic_ran", False),
             })
-        
+
         # Write to results JSONL — full decision pipeline
         primary = decision.get("primary", {})
         critic = decision.get("critic") or {}
@@ -309,45 +345,13 @@ def _run_trace_loop(
             f.write(f"Ambiguous:    {ambiguous_count} ({ambiguous_count/decision_count*100:.1f}%)\n")
             f.write("\nCategory breakdown:\n")
             for cat, count in sorted(category_counts.items(), key=lambda x: -x[1]):
-                f.write(f"  {cat}: {count} ({count/decision_count*100:.1f}%)\n")
-
-        # --- accuracy section ---
+                f.write(f"  {cat:25s} {count:4d} ({count/decision_count*100:.1f}%)\n")
         if labeled_count > 0:
-            exact_pct = exact_match / labeled_count * 100
-            prod_pct = productivity_match / labeled_count * 100
-            f.write("\n" + "=" * 50 + "\n")
-            f.write("ACCURACY (vs ground truth labels)\n")
-            f.write("=" * 50 + "\n")
-            f.write(f"Labeled events:        {labeled_count}/{decision_count}\n")
-            f.write(f"Category accuracy:     {exact_match}/{labeled_count} ({exact_pct:.1f}%)\n")
-            f.write(f"Productivity accuracy: {productivity_match}/{labeled_count} ({prod_pct:.1f}%)\n")
+            f.write(f"\nAccuracy:\n")
+            f.write(f"  Category:     {exact_match}/{labeled_count} ({exact_match/labeled_count*100:.1f}%)\n")
+            f.write(f"  Productivity: {productivity_match}/{labeled_count} ({productivity_match/labeled_count*100:.1f}%)\n")
 
-            f.write(f"\n{'Timestamp':<22s} {'Predicted':<22s} {'Expected':<22s} {'Match':>6s} {'Prod':>6s}\n")
-            f.write("-" * 80 + "\n")
-            for d in accuracy_details:
-                match_sym = "✅" if d["exact_match"] else "❌"
-                prod_sym = "✅" if d["productivity_match"] else "❌"
-                f.write(f"{d['timestamp']:<22s} {d['predicted']:<22s} {d['expected']:<22s} {match_sym:>6s} {prod_sym:>6s}\n")
-
-            errors = [d for d in accuracy_details if not d["exact_match"]]
-            if errors:
-                f.write(f"\nMISCLASSIFICATIONS ({len(errors)}):\n")
-                f.write("-" * 80 + "\n")
-                for d in errors:
-                    if d["productivity_match"]:
-                        prod_note = " (productivity correct, wrong category)"
-                    else:
-                        prod_note = f" (productivity WRONG: predicted={d['predicted_productive']}, expected={d['expected_productive']})"
-                    f.write(f"  {d['timestamp']} | {d['current_window'][:50]}\n")
-                    f.write(f"    predicted: {d['predicted']}  ->  expected: {d['expected']}{prod_note}\n")
-        else:
-            f.write("\nNo ground truth labels found in trace file.\n")
-            f.write("Add \"expected\" field to trace_win.jsonl events to enable accuracy tracking.\n")
-
-        f.write(f"\nDetailed results saved to: {results_path}\n")
-
-    # --- console output ---
-    print(f"\n[runner] Trace complete. {decision_count} decisions made.")
+    print(f"\n[runner] Done. {decision_count} decisions made.")
     print(f"[runner] Results: {results_path}")
     print(f"[runner] Summary: {summary_path}")
 

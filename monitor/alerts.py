@@ -1,5 +1,5 @@
 # monitor/alerts.py
-"""Cross-platform popup alerts."""
+"""Cross-platform popup alerts — always on top."""
 
 import platform
 import subprocess
@@ -19,6 +19,7 @@ IS_WSL = PLATFORM == "Linux" and _is_wsl()
 
 
 def _popup_windows(message: str, title: str) -> None:
+    """Win32 MessageBox with TOPMOST + FOREGROUND flags."""
     import ctypes
     flags = 0x40 | 0x00010000 | 0x00040000  # INFO | FOREGROUND | TOPMOST
     ctypes.windll.user32.MessageBoxW(0, message, title, flags)
@@ -26,7 +27,7 @@ def _popup_windows(message: str, title: str) -> None:
 
 def _popup_wsl(message: str, title: str) -> None:
     """Show a TopMost WinForms popup from WSL via PowerShell."""
-    message = message.replace("'", "").replace('"', '').replace('\n', '`n')
+    message = message.replace("'", "").replace('"', '').replace('\n', ' ')
     title = title.replace("'", "").replace('"', '')
 
     ps_cmd = (
@@ -65,22 +66,39 @@ def _popup_wsl(message: str, title: str) -> None:
 
 
 def _popup_linux(message: str, title: str) -> None:
-    """Try notify-send (non-blocking), fall back to console."""
+    """Try zenity (topmost), fall back to notify-send, then console."""
     try:
         subprocess.Popen(
-            ["notify-send", "-u", "critical", "-t", "5000", title, message],
+            ["zenity", "--info", "--title", title, "--text", message,
+             "--width=350", "--timeout=10", "--no-markup"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        return
     except FileNotFoundError:
-        print(f"[popup] {title}: {message}")
-        print("[hint] Install notify-send: sudo apt install libnotify-bin")
+        pass
+
+    try:
+        subprocess.Popen(
+            ["notify-send", "-u", "critical", "-t", "10000", title, message],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        return
+    except FileNotFoundError:
+        pass
+
+    print(f"[popup] {title}: {message}")
+    print("[hint] Install zenity or notify-send: sudo apt install zenity libnotify-bin")
 
 
 def _popup_macos(message: str, title: str) -> None:
-    """macOS native notification via osascript."""
+    """macOS dialog via osascript — always on top unlike notifications."""
+    message = message.replace('"', '\\"')
+    title = title.replace('"', '\\"')
     try:
         subprocess.Popen(
-            ["osascript", "-e", f'display notification "{message}" with title "{title}"'],
+            ["osascript", "-e",
+             f'display dialog "{message}" with title "{title}" '
+             f'buttons {{"OK"}} default button "OK" giving up after 10'],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception:
@@ -88,9 +106,9 @@ def _popup_macos(message: str, title: str) -> None:
 
 
 def show_popup(message: str, title: str = "Productivity Alert") -> None:
-    # Sanitize quotes for shell safety
-    message = message.replace("'", "\u2019").replace('"', "\u201C")
-    title = title.replace("'", "\u2019").replace('"', "\u201C")
+    """Route to the correct platform popup."""
+    message = message.replace("'", "").replace('"', '')
+    title = title.replace("'", "").replace('"', '')
 
     if PLATFORM == "Windows":
         _popup_windows(message, title)
