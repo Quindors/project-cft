@@ -376,6 +376,28 @@ _OFF_TASK_SIGNALS = [
 # Categories that are productive
 _PRODUCTIVE_CATS = ["deep work", "homework", "research & learning", "communication"]
 
+# Known system/utility windows (lowercase substrings for matching)
+_SYSTEM_WINDOWS = [
+    "snipping tool",
+    "task switching",
+    "focus alert",
+    "unlockingwindow",
+    "windows default lock screen",
+    "narrator",
+    "quick settings",
+    "task manager",
+    r"c:\windows\system32\cmd.exe",
+    "command prompt",
+]
+
+
+def _is_system_window(title: str) -> bool:
+    """Check if window title matches a known system/utility window."""
+    clean = title.strip()
+    if clean.upper().startswith("WIN:"):
+        clean = clean[4:]
+    lower = clean.lower()
+    return any(pattern in lower for pattern in _SYSTEM_WINDOWS)
 
 def _should_run_critic(
     cat_name: str,
@@ -448,6 +470,21 @@ def decide_with_critic(
                 "critic": None,
                 "vision": None,
             }
+
+    # --- System window shortcut: skip LLM for OS-level windows ---
+    if events_context and _is_system_window(events_context[-1][1]):
+        return {
+            "final_category_name": "System",
+            "final_is_productive": None,
+            "final_off": 0.5,
+            "final_conf": 1.0,
+            "final_reason": "System/utility window — not a user activity",
+            "critic_ran": False,
+            "primary": {"category_name": "System", "is_productive": None,
+                         "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
+            "critic": None,
+            "vision": None,
+        }
 
     # Build prompt with categories and goals
     p1_prompt = build_prompt(
