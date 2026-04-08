@@ -521,7 +521,7 @@ class SheetsSink:
         try:
             ws = self.sh.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
-            ws = self.sh.add_worksheet(title=title, rows="200", cols=str(len(self._expected_headers())), index=0)
+            ws = self.sh.add_worksheet(title=title, rows="200", cols=str(len(self._expected_headers())), index=2)
             self.ws = ws
             self._ensure_headers()
             self._apply_sheet_formatting()
