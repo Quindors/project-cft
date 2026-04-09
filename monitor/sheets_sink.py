@@ -697,3 +697,47 @@ class SheetsSink:
 
         self.last_flush_time = time.time()
         return FlushResult(updated=updated, appended=appended, sent=len(buffer_rows))
+
+    def sync_dropdowns_to_all_daily_sheets(self):
+        """Update human_label dropdown on ALL prior daily sheets with current categories."""
+        categories = self.get_categories()
+        cat_names = [c["name"] for c in categories] if categories else []
+        if not cat_names:
+            return
+
+        headers = self._expected_headers()
+        col_human = headers.index("human_label")
+
+        pattern = re.compile(r"^Focus Logs - \d{4}-\d{2}-\d{2}$")
+        daily_sheets = [ws for ws in self.sh.worksheets() if pattern.match(ws.title)]
+        if not daily_sheets:
+            return
+
+        requests = []
+        for ws in daily_sheets:
+            requests.append({
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": 200,
+                        "startColumnIndex": col_human,
+                        "endColumnIndex": col_human + 1,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [{"userEnteredValue": n} for n in cat_names],
+                        },
+                        "showCustomUi": True,
+                        "strict": False,
+                    },
+                }
+            })
+
+        print(f"[boot] Syncing dropdowns to {len(daily_sheets)} daily sheets...")
+        try:
+            self.sh.batch_update({"requests": requests})
+        except Exception as e:
+            print(f"[warn] Dropdown sync failed: {e}")
+        print(f"[boot] Dropdown sync complete")

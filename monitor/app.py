@@ -56,6 +56,10 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
         sink.ensure_day(event_src.now_dt().date())
         print(f"[boot] ensure_day              {time.time() - t:.2f}s")
         print(f"[boot] sheet tab='{sink.ws_title}', rows tracked={sink.existing_rows_tracked}")
+        
+        t = time.time()
+        sink.sync_dropdowns_to_all_daily_sheets()
+        print(f"[boot] sync dropdowns          {time.time() - t:.2f}s")
 
     if settings.trace.use_trace_file and hasattr(event_src, "sim_start"):
         print(f"[boot] TRACE MODE ON. sim_start={event_src.sim_start}")
