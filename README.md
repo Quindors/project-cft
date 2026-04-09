@@ -49,6 +49,7 @@ cft classifies your activity into categories rather than a simple on-task/off-ta
 | Shopping | No | Amazon, eBay, online shopping |
 | Other Off-Task | No | Any other off-task activity not covered above |
 | Ambiguous | — | Activity that can't be clearly categorized from available context |
+| System | — | System windows (Snipping Tool, Task Switching, lock screen, etc.) |
 
 ### Managing Categories
 
@@ -58,26 +59,21 @@ Categories live in the **"Categories" sheet** in your Google Spreadsheet. To man
 
 | Column | Required | Description |
 |--------|----------|-------------|
-| `category_id` | Yes | Short unique ID, e.g. `deep_work`, `gaming`. Use lowercase with underscores. |
 | `name` | Yes | Display name shown in logs and popups, e.g. "Deep Work" |
 | `description` | Yes | Tells the LLM what belongs in this category. Be specific — include app names, site names, and examples. |
-| `color` | No | Hex color for future dashboard use, e.g. `#2ecc71` |
 | `is_productive` | Yes | `TRUE`, `FALSE`, or leave blank for ambiguous categories. Determines if the category counts as focused work. |
-| `created_at` | No | Auto-filled on creation |
 
 **Adding a new category:**
 
 1. Open the Categories sheet
 2. Add a new row at the bottom
-3. Fill in `category_id`, `name`, `description`, and `is_productive` at minimum
+3. Fill in `name`, `description`, and `is_productive`
 4. Write a clear description — this is what the AI reads to decide if an activity fits
 
 Example — adding a "Music" category for background music apps:
 ```
-category_id:    music
 name:           Music
 description:    Spotify, Apple Music, SoundCloud, background music while working
-color:          #1DB954
 is_productive:  TRUE
 ```
 
@@ -103,10 +99,8 @@ The AI won't always get it right. You can correct mistakes directly in Google Sh
 
 1. Open the daily **"Focus Logs - YYYY-MM-DD"** sheet
 2. Find the row with the wrong classification
-3. Edit these columns:
-   - **`human_label`** — write the correct category name (must match a name from the Categories sheet exactly)
-   - **`human_reason`** — optionally explain why, e.g. "was actually watching a coding tutorial, not entertainment"
-4. Leave the original AI columns (`category_id`, `category_name`, etc.) unchanged — they serve as the AI's original prediction for accuracy tracking
+3. Edit the **`human_label`** column — select the correct category (auto-populates upon startup)
+4. Leave the original AI columns (`category_name`, `is_productive`, etc.) unchanged — they serve as the AI's original prediction for accuracy tracking
 
 ### What to Look For
 
@@ -174,14 +168,16 @@ project cft/
 
 ## Configuration
 
-All settings are in `monitor/config.py`. Key settings:
+All settings are in `monitor/config.py`.
+
+Key settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `model` | `gpt-4o-mini` | Primary classification model |
 | `poll_interval` | `2.0` | Seconds between window event collection |
 | `decision_interval` | `60.0` | Seconds between classification decisions |
-| `context_window_size` | `30` | Number of recent events sent to LLM |
+| `context_window_size` | `10` | Number of recent events sent to LLM |
 | `min_events` | `5` | Minimum events before first decision |
 | `off_threshold` | `0.60` | OFF_SCORE threshold |
 | `critic.enabled` | `True` | Run critic on ambiguous classifications |
