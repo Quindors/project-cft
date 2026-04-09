@@ -123,11 +123,11 @@ class SheetsSink:
             self.categories_ws = self.sh.add_worksheet(
                 title="Categories",
                 rows="50",
-                cols="6",
+                cols="3",
                 index=0  # Put at beginning of workbook
             )
             # Write headers
-            headers = ["category_id", "name", "description", "color", "is_productive", "created_at"]
+            headers = ["name", "description", "is_productive"]
             self.categories_ws.update("A1:F1", [headers], value_input_option="RAW")
             
             # Seed default categories
@@ -140,20 +140,21 @@ class SheetsSink:
         
         defaults = [
             # Productive categories
-            ["deep_work", "Deep Work", "VS Code, PyCharm, coding, writing, focused tasks. Examples: .py files, homework assignments, project work", "#2ecc71", "TRUE", now_str],
-            ["homework", "Homework", "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "#9b59b6", "TRUE", now_str],
-            ["research", "Research & Learning", "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "#3498db", "TRUE", now_str],
-            ["communication", "Communication", "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "#f39c12", "TRUE", now_str],
+            ["Deep Work", "VS Code, PyCharm, coding, writing, focused tasks. Examples: .py files, homework assignments, project work", "TRUE"],
+            ["Homework", "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "TRUE"],
+            ["Research & Learning", "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "TRUE"],
+            ["Communication", "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "TRUE"],
             
             # Non-productive categories
-            ["social_media", "Social Media", "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "#e74c3c", "FALSE", now_str],
-            ["entertainment", "Entertainment", "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "#c0392b", "FALSE", now_str],
-            ["gaming", "Gaming", "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "#8e44ad", "FALSE", now_str],
-            ["shopping", "Shopping", "Amazon, eBay, AliExpress, online shopping, browsing products", "#d35400", "FALSE", now_str],
-            ["other", "Other Off-Task", "Any other off-task activity that doesn't fit the above categories", "#95a5a6", "FALSE", now_str],
+            ["Social Media", "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "FALSE"],
+            ["Entertainment", "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "FALSE"],
+            ["Gaming", "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "FALSE"],
+            ["Shopping", "Amazon, eBay, AliExpress, online shopping, browsing products", "FALSE"],
+            ["Other Off-Task", "Any other off-task activity that doesn't fit the above categories", "FALSE"],
             
             # Ambiguous
-            ["ambiguous", "Ambiguous", "Activity that cannot be clearly categorized as productive or non-productive from available context", "#bdc3c7", "", now_str],
+            ["Ambiguous", "Activity that cannot be clearly categorized as productive or non-productive from available context", ""],
+            ["System", "System windows", ""]
         ]
         
         self.categories_ws.append_rows(defaults, value_input_option="USER_ENTERED")
@@ -161,7 +162,7 @@ class SheetsSink:
     def get_categories(self) -> List[Dict]:
         """
         Load all categories from Categories sheet.
-        Returns list of dicts with keys: category_id, name, description, color, is_productive, created_at
+        Returns list of dicts with keys: name, description, is_productive
         """
         if self._categories_cache is not None:
             return self._categories_cache
