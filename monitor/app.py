@@ -4,8 +4,8 @@ from __future__ import annotations
 import os, time, openai
 
 from monitor.config import Settings, DEFAULT_SETTINGS
-from monitor.creds import load_env, build_service_account_json_from_b64, require_openai_api_key
-from monitor.sheets_sink import SheetsSink, NullSink
+from monitor.creds import load_env, require_openai_api_key
+from monitor.supabase_sink import SupabaseSink, NullSink
 from monitor.sources import make_sources
 from monitor.alerts import show_popup
 from monitor.runner import run_monitor_loop
@@ -36,30 +36,19 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
     testing_mode = settings.trace.use_trace_file
     popup_fn = _noop_popup if testing_mode else show_popup
 
-    # --- 4. Sheets sink ---
+    # --- 4. Supabase sink ---
     if settings.trace.use_trace_file and not settings.trace.upload_to_sheets:
         sink = NullSink()
-        print("[boot] TESTING MODE: Sheets upload disabled.")
+        print("[boot] TESTING MODE: database upload disabled.")
     else:
         t = time.time()
-        service_account_json = build_service_account_json_from_b64()
-        print(f"[boot] decode service account  {time.time() - t:.2f}s")
-
-        if not os.path.exists(service_account_json):
-            raise SystemExit(f"[fatal] Service account JSON not found: {service_account_json}")
-
-        t = time.time()
-        sink = SheetsSink(service_account_json, settings=settings)
-        print(f"[boot] SheetsSink connect      {time.time() - t:.2f}s")
+        sink = SupabaseSink(settings=settings)
+        print(f"[boot] SupabaseSink connect    {time.time() - t:.2f}s")
 
         t = time.time()
         sink.ensure_day(event_src.now_dt().date())
         print(f"[boot] ensure_day              {time.time() - t:.2f}s")
-        print(f"[boot] sheet tab='{sink.ws_title}', rows tracked={sink.existing_rows_tracked}")
-        
-        t = time.time()
-        sink.sync_dropdowns_to_all_daily_sheets()
-        print(f"[boot] sync dropdowns          {time.time() - t:.2f}s")
+        print(f"[boot] rows tracked today={sink.existing_rows_tracked}")
 
     if settings.trace.use_trace_file and hasattr(event_src, "sim_start"):
         print(f"[boot] TRACE MODE ON. sim_start={event_src.sim_start}")
@@ -81,7 +70,7 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
             settings=settings,
         )
     finally:
-        print("[info] final sheets flush...")
+        print("[info] final flush...")
         sink.close()
         print("[info] stopping key capture...")
         key_src.stop()

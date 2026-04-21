@@ -32,24 +32,20 @@ class CriticSettings:
 
 
 @dataclass(frozen=True)
-class SheetsSettings:
-    sheet_url_or_key: str = "https://docs.google.com/spreadsheets/d/1GU5H7sB0u2ximxylH-E-3qx0DcT3dNpqiM5lztuVNdg/edit"
-    worksheet_prefix: str = "Focus Logs"
-    scopes: List[str] = field(default_factory=lambda: [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ])
-
-    max_event_cols: int = 10
-
-    # Write throttling/buffering
-    append_only: bool = False
+class SupabaseSettings:
+    url: str = ""
+    key: str = ""
     batch_flush_max: int = 15
     idle_flush_sec: float = 15.0
     max_retries: int = 6
     backoff_base: float = 0.8
-    capture_typed_text: bool = True
-    enable_live_keylogger: bool = True
+
+    def __post_init__(self):
+        # frozen=True requires object.__setattr__ for post-init defaults
+        if not self.url:
+            object.__setattr__(self, 'url', os.getenv("SUPABASE_URL", ""))
+        if not self.key:
+            object.__setattr__(self, 'key', os.getenv("SUPABASE_KEY", ""))
 
 
 @dataclass(frozen=True)
@@ -58,7 +54,7 @@ class TraceSettings:
     trace_win_path: str = r"tests/traces/trace_win.jsonl"
     trace_key_path: str = r"tests/traces/trace_key.jsonl"
     trace_speed: float = 1.0
-    upload_to_sheets: bool = False     # testing mode: don't write to sheets
+    upload_to_sheets: bool = False     # testing mode: don't write to database
     replay_realtime: bool = False      # False = run as fast as possible
 
 @dataclass(frozen=True)
@@ -88,7 +84,7 @@ class Settings:
     off_threshold: float = 0.60
 
     critic: CriticSettings = field(default_factory=CriticSettings)
-    sheets: SheetsSettings = field(default_factory=SheetsSettings)
+    supabase: SupabaseSettings = field(default_factory=SupabaseSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
 
