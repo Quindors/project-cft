@@ -9,6 +9,6 @@ WshShell.CurrentDirectory = projectPath
 pythonExe = "C:\Users\abl96\AppData\Local\Microsoft\WindowsApps\python.exe"
 
 ' Start monitor (captures windows + classifies + uploads)
-WshShell.Run """" & pythonExe & """ """ & projectPath & "\monitor-sheets.py""", 0, False
+WshShell.Run """" & pythonExe & """ """ & projectPath & "\run.py""", 0, False
 
 WScript.Quit
