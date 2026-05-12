@@ -29,10 +29,21 @@ def _normalize_title(title: str) -> str:
 
 
 class NullSink:
-    """No-op sink used in testing/trace mode."""
+    """No-op sink used in testing/trace mode.
+
+    Writes (ensure_day, enqueue_record, flush, close) are always no-ops.
+    Reads (get_categories, load_corrections, load_prior_classifications)
+    delegate to `read_sink` if one is provided, so trace runs can see the
+    same categories/corrections/priors that production does. Falls back to
+    hardcoded defaults if no read_sink is supplied or if a read fails.
+    """
     ws_title = "(testing mode — no database)"
     existing_rows_tracked = 0
 
+    def __init__(self, read_sink=None):
+        self.read_sink = read_sink
+
+    # ---- writes: always no-op ----
     def ensure_day(self, day):
         return
 
@@ -45,13 +56,13 @@ class NullSink:
     def close(self):
         return
 
-    def load_corrections(self):
-        return []
-
-    def load_prior_classifications(self, max_sheets=7, min_confidence=0.85):
-        return []
-
+    # ---- reads: delegate if possible ----
     def get_categories(self):
+        if self.read_sink is not None:
+            try:
+                return self.read_sink.get_categories()
+            except Exception as e:
+                print(f"[warn] NullSink: read_sink.get_categories failed ({e}) — using fallback defaults")
         return [
             {"name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
             {"name": "Homework", "description": "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "is_productive": True},
@@ -65,6 +76,21 @@ class NullSink:
             {"name": "Ambiguous", "description": "Activity that cannot be clearly categorized from available context", "is_productive": None},
         ]
 
+    def load_corrections(self, max_sheets: int = 7):
+        if self.read_sink is not None:
+            try:
+                return self.read_sink.load_corrections(max_sheets)
+            except Exception as e:
+                print(f"[warn] NullSink: read_sink.load_corrections failed ({e})")
+        return []
+
+    def load_prior_classifications(self, max_sheets: int = 7, min_confidence: float = 0.85):
+        if self.read_sink is not None:
+            try:
+                return self.read_sink.load_prior_classifications(max_sheets, min_confidence)
+            except Exception as e:
+                print(f"[warn] NullSink: read_sink.load_prior_classifications failed ({e})")
+        return []
 
 class SupabaseSink:
     def __init__(self, settings):

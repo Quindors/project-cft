@@ -38,8 +38,14 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
 
     # --- 4. Supabase sink ---
     if settings.trace.use_trace_file and not settings.trace.upload_to_sheets:
-        sink = NullSink()
-        print("[boot] TESTING MODE: database upload disabled.")
+        t = time.time()
+        try:
+            read_sink = SupabaseSink(settings=settings)
+            sink = NullSink(read_sink=read_sink)
+            print(f"[boot] TESTING MODE: writes disabled, reads from Supabase ({time.time() - t:.2f}s).")
+        except Exception as e:
+            sink = NullSink()
+            print(f"[boot] TESTING MODE: writes disabled, Supabase unreachable ({e}) — using fallback categories.")
     else:
         t = time.time()
         sink = SupabaseSink(settings=settings)

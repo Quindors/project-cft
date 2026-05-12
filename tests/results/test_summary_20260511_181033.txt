@@ -1,0 +1,20 @@
+Test Results Summary
+==================================================
+Total decisions: 21
+Productive:   12 (57.1%)
+Unproductive: 8 (38.1%)
+Ambiguous:    1 (4.8%)
+
+Category breakdown:
+  Homework                     5 (23.8%)
+  Research & Learning          5 (23.8%)
+  Other Off-Task               3 (14.3%)
+  Communication                2 (9.5%)
+  Social Media                 2 (9.5%)
+  Gaming                       2 (9.5%)
+  Deep Work                    1 (4.8%)
+  Entertainment                1 (4.8%)
+
+Accuracy:
+  Category:     12/21 (57.1%)
+  Productivity: 14/21 (66.7%)

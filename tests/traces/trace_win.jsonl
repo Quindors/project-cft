@@ -1,19 +1,19 @@
-{"timestamp": "2025-11-24 19:11:50", "key": "WIN:.gitignore - project cft - Visual Studio Code", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:11:53", "key": "WIN:.env - project cft - Visual Studio Code", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:12:01", "key": "WIN:Rules - Google Sheets - Google Chrome", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:12:02", "key": "WIN:.env - project cft - Visual Studio Code", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:20:35", "key": "WIN:monitor-sheets.py - project cft - Visual Studio Code", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:21:09", "key": "WIN:Script modification guidance - Google Chrome", "expected": "Deep Work"}
-{"timestamp": "2025-11-24 19:21:10", "key": "WIN:Rules - Google Sheets - Google Chrome", "expected": "Deep Work"}
+{"timestamp": "2025-11-24 19:11:50", "key": "WIN:.gitignore - project cft - Visual Studio Code", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:11:53", "key": "WIN:.env - project cft - Visual Studio Code", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:12:01", "key": "WIN:Rules - Google Sheets - Google Chrome", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:12:02", "key": "WIN:.env - project cft - Visual Studio Code", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:20:35", "key": "WIN:monitor-sheets.py - project cft - Visual Studio Code", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:21:09", "key": "WIN:Script modification guidance - Google Chrome", "expected": "Personal Project"}
+{"timestamp": "2025-11-24 19:21:10", "key": "WIN:Rules - Google Sheets - Google Chrome", "expected": "Personal Project"}
 {"timestamp": "2025-11-24 19:21:12", "key": "WIN:(1) Chat | hey guys | Microsoft Teams - Google Chrome", "expected": "Social Media"}
-{"timestamp": "2025-11-24 19:21:16", "key": "WIN:(1) Chat | Hu, Yuxin (Student) | Microsoft Teams - Google Chrome", "expected": "Social Media"}
-{"timestamp": "2025-11-24 19:21:17", "key": "WIN:10.2 HW - OneNote", "expected": "Homework"}
+{"timestamp": "2025-11-24 19:21:16", "key": "WIN:(1) Chat | Hu, Yuxin (Student) | Microsoft Teams - Google Chrome", "expected": "Communication"}
+{"timestamp": "2025-11-24 19:21:17", "key": "WIN:10.2 HW - OneNote", "expected": "Advanced Calc"}
 {"timestamp": "2025-11-24 19:22:19", "key": "WIN:Chrome - New Tab", "expected": "Ambiguous"}
-{"timestamp": "2025-11-24 19:30:05", "key": "WIN:Calc HW 10.3 - OneNote", "expected": "Homework"}
-{"timestamp": "2025-11-24 19:30:45", "key": "WIN:Chapter 3.pdf - Adobe Acrobat Reader", "expected": "Homework"}
-{"timestamp": "2025-11-24 19:35:10", "key": "WIN:Calculus 1 - Limits - Khan Academy - Google Chrome", "expected": "Research & Learning"}
-{"timestamp": "2025-11-24 19:38:20", "key": "WIN:Desmos | Graphing Calculator - Google Chrome", "expected": "Homework"}
-{"timestamp": "2025-11-24 19:42:00", "key": "WIN:Wolfram|Alpha: Derivatives - Google Chrome", "expected": "Homework"}
+{"timestamp": "2025-11-24 19:30:05", "key": "WIN:Calc HW 10.3 - OneNote", "expected": "Advanced Calc"}
+{"timestamp": "2025-11-24 19:30:45", "key": "WIN:Chapter 3.pdf - Adobe Acrobat Reader", "expected": "Research & Learning"}
+{"timestamp": "2025-11-24 19:35:10", "key": "WIN:Calculus 1 - Limits - Khan Academy - Google Chrome", "expected": "Advanced Calc"}
+{"timestamp": "2025-11-24 19:38:20", "key": "WIN:Desmos | Graphing Calculator - Google Chrome", "expected": "Advanced Calc"}
+{"timestamp": "2025-11-24 19:42:00", "key": "WIN:Wolfram|Alpha: Derivatives - Google Chrome", "expected": "Advanced Calc"}
 {"timestamp": "2025-11-24 19:45:15", "key": "WIN:L'Hôpital's rule - Wikipedia - Google Chrome", "expected": "Research & Learning"}
 {"timestamp": "2025-11-24 19:48:30", "key": "WIN:Riemann zeta function - Wikipedia - Google Chrome", "expected": "Other Off-Task"}
 {"timestamp": "2025-11-24 19:50:00", "key": "WIN:Millennium Prize Problems - Wikipedia - Google Chrome", "expected": "Other Off-Task"}
@@ -22,4 +22,4 @@
 {"timestamp": "2025-11-24 20:00:15", "key": "WIN:funny cat videos - YouTube - Google Chrome", "expected": "Entertainment"}
 {"timestamp": "2025-11-24 20:10:00", "key": "WIN:General - Discord", "expected": "Social Media"}
 {"timestamp": "2025-11-24 20:15:30", "key": "WIN:Minecraft Launcher", "expected": "Gaming"}
-{"timestamp": "2025-11-24 20:45:00", "key": "WIN:Calc HW 10.3 - OneNote", "expected": "Homework"}
+{"timestamp": "2025-11-24 20:45:00", "key": "WIN:Calc HW 10.3 - OneNote", "expected": "Advanced Calc"}
