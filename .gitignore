@@ -1,7 +1,5 @@
 .venv
-logs/*
-list.md
 .env
 venv/*
 monitor/__pycache__
-user-goals.txt
+tests/*

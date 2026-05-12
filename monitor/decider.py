@@ -1,17 +1,12 @@
 # monitor/decider.py
 from __future__ import annotations
 
-import base64, io, re, openai
+import re, openai
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
 
 from monitor.config import Settings, DEFAULT_SETTINGS
-
-try:
-    from PIL import ImageGrab
-except Exception:
-    ImageGrab = None
-    print("[warn] Pillow not installed. Vision tiebreaker disabled. pip install Pillow")
+from monitor.screenshot_capture import take_screenshot_b64
 
 
 # ==================== PROMPT FILES ====================
@@ -47,28 +42,26 @@ def _normalize_title(title: str) -> str:
 # ==================== PROMPT BUILDING ====================
 
 def _format_activity(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
-    """Format events with clear separation between current window and history."""
+    """Format events with clear separation between current window and history.
+
+    keystroke_summary is accepted for backward compatibility but no longer used —
+    the pipeline is window-title + screenshot only.
+    """
     if not events:
         return "(no events)"
 
     _current_ts, current_win = events[-1]
-
     parts = [f">>> CURRENT WINDOW (classify this): {current_win}"]
 
-    # Show recent windows (up to 5 before current, newest first)
     recent = events[max(0, len(events) - 6):-1]
     if recent:
         recent_str = "\n".join([f"  {ts}: {win}" for ts, win in reversed(recent)])
         parts.append(f"RECENT WINDOWS (newest first):\n{recent_str}")
 
-    # Summarize older context
     older = events[:max(0, len(events) - 6)]
     if older:
         unique_older = list(dict.fromkeys([win for _, win in older]))
         parts.append(f"OLDER CONTEXT ({len(older)} events): {', '.join(unique_older[-5:])}")
-
-    if keystroke_summary:
-        parts.append(f"KEYSTROKE ACTIVITY (last 60s): {keystroke_summary}")
 
     return "\n".join(parts)
 
@@ -238,52 +231,6 @@ def build_prompt(
 
     return filled
 
-
-def build_critic_prompt(
-    events: List[Tuple[str, str]],
-    p1_summary: str,
-    keystroke_summary: str = "",
-    categories: List[Dict] = None,
-    corrections: List[Dict] = None,
-    prior_classifications: List[Dict] = None,
-) -> str:
-    activity_str = _format_activity(events, keystroke_summary)
-
-    template = _read_prompt_file("prompt-critic.txt")
-    if not template:
-        return (
-            "You are a strict critic. Review the classification.\n"
-            f"Initial model summary: {p1_summary}\n"
-            f"Recent activity: {activity_str}\n"
-            "Output: CATEGORY=<category_name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<text>"
-        )
-
-    if categories:
-        category_list = "\n".join([
-            f"- \"{cat['name']}\": {cat['description']} "
-            f"({'PRODUCTIVE' if cat.get('is_productive') else 'NOT PRODUCTIVE'})"
-            for cat in categories
-        ])
-    else:
-        category_list = "(no categories available)"
-
-    filled = template
-    filled = filled.replace("[insert categories here]", category_list)
-    filled = filled.replace("[insert here]", p1_summary)
-    filled = filled.replace("[insert activity here]", activity_str)
-
-    # Inject few-shot examples into critic too
-    if events:
-        current_win = events[-1][1]
-        fewshot_section = _build_fewshot_prompt(
-            current_win, corrections or [], prior_classifications
-        )
-        if fewshot_section:
-            filled = filled + "\n\n" + fewshot_section
-
-    return filled
-
-
 # ==================== LLM PARSING ====================
 
 def _parse_llm_line(
@@ -369,66 +316,79 @@ def ask_gpt(
 
 
 # ==================== VISION ====================
-
-def take_screenshot_b64() -> Optional[str]:
-    if not ImageGrab:
-        return None
-    try:
-        img = ImageGrab.grab()
-        img.thumbnail((1024, 1024))
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=60)
-        return base64.b64encode(buf.getvalue()).decode("utf-8")
-    except Exception as e:
-        print(f"[warn] screenshot failed: {e}")
-        return None
-
-
-def ask_gpt_vision_category(
+def ask_gpt_vision_verdict(
     screenshot_b64: str,
     events: List[Tuple[str, str]],
     primary_category: str,
+    primary_off: float,
+    primary_conf: float,
     primary_reason: str,
-    critic_category: str,
-    critic_reason: str,
     *,
     model: str,
     max_tokens: int,
     categories: List[Dict] = None,
-) -> Tuple[str, float, float]:
-    """
-    Vision tiebreaker for category disagreement.
+) -> Tuple[str, float, float, str, Optional[bool]]:
+    """Vision tiebreaker. Reviews the primary's window-title-only call against
+    the screenshot, then either agrees or overrides.
 
-    Returns:
-        (category_name, off_score, conf)
+    Returns (category_name, off_score, conf, reason, is_productive) — same
+    shape as the primary call's parse output.
     """
-    activity_str = ", ".join([k for _, k in events])
+    if not events:
+        current_window = "(unknown)"
+        history_str = "(none)"
+    else:
+        current_window = events[-1][1]
+        recent = events[max(0, len(events) - 6):-1]
+        history_str = ", ".join([win for _, win in reversed(recent)]) or "(none)"
 
     if categories:
         category_list = "\n".join([
-            f"- \"{cat['name']}\": {cat['description']}"
+            f"- \"{cat['name']}\": {cat['description']} "
+            f"({'PRODUCTIVE' if cat.get('is_productive') else 'NOT PRODUCTIVE' if cat.get('is_productive') is False else 'NEUTRAL'})"
             for cat in categories
         ])
     else:
         category_list = "(no categories available)"
 
-    prompt = f"""You are the final judge. Resolving a category disagreement.
+    prompt = f"""You are reviewing a window-title-based classification using the screen contents as ground truth.
 
 AVAILABLE CATEGORIES:
 {category_list}
 
-Context: {activity_str}
+CURRENT WINDOW TITLE: {current_window}
+RECENT WINDOWS: {history_str}
 
-Primary Model said: {primary_category}
-Reason: {primary_reason}
+PRIMARY CLASSIFICATION (window title only — no screenshot used):
+  Category:  {primary_category}
+  OFF_SCORE: {primary_off:.2f}
+  CONF:      {primary_conf:.2f}
+  Reason:    {primary_reason}
 
-Critic Model said: {critic_category}
-Reason: {critic_reason}
+YOUR TASK:
+Look at the screenshot. Decide whether the primary's call is supported by what's actually on screen, or whether it should be overridden.
 
-Look at the screen. What is the user *actually* doing? Which category is most accurate?
+OVERRIDE RULES (asymmetric — direction matters):
 
-Output strict single line format:
-CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explanation>"""
+  CASE A — Primary said a PRODUCTIVE category:
+    The primary may have over-trusted a productive-looking window title. DEMOTE if the screenshot clearly shows the user is NOT doing that productive activity.
+    Examples:
+      - Title says "Khan Academy" but screen shows YouTube comments scroll → Entertainment
+      - Title says "myproject - VS Code" but screen shows Discord overlay in foreground → Social Media
+      - Title says "Wikipedia: Calculus" but screen shows an unrelated article (celebrity gossip, sports) → Other Off-Task
+
+  CASE B — Primary said "Other Off-Task" or "Ambiguous":
+    The primary defaulted because the window title had no specific productive evidence (bare "Chrome", "VS Code", "New Tab", etc.). PROMOTE to a productive category ONLY if the screenshot clearly shows a productive activity.
+    Examples:
+      - Title is "Google Chrome" but screen shows a calculus textbook PDF → Homework
+      - Title is "Visual Studio Code" but screen shows a named project's source code → Deep Work
+      - Title is "New Tab" but screen shows Wolfram Alpha computing a derivative → Research & Learning
+
+DEFAULT BEHAVIOR — AGREE WITH PRIMARY:
+  If the screenshot is unclear, low-resolution, shows a lock/idle screen, doesn't show a recognizable activity, or is consistent with the primary's call — AGREE. Do not override on uncertainty. The primary's window-title evidence stands.
+
+Output format (strict, single line):
+CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0> | REASON=<brief explanation citing what you saw on screen>"""
 
     try:
         resp = openai.chat.completions.create(
@@ -444,14 +404,10 @@ CATEGORY=<exact category name> | OFF_SCORE=<0..1> | CONF=<0..1> | REASON=<explan
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        cat_name, off_score, conf, reason, is_productive = _parse_llm_line(
-            content, categories
-        )
-        return cat_name, off_score, conf
+        return _parse_llm_line(content, categories)
 
     except Exception as e:
-        return "[ERROR]", 0.5, 0.5
-
+        return "[ERROR]", 0.5, 0.5, str(e), None
 
 # ==================== SYSTEM WINDOW DETECTION ====================
 
@@ -479,75 +435,73 @@ def _is_system_window(title: str) -> bool:
     return any(pattern in lower for pattern in _SYSTEM_WINDOWS)
 
 
-# ==================== CRITIC LOGIC ====================
+# ==================== VISION TIEBREAKER LOGIC ====================
 
-# Known off-task signals in window titles (lowercase for matching)
-_OFF_TASK_SIGNALS = [
-    "twitter", "reddit", "youtube", "discord", "minecraft",
-    "steam", "netflix", "tiktok", "instagram", "twitch",
-    "hulu", "prime video", "roblox", "epic games",
-    "facebook", "snapchat", "telegram",
-]
-
-# Categories that are productive
-_PRODUCTIVE_CATS = ["deep work", "homework", "research & learning", "communication"]
+# CONF ceiling for the default-by-absence band. Matches the band defined in
+# prompt-main.txt (Rule 5 scoring): default-by-absence CONF = 0.50–0.70.
+_DEFAULT_BY_ABSENCE_CONF_CEILING = 0.70
 
 
-def _should_run_critic(
-    cat_name: str,
+def _should_run_vision(
+    is_productive: Optional[bool],
     conf: float,
     settings: Settings,
-    events: list = None,
 ) -> bool:
-    """Decide if critic should run based on category classification."""
-    c = settings.critic
-    if not c.enabled:
+    """Vision tiebreaker fires in two directions:
+
+      Direction A — VERIFY PRODUCTIVE:
+        Primary said the user is being productive (is_productive=True).
+        Vision checks whether the screen actually shows that.
+
+      Direction B — SECOND-GUESS DEFAULT-BY-ABSENCE:
+        Primary said off-task or neutral (is_productive in {False, None})
+        with CONF in the default-by-absence band (≤ 0.70). The primary
+        likely fell back because the title had no specific signal. Vision
+        checks whether the screen reveals productive activity the title
+        couldn't.
+
+    Confident off-task calls (CONF > 0.70, is_productive=False) skip vision —
+    the title already carried a specific signal (Twitter, Minecraft, etc.)
+    and a screenshot won't change the answer.
+    """
+    if not settings.critic.vision_enabled:
         return False
 
-    # Always run critic on low confidence
-    if conf <= c.trigger_conf_max:
+    if is_productive is True:
         return True
 
-    # Run on ambiguous categories
-    ambiguous_categories = ["research & learning", "communication", "ambiguous"]
-    if cat_name.lower() in ambiguous_categories:
+    if conf <= _DEFAULT_BY_ABSENCE_CONF_CEILING:
         return True
-
-    # Run critic when current window looks off-task but model said productive
-    if events and cat_name.lower() in _PRODUCTIVE_CATS:
-        current_win = events[-1][1].lower() if events else ""
-        if any(sig in current_win for sig in _OFF_TASK_SIGNALS):
-            print(f"[critic] Triggered: current window contains off-task signal but model said '{cat_name}'")
-            return True
 
     return False
-
 
 # ==================== MAIN DECISION ====================
 
 def decide_with_critic(
     events_context: List[Tuple[str, str]],
-    keystroke_summary: str = "",
+    keystroke_summary: str = "",          # kept for backward compat, unused
     settings: Settings = DEFAULT_SETTINGS,
-    window_dwell_info: Optional[Dict[str, Any]] = None,
+    window_dwell_info: Optional[Dict[str, Any]] = None,  # kept for backward compat
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
 ) -> Dict[str, Any]:
-    """
-    Category-based decision with optional critic verification.
+    """Window-title primary + two-direction vision tiebreaker.
 
-    Decision pipeline (in order):
-        1. User correction exact-match → skip LLM
-        2. System window shortcut → skip LLM
-        3. Prior classification match → skip LLM (tier 1 cache)
-        4. LLM call with few-shot hints from corrections + priors (tier 2)
+    Decision pipeline:
+      1. User correction exact-match  → skip LLM
+      2. System window shortcut       → skip LLM
+      3. Primary text-LLM call (window title + history, no screenshot)
+      4. Vision tiebreaker fires if EITHER:
+           (A) primary returned a productive category, OR
+           (B) primary returned Other Off-Task/Ambiguous with CONF ≤ 0.70
+         Otherwise primary stands.
 
-    Returns dict with:
-        final_category_name, final_is_productive, final_off, final_conf,
-        final_reason, critic_ran, primary, critic, vision
+    Returns: dict with final_category_name, final_is_productive, final_off,
+    final_conf, final_reason, critic_ran (= vision_ran for back-compat),
+    primary, critic (= None now), vision.
     """
-    # --- 1. Exact-match shortcut: skip LLM if user already corrected this window ---
+    # --- 1. User correction exact-match ---
     if corrections and events_context:
         match = _match_correction(events_context[-1][1], corrections)
         if match:
@@ -567,12 +521,13 @@ def decide_with_critic(
                 "final_conf": 1.0,
                 "final_reason": f"User correction: was {match['ai_category']}, corrected to {cat_name}",
                 "critic_ran": False,
-                "primary": {"category_name": cat_name, "is_productive": is_productive, "off": 0.0, "conf": 1.0, "reason": "user correction"},
+                "primary": {"category_name": cat_name, "is_productive": is_productive,
+                            "off": 0.0, "conf": 1.0, "reason": "user correction"},
                 "critic": None,
                 "vision": None,
             }
 
-    # --- 2. System window shortcut: skip LLM for OS-level windows ---
+    # --- 2. System window shortcut ---
     if events_context and _is_system_window(events_context[-1][1]):
         return {
             "final_category_name": "System",
@@ -582,49 +537,18 @@ def decide_with_critic(
             "final_reason": "System/utility window — not a user activity",
             "critic_ran": False,
             "primary": {"category_name": "System", "is_productive": None,
-                         "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
+                        "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
             "critic": None,
             "vision": None,
         }
 
-    # --- 3. Prior classification match: skip LLM if we've seen this title before ---
-    if prior_classifications and events_context:
-        match = _match_prior_classification(events_context[-1][1], prior_classifications)
-        if match:
-            cat_name = match["category_name"]
-            is_productive = None
-            if categories:
-                for cat in categories:
-                    if cat["name"].lower() == cat_name.lower():
-                        cat_name = cat["name"]
-                        is_productive = cat.get("is_productive")
-                        break
-            print(f"[prior] Cache hit: '{match['window_title'][:40]}' -> {cat_name} (skipping LLM)")
-            return {
-                "final_category_name": cat_name,
-                "final_is_productive": is_productive,
-                "final_off": 0.0 if is_productive else (1.0 if is_productive is False else 0.5),
-                "final_conf": 0.95,
-                "final_reason": f"[Prior] previously classified as {cat_name} (conf={match['confidence']:.2f})",
-                "critic_ran": False,
-                "primary": {"category_name": cat_name, "is_productive": is_productive,
-                             "off": 0.0, "conf": 0.95, "reason": "prior classification cache"},
-                "critic": None,
-                "vision": None,
-            }
-
-    # --- 4. LLM call with few-shot hints (tier 2) ---
-
-    # Build prompt with categories, corrections, and prior classifications
+    # --- 3. Primary text-LLM call ---
     p1_prompt = build_prompt(
         events_context,
-        keystroke_summary,
         categories=categories,
         corrections=corrections,
         prior_classifications=prior_classifications,
     )
-
-    # Primary model call
     p1_name, p1_off, p1_conf, p1_reason, p1_prod, p1_raw = ask_gpt(
         p1_prompt,
         settings.model,
@@ -632,7 +556,6 @@ def decide_with_critic(
         temperature=0.0,
         categories=categories,
     )
-
     primary_res = {
         "category_name": p1_name,
         "is_productive": p1_prod,
@@ -641,98 +564,69 @@ def decide_with_critic(
         "reason": p1_reason or "",
     }
 
-    def mk_ret(cat_name, is_productive, off, conf, reason, critic_ran, critic_res=None, vision_res=None):
+    def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None):
         return {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
             "final_off": off,
             "final_conf": conf,
             "final_reason": reason,
-            "critic_ran": critic_ran,
+            "critic_ran": vision_ran,   # back-compat alias
             "primary": primary_res,
-            "critic": critic_res,
+            "critic": None,
             "vision": vision_res,
         }
 
-    # Handle errors
+    # Primary errored
     if p1_name in ("[ERROR]", "[PARSE_ERROR]"):
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], False)
 
-    # Check if critic should run
-    if not _should_run_critic(p1_name, p1_conf, settings, events=events_context):
+    # --- 4. Vision tiebreaker? ---
+    if not _should_run_vision(p1_prod, p1_conf, settings):
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
 
-    # Run critic
-    p1_summary = f"CATEGORY={p1_name} | OFF_SCORE={p1_off:.2f} | CONF={p1_conf:.2f} | REASON={p1_reason or ''}"
-    c_prompt = build_critic_prompt(
+    direction = "verify-productive" if p1_prod is True else "second-guess-default"
+
+    # In trace mode, the live screen grab has nothing to do with the historical
+    # event being evaluated. Skip the vision call but log that it would have fired
+    # so the trace still reports the trigger rate and direction breakdown.
+    if settings.trace.use_trace_file:
+        print(f"[vision] WOULD FIRE ({direction}): primary={p1_name}, conf={p1_conf:.2f} — skipped (trace mode)")
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+
+    print(f"[vision] Triggered ({direction}): primary={p1_name}, conf={p1_conf:.2f}")
+
+    b64_img = take_screenshot_b64()
+    if not b64_img:
+        print("[vision] No screenshot available — primary stands.")
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+
+    v_name, v_off, v_conf, v_reason, v_prod = ask_gpt_vision_verdict(
+        b64_img,
         events_context,
-        p1_summary,
-        keystroke_summary,
+        primary_category=p1_name,
+        primary_off=p1_off,
+        primary_conf=p1_conf,
+        primary_reason=p1_reason,
+        model=settings.critic.vision_model,
+        max_tokens=settings.critic.vision_max_tokens,
         categories=categories,
-        corrections=corrections,
-        prior_classifications=prior_classifications,
     )
-
-    c_name, c_off, c_conf, c_reason, c_prod, c_raw = ask_gpt(
-        c_prompt,
-        settings.critic_model(),
-        max_tokens=settings.critic.max_tokens,
-        temperature=settings.critic.temperature,
-    )
-
-    critic_res = {
-        "category_name": c_name,
-        "is_productive": c_prod,
-        "off": c_off,
-        "conf": c_conf,
-        "reason": c_reason or "",
+    vision_res = {
+        "category_name": v_name,
+        "is_productive": v_prod,
+        "off": v_off,
+        "conf": v_conf,
+        "reason": v_reason or "",
     }
 
-    # Handle critic errors
-    if c_name in ("[ERROR]", "[PARSE_ERROR]"):
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], True, critic_res)
+    # Vision errored → primary stands
+    if v_name in ("[ERROR]", "[PARSE_ERROR]"):
+        print(f"[vision] Error ({v_reason}) — primary stands.")
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res)
 
-    # Check for disagreement
-    critic_disagrees = (c_name.lower() != p1_name.lower())
-
-    if critic_disagrees and settings.critic.vision_enabled:
-        print(f"[info] Category disagreement: primary={p1_name}, critic={c_name}. Trying vision tiebreak...")
-        b64_img = take_screenshot_b64()
-        if b64_img:
-            v_name, v_off, v_conf = ask_gpt_vision_category(
-                b64_img,
-                events_context,
-                p1_name,
-                p1_reason,
-                c_name,
-                c_reason,
-                model=settings.critic.vision_model,
-                max_tokens=settings.critic.vision_max_tokens,
-                categories=categories,
-            )
-            if v_name not in ("[ERROR]", "[PARSE_ERROR]"):
-                vision_res = {
-                    "category_name": v_name,
-                    "off": v_off,
-                    "conf": v_conf,
-                }
-                v_prod = None
-                if categories:
-                    for cat in categories:
-                        if cat["name"].lower() == v_name.lower():
-                            v_prod = cat.get("is_productive")
-                            break
-
-                return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {c_reason}", True, critic_res, vision_res)
-
-    # No vision or vision failed — use critic if it disagrees
-    if critic_disagrees:
-        final_off = max(p1_off, c_off)
-        return mk_ret(
-            c_name, c_prod, final_off, c_conf,
-            f"[Critic] {critic_res['reason'] or primary_res['reason']}",
-            True, critic_res,
-        )
-
-    # Critic agrees — use primary
-    return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, critic_res)
+    # Vision verdict wins
+    overrode = (v_name.lower() != p1_name.lower())
+    tag = "OVERRIDE" if overrode else "AGREE"
+    print(f"[vision] {tag}: {p1_name} -> {v_name} (conf {p1_conf:.2f} -> {v_conf:.2f})")
+    return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True, vision_res)
