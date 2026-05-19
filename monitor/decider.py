@@ -8,6 +8,33 @@ from datetime import datetime
 from monitor.config import Settings, DEFAULT_SETTINGS
 from monitor.screenshot_capture import take_screenshot_b64
 
+import os, base64
+
+def _load_trace_screenshot(events_context, settings) -> Optional[str]:
+    """Look up a screenshot fixture matching the current trace event timestamp.
+
+    Returns base64-encoded JPEG, or None if no fixture exists for this event.
+    Expected layout: tests/traces/screenshots/YYYY-MM-DD_HH-MM-SS.{jpg|jpeg|png}
+    """
+    if not events_context:
+        return None
+
+    ts_str = events_context[-1][0]  # "YYYY-MM-DD HH:MM:SS"
+    safe_ts = ts_str.replace(" ", "_").replace(":", "-")
+
+    screenshot_dir = getattr(settings.trace, "screenshot_dir", "tests/traces/screenshots")
+
+    for ext in (".jpg", ".jpeg", ".png"):
+        path = os.path.join(screenshot_dir, safe_ts + ext)
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return base64.b64encode(f.read()).decode("utf-8")
+            except Exception as e:
+                print(f"[warn] Failed to load trace screenshot {path}: {e}")
+                return None
+
+    return None
 
 # ==================== PROMPT FILES ====================
 
@@ -590,16 +617,22 @@ def decide_with_critic(
     # In trace mode, the live screen grab has nothing to do with the historical
     # event being evaluated. Skip the vision call but log that it would have fired
     # so the trace still reports the trigger rate and direction breakdown.
+    # Get screenshot — trace fixture in trace mode, live grab otherwise
     if settings.trace.use_trace_file:
-        print(f"[vision] WOULD FIRE ({direction}): primary={p1_name}, conf={p1_conf:.2f} — skipped (trace mode)")
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+        b64_img = _load_trace_screenshot(events_context, settings)
+        if b64_img is None:
+            print(f"[vision] WOULD FIRE ({direction}): primary={p1_name}, conf={p1_conf:.2f} — no fixture screenshot")
+            return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+        source = "trace fixture"
+    else:
+        b64_img = take_screenshot_b64()
+        source = "live"
 
-    print(f"[vision] Triggered ({direction}): primary={p1_name}, conf={p1_conf:.2f}")
-
-    b64_img = take_screenshot_b64()
     if not b64_img:
         print("[vision] No screenshot available — primary stands.")
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+
+    print(f"[vision] Triggered ({direction}, {source}): primary={p1_name}, conf={p1_conf:.2f}")
 
     v_name, v_off, v_conf, v_reason, v_prod = ask_gpt_vision_verdict(
         b64_img,
