@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import os, time, openai
 
-from monitor.config import Settings, DEFAULT_SETTINGS
-from monitor.creds import load_env, require_openai_api_key
+from monitor.config import Settings, DEFAULT_SETTINGS, load_settings
+from monitor.creds import load_env, configure_llm
 from monitor.supabase_sink import SupabaseSink, NullSink
 from monitor.sources import make_sources
 from monitor.alerts import show_popup
@@ -12,7 +12,7 @@ from monitor.runner import run_monitor_loop
 
 def _noop_popup(message: str, title: str = "Productivity Alert") -> None: return
 
-def run(settings: Settings = DEFAULT_SETTINGS) -> None:
+def run(settings: Settings | None = None) -> None:
     boot_start = time.time()
     print(f"\n{'='*50}")
     print(f"  project-cft starting up...")
@@ -23,10 +23,14 @@ def run(settings: Settings = DEFAULT_SETTINGS) -> None:
     load_env(override=True)
     print(f"[boot] load .env              {time.time() - t:.2f}s")
 
-    # --- 2. OpenAI key ---
+    # Build settings AFTER .env so LLM_MODEL takes effect
+    if settings is None:
+        settings = load_settings()
+
+    # --- 2. LLM provider ---
     t = time.time()
-    require_openai_api_key(openai)
-    print(f"[boot] openai api key         {time.time() - t:.2f}s")
+    provider = configure_llm(openai)
+    print(f"[boot] llm provider={provider} model={settings.model} ({time.time() - t:.2f}s)")
 
     # --- 3. Event + keystroke sources ---
     t = time.time()

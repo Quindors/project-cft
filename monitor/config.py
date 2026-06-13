@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 tracing = False
@@ -102,5 +102,16 @@ DEFAULT_SETTINGS = Settings(
 
 
 def load_settings() -> Settings:
-    """Load settings. For now, returns DEFAULT_SETTINGS."""
-    return DEFAULT_SETTINGS
+    """Read model/provider from env (call AFTER load_env so .env is in place).
+
+    Single global swap: LLM_MODEL is applied to both the primary classifier
+    and the vision tiebreaker.
+    """
+    provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
+    default_model = "openai/gpt-4o-mini" if provider == "openrouter" else "gpt-4o-mini"
+    model = os.getenv("LLM_MODEL", default_model)
+    return replace(
+        DEFAULT_SETTINGS,
+        model=model,
+        critic=replace(DEFAULT_SETTINGS.critic, vision_model=model),
+    )
