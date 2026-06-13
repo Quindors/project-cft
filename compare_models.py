@@ -42,6 +42,7 @@ from datetime import datetime
 import openai
 
 from monitor.creds import load_env, configure_llm
+from monitor.decider import set_llm_client
 from monitor.config import DEFAULT_SETTINGS
 from monitor.sources import make_sources
 from monitor.decider import decide_with_critic
@@ -288,7 +289,8 @@ def main():
     args = ap.parse_args()
 
     load_env(override=True)
-    provider = configure_llm(openai)
+    client, provider = configure_llm()
+    set_llm_client(client)
     use_vision = not args.no_vision
     quiet = not args.verbose
 

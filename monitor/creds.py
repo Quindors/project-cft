@@ -24,28 +24,37 @@ def build_service_account_json_from_b64(env_var: str = "GCP_SERVICE_ACCOUNT_B64"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-def configure_llm(openai_module) -> str:
-    """Point the openai SDK at OpenAI or OpenRouter based on LLM_PROVIDER.
-    Returns the provider name so the caller can log it.
+def configure_llm(_openai_module=None):
+    """Build and return an OpenAI() client pointing at the configured provider.
+
+    The caller should use the returned client object directly (client.chat.
+    completions.create(...)) rather than the module-level openai.* calls,
+    because module-level base_url/api_key are flaky across SDK versions.
+
+    Returns (client, provider_name).
     """
+    from openai import OpenAI
+
     provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
+
     if provider == "openrouter":
         key = os.getenv("OPENROUTER_API_KEY")
         if not key:
             raise RuntimeError("Set OPENROUTER_API_KEY in your .env")
-        openai_module.api_key = key
-        openai_module.base_url = OPENROUTER_BASE_URL
-        # Optional — shows up on the OpenRouter activity dashboard
         headers = {"X-Title": os.getenv("OPENROUTER_TITLE", "project-cft")}
         ref = os.getenv("OPENROUTER_REFERER")
         if ref:
             headers["HTTP-Referer"] = ref
-        openai_module.default_headers = headers
+        client = OpenAI(api_key=key, base_url=OPENROUTER_BASE_URL, default_headers=headers)
     elif provider == "openai":
-        require_openai_api_key(openai_module)
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("Set OPENAI_API_KEY in your .env")
+        client = OpenAI(api_key=key)
     else:
-        raise RuntimeError(f"Unknown LLM_PROVIDER={provider!r} (expected 'openrouter' or 'openai')")
-    return provider
+        raise RuntimeError(f"Unknown LLM_PROVIDER={provider!r}")
+
+    return client, provider
 
 def require_openai_api_key(openai_module, env_var: str = "OPENAI_API_KEY") -> None:
     key = os.getenv(env_var)

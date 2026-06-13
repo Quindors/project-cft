@@ -5,6 +5,7 @@ import os, time, openai
 
 from monitor.config import Settings, DEFAULT_SETTINGS, load_settings
 from monitor.creds import load_env, configure_llm
+from monitor.decider import set_llm_client
 from monitor.supabase_sink import SupabaseSink, NullSink
 from monitor.sources import make_sources
 from monitor.alerts import show_popup
@@ -29,7 +30,8 @@ def run(settings: Settings | None = None) -> None:
 
     # --- 2. LLM provider ---
     t = time.time()
-    provider = configure_llm(openai)
+    client, provider = configure_llm()
+    set_llm_client(client)
     print(f"[boot] llm provider={provider} model={settings.model} ({time.time() - t:.2f}s)")
 
     # --- 3. Event + keystroke sources ---

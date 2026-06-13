@@ -10,6 +10,21 @@ from monitor.screenshot_capture import take_screenshot_b64
 
 import os, base64
 
+# Set by configure_llm() at boot. decider uses this instead of module-level openai.*
+_llm_client = None
+
+
+def set_llm_client(client) -> None:
+    global _llm_client
+    _llm_client = client
+
+
+def _client():
+    if _llm_client is None:
+        # Fall back to module-level openai (works if api_key is set the old way)
+        return openai
+    return _llm_client
+
 def _load_trace_screenshot(events_context, settings) -> Optional[str]:
     """Look up a screenshot fixture matching the current trace event timestamp.
 
@@ -325,7 +340,7 @@ def ask_gpt(
         (category_name, off_score, conf, reason, is_productive, raw_content)
     """
     try:
-        resp = openai.chat.completions.create(
+        resp = _client().chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
@@ -418,7 +433,7 @@ Output format (strict, single line):
 CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0> | REASON=<brief explanation citing what you saw on screen>"""
 
     try:
-        resp = openai.chat.completions.create(
+        resp = _client().chat.completions.create(
             model=model,
             messages=[{
                 "role": "user",
