@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
-tracing = False
+tracing = True
 
 @dataclass(frozen=True)
 class PopupSettings:

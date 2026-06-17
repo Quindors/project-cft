@@ -50,7 +50,7 @@ def configure_llm(_openai_module=None):
         key = os.getenv("OPENAI_API_KEY")
         if not key:
             raise RuntimeError("Set OPENAI_API_KEY in your .env")
-        client = OpenAI(api_key=key)
+        client = OpenAI(api_key=key, max_retries=5)
     else:
         raise RuntimeError(f"Unknown LLM_PROVIDER={provider!r}")
 
