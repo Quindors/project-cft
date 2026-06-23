@@ -178,7 +178,7 @@ Key settings:
 | `poll_interval` | `2.0` | Seconds between window event collection |
 | `decision_interval` | `60.0` | Seconds between classification decisions |
 | `context_window_size` | `10` | Number of recent events sent to LLM |
-| `min_events` | `5` | Minimum events before first decision |
+| `min_events` | `1` | Minimum events before first decision |
 | `off_threshold` | `0.60` | OFF_SCORE threshold |
 | `critic.enabled` | `True` | Run critic on ambiguous classifications |
 | `critic.vision_enabled` | `True` | Use screenshot tiebreaker on disagreements |

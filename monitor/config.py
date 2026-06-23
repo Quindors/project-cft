@@ -74,7 +74,7 @@ class Settings:
     
     # Context window
     context_window_size: int = 10  # Number of recent events to keep
-    min_events: int = 5  # Minimum events before making first decision
+    min_events: int = 1  # Minimum events before making first decision
     
     # Legacy settings (kept for compatibility)
     interval_sec: float = 3.0  # Old name for poll_interval
