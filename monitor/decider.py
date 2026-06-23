@@ -13,6 +13,21 @@ import os, base64
 # Set by configure_llm() at boot. decider uses this instead of module-level openai.*
 _llm_client = None
 
+def _detect_image_mime(b64: str) -> str:
+    """Sniff the image format from the leading bytes of a base64 string."""
+    try:
+        head = base64.b64decode(b64[:24])
+    except Exception:
+        return "image/jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "image/jpeg"  # safe default
 
 def set_llm_client(client) -> None:
     global _llm_client
@@ -439,7 +454,7 @@ CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"}},
+                    {"type": "image_url", "image_url": {"url": f"data:{_detect_image_mime(screenshot_b64)};base64,{screenshot_b64}"}},
                 ],
             }],
             max_tokens=max_tokens,

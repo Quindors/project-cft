@@ -257,7 +257,6 @@ def _run_trace_loop(
         )
         llm_time = time.time() - t
         print(f"[runner] LLM pipeline took {llm_time:.2f}s")
-        time.sleep(5)
         decision_count += 1
         prev_evt_time = evt_time
 
