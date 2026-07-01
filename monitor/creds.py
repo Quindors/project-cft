@@ -1,63 +1,94 @@
 # monitor/creds.py
 from __future__ import annotations
 
-import os, base64, tempfile
+import os
+import subprocess
 from dotenv import load_dotenv
 
+from monitor.paths import env_path, is_frozen
 
-def load_env(*, override: bool = True) -> None:
-    load_dotenv(override=override)
-
-
-def build_service_account_json_from_b64(env_var: str = "GCP_SERVICE_ACCOUNT_B64") -> str:
-    b64 = os.getenv(env_var)
-    if not b64:
-        raise RuntimeError(f"{env_var} not set in environment (.env).")
-
-    data = base64.b64decode(b64)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-    tmp.write(data)
-    tmp.flush()
-    tmp.close()
-    return tmp.name
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
-def configure_llm(_openai_module=None):
-    """Build and return an OpenAI() client pointing at the configured provider.
+def load_env(*, override: bool = True) -> None:
+    if is_frozen():
+        load_dotenv(dotenv_path=str(env_path()), override=override)
+    else:
+        load_dotenv(override=override)
 
-    The caller should use the returned client object directly (client.chat.
-    completions.create(...)) rather than the module-level openai.* calls,
-    because module-level base_url/api_key are flaky across SDK versions.
 
-    Returns (client, provider_name).
+def _prompt_for_key(label: str) -> str:
+    """Pop a Windows input dialog asking for an API key. Returns '' if cancelled."""
+    ps = (
+        "Add-Type -AssemblyName Microsoft.VisualBasic;"
+        "[Microsoft.VisualBasic.Interaction]::InputBox("
+        f"'project-cft needs your {label} API key to run. Paste it below - "
+        "it will be saved to the .env next to the app so you are only asked once.',"
+        "'project-cft setup','')"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=300,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _persist_env_var(name: str, value: str) -> None:
+    """Write or update NAME=value in the .env next to the app."""
+    path = env_path()
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f"{name}="):
+            lines[i] = f"{name}={value}"
+            break
+    else:
+        lines.append(f"{name}={value}")
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"[creds] saved {name} to {path}")
+    except Exception as e:
+        print(f"[creds] could not save {name} to {path}: {e}")
+
+
+def _require_key(var_name: str, label: str) -> str:
+    """Return the API key from env, or prompt the user once and persist it."""
+    key = os.getenv(var_name)
+    if key:
+        return key
+    print(f"[creds] {var_name} not set - prompting user...")
+    key = _prompt_for_key(label)
+    if key:
+        os.environ[var_name] = key
+        _persist_env_var(var_name, key)
+        return key
+    raise RuntimeError(f"No {var_name} provided. Set it in your .env and restart.")
+
+
+def configure_llm():
+    """Build an OpenAI() client for the configured hosted provider.
+
+    Returns (client, provider_name). If the required API key is missing, the
+    user is prompted for it once and it's saved to the .env for next time.
     """
     from openai import OpenAI
 
     provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
 
     if provider == "openrouter":
-        key = os.getenv("OPENROUTER_API_KEY")
-        if not key:
-            raise RuntimeError("Set OPENROUTER_API_KEY in your .env")
+        key = _require_key("OPENROUTER_API_KEY", "OpenRouter")
         headers = {"X-Title": os.getenv("OPENROUTER_TITLE", "project-cft")}
         ref = os.getenv("OPENROUTER_REFERER")
         if ref:
             headers["HTTP-Referer"] = ref
         client = OpenAI(api_key=key, base_url=OPENROUTER_BASE_URL, default_headers=headers)
     elif provider == "openai":
-        key = os.getenv("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("Set OPENAI_API_KEY in your .env")
+        key = _require_key("OPENAI_API_KEY", "OpenAI")
         client = OpenAI(api_key=key, max_retries=5)
     else:
-        raise RuntimeError(f"Unknown LLM_PROVIDER={provider!r}")
+        raise RuntimeError(f"Unknown LLM_PROVIDER={provider!r} (use 'openrouter' or 'openai')")
 
     return client, provider
-
-def require_openai_api_key(openai_module, env_var: str = "OPENAI_API_KEY") -> None:
-    key = os.getenv(env_var)
-    if not key:
-        raise RuntimeError(f"Set {env_var} in your environment (.env).")
-    openai_module.api_key = key

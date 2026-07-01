@@ -1,5 +1,8 @@
-' Startup Launcher for Productivity Monitor
-' monitor-sheets.py handles window capture internally
+' Startup Launcher for Productivity Monitor (source-tree / dev mode).
+'
+' NOTE: After installing the packaged build via cft-setup.exe, the installer
+' drops its own Startup-folder shortcut and this script is no longer needed.
+' Keep this for running directly from the WSL source tree during development.
 
 Set WshShell = CreateObject("WScript.Shell")
 

@@ -1,7 +1,7 @@
 # monitor/decider.py
 from __future__ import annotations
 
-import re, openai
+import re, time, openai
 from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
 
@@ -69,11 +69,48 @@ def _load_trace_screenshot(events_context, settings) -> Optional[str]:
 # ==================== PROMPT FILES ====================
 
 def _read_prompt_file(filename: str) -> str:
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except Exception:
-        return ""
+    from monitor.paths import resource_path
+    for path in (str(resource_path(filename)), filename):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            continue
+    return ""
+
+
+# ==================== SESSION CACHE ====================
+#
+# In-process cache of normalized_title -> (decision, timestamp). Lets the
+# decision loop skip the LLM when the same window has been classified
+# recently with high confidence. Reset on process restart; corrections and
+# prior_classifications already handle the cross-session story.
+
+_session_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+
+_CACHE_TTL_SEC = 600.0   # 10 minutes
+_CACHE_MIN_CONF = 0.80
+_CACHE_SKIP_CATS = {"[ERROR]", "[PARSE_ERROR]", "System", "Ambiguous"}
+
+
+def _cache_get(window_title: str) -> Optional[Dict[str, Any]]:
+    key = _normalize_title(window_title)
+    entry = _session_cache.get(key)
+    if entry is None:
+        return None
+    decision, ts = entry
+    if time.time() - ts > _CACHE_TTL_SEC:
+        _session_cache.pop(key, None)
+        return None
+    return decision
+
+
+def _cache_put(window_title: str, decision: Dict[str, Any]) -> None:
+    if decision.get("final_conf", 0.0) < _CACHE_MIN_CONF:
+        return
+    if decision.get("final_category_name") in _CACHE_SKIP_CATS:
+        return
+    _session_cache[_normalize_title(window_title)] = (decision, time.time())
 
 
 # ==================== TITLE NORMALIZATION ====================
@@ -98,12 +135,8 @@ def _normalize_title(title: str) -> str:
 
 # ==================== PROMPT BUILDING ====================
 
-def _format_activity(events: List[Tuple[str, str]], keystroke_summary: str = "") -> str:
-    """Format events with clear separation between current window and history.
-
-    keystroke_summary is accepted for backward compatibility but no longer used —
-    the pipeline is window-title + screenshot only.
-    """
+def _format_activity(events: List[Tuple[str, str]]) -> str:
+    """Format events with clear separation between current window and history."""
     if not events:
         return "(no events)"
 
@@ -134,21 +167,6 @@ def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[
     for c in corrections:
         if c["window_title"].lower() == clean_lower:
             return c
-    return None
-
-
-def _match_prior_classification(current_window: str, prior_classifications: List[Dict]) -> Optional[Dict]:
-    """Check if current window matches a prior high-confidence classification.
-
-    Uses normalized title matching (strips WIN:, notification counts, lowercases).
-    Returns the matching dict or None.
-    """
-    if not prior_classifications:
-        return None
-    normalized = _normalize_title(current_window)
-    for p in prior_classifications:
-        if p["normalized_title"] == normalized:
-            return p
     return None
 
 
@@ -249,12 +267,11 @@ def _build_fewshot_prompt(
 
 def build_prompt(
     events: List[Tuple[str, str]],
-    keystroke_summary: str = "",
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
 ) -> str:
-    activity_str = _format_activity(events, keystroke_summary)
+    activity_str = _format_activity(events)
 
     template = _read_prompt_file("prompt-main.txt")
     if not template:
@@ -534,29 +551,25 @@ def _should_run_vision(
 
 # ==================== MAIN DECISION ====================
 
-def decide_with_critic(
+def decide(
     events_context: List[Tuple[str, str]],
-    keystroke_summary: str = "",          # kept for backward compat, unused
     settings: Settings = DEFAULT_SETTINGS,
-    window_dwell_info: Optional[Dict[str, Any]] = None,  # kept for backward compat
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
 ) -> Dict[str, Any]:
     """Window-title primary + two-direction vision tiebreaker.
 
-    Decision pipeline:
-      1. User correction exact-match  → skip LLM
-      2. System window shortcut       → skip LLM
-      3. Primary text-LLM call (window title + history, no screenshot)
+    Pipeline:
+      1. User correction exact-match  -> skip LLM
+      2. System window shortcut       -> skip LLM
+      3. Primary text-LLM (window title + history, no screenshot)
       4. Vision tiebreaker fires if EITHER:
            (A) primary returned a productive category, OR
-           (B) primary returned Other Off-Task/Ambiguous with CONF ≤ 0.70
-         Otherwise primary stands.
+           (B) primary returned Other Off-Task/Ambiguous with CONF <= 0.70
 
     Returns: dict with final_category_name, final_is_productive, final_off,
-    final_conf, final_reason, critic_ran (= vision_ran for back-compat),
-    primary, critic (= None now), vision.
+    final_conf, final_reason, vision_ran, primary, vision.
     """
     # --- 1. User correction exact-match ---
     if corrections and events_context:
@@ -577,10 +590,9 @@ def decide_with_critic(
                 "final_off": 0.0 if is_productive else 1.0,
                 "final_conf": 1.0,
                 "final_reason": f"User correction: was {match['ai_category']}, corrected to {cat_name}",
-                "critic_ran": False,
+                "vision_ran": False,
                 "primary": {"category_name": cat_name, "is_productive": is_productive,
                             "off": 0.0, "conf": 1.0, "reason": "user correction"},
-                "critic": None,
                 "vision": None,
             }
 
@@ -591,13 +603,21 @@ def decide_with_critic(
             "final_is_productive": None,
             "final_off": 0.5,
             "final_conf": 1.0,
-            "final_reason": "System/utility window — not a user activity",
-            "critic_ran": False,
+            "final_reason": "System/utility window - not a user activity",
+            "vision_ran": False,
             "primary": {"category_name": "System", "is_productive": None,
                         "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
-            "critic": None,
             "vision": None,
         }
+
+    # --- 2.5. Session cache: same window classified recently? ---
+    if events_context:
+        cached = _cache_get(events_context[-1][1])
+        if cached is not None:
+            print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
+            result = dict(cached)
+            result["final_reason"] = f"[cache] {cached.get('final_reason', '')}"
+            return result
 
     # --- 3. Primary text-LLM call ---
     p1_prompt = build_prompt(
@@ -621,18 +641,22 @@ def decide_with_critic(
         "reason": p1_reason or "",
     }
 
+    current_window = events_context[-1][1] if events_context else ""
+
     def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None):
-        return {
+        result = {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
             "final_off": off,
             "final_conf": conf,
             "final_reason": reason,
-            "critic_ran": vision_ran,   # back-compat alias
+            "vision_ran": vision_ran,
             "primary": primary_res,
-            "critic": None,
             "vision": vision_res,
         }
+        if current_window:
+            _cache_put(current_window, result)
+        return result
 
     # Primary errored
     if p1_name in ("[ERROR]", "[PARSE_ERROR]"):

@@ -42,10 +42,9 @@ from datetime import datetime
 import openai
 
 from monitor.creds import load_env, configure_llm
-from monitor.decider import set_llm_client
+from monitor.decider import set_llm_client, decide
 from monitor.config import DEFAULT_SETTINGS
 from monitor.sources import make_sources
-from monitor.decider import decide_with_critic
 
 
 # Used only if categories can't be read from the sink. Productivity flags
@@ -167,9 +166,8 @@ def run_model(model: str, points, categories, base_settings, use_vision: bool, q
 
         t0 = time.time()
         with _quiet(quiet):
-            decision = decide_with_critic(
+            decision = decide(
                 events_context=p["events"],
-                keystroke_summary="",          # unused by current pipeline
                 settings=settings_m,
                 categories=categories,
                 corrections=[],                # force LLM (no corrections fast-path)
@@ -180,7 +178,7 @@ def run_model(model: str, points, categories, base_settings, use_vision: bool, q
         final_cat = decision.get("final_category_name", "") or ""
         primary = decision.get("primary", {}) or {}
         primary_cat = (primary.get("category_name", "") or "")
-        vision_ran = bool(decision.get("critic_ran"))   # alias for vision_ran
+        vision_ran = bool(decision.get("vision_ran"))
         vision_overrode = (
             decision.get("vision") is not None
             and final_cat.lower() != primary_cat.lower()

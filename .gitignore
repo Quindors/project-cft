@@ -1,5 +1,27 @@
-.venv
+# Secrets / local config
 .env
-venv/*
-monitor/__pycache__
-tests/*
+.venv
+
+# Virtual environments
+venv/
+build-venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+
+# Bundled model/binary downloads (safety for future builds)
+models/
+vendor/
+.cache/
+
+# Logs
+*.log
+.logs/
+
+# Test fixtures / results (kept local)
+tests/

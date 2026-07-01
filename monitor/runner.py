@@ -12,60 +12,56 @@ from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable
 
 from monitor.config import Settings
-from monitor.decider import decide_with_critic
+from monitor.decider import decide
 from monitor.sources import EventSource, KeystrokeSource, TraceEventSource
 
 
 def run_monitor_loop(
     event_src: EventSource,
     key_src: KeystrokeSource,
-    sink,                        # SheetsSink or NullSink
+    sink,
     show_popup: Callable,
     settings: Settings,
+    categories: Optional[List[Dict]] = None,
+    corrections: Optional[List[Dict]] = None,
+    prior_classifications: Optional[List[Dict]] = None,
 ) -> None:
-    """
-    Main monitoring loop. Called by monitor/app.py after all
-    initialization (env, credentials, sources, sink) is done.
+    """Main monitoring loop. Called by monitor/app.py.
+
+    categories/corrections/prior_classifications are preloaded in parallel during
+    boot. If callers omit them (older code paths), we lazy-load here as a
+    backstop.
     """
 
-    # Load categories from sheets
-    t = time.time()
-    categories = sink.get_categories()
-    cat_time = time.time() - t
+    if categories is None:
+        categories = sink.get_categories()
+    if corrections is None:
+        corrections = sink.load_corrections()
+    if prior_classifications is None:
+        prior_classifications = sink.load_prior_classifications()
+
     if categories:
-        print(f"[runner] Loaded {len(categories)} categories ({cat_time:.2f}s):")
+        print(f"[runner] {len(categories)} categories:")
         for cat in categories:
             prod = cat.get("is_productive")
             status = "✓" if prod is True else ("✗" if prod is False else "?")
             print(f"[runner]   {status} {cat['name']}")
     else:
-        print(f"[runner] No categories loaded ({cat_time:.2f}s) — using fallback prompts")
+        print("[runner] No categories — using fallback prompts")
 
-    # Load user corrections
-    t = time.time()
-    corrections = sink.load_corrections()
-    corr_time = time.time() - t
     if corrections:
-        print(f"[runner] Loaded {len(corrections)} user corrections ({corr_time:.2f}s):")
+        print(f"[runner] {len(corrections)} user corrections:")
         for c in corrections[:5]:
             print(f"[runner]   {c['window_title'][:40]:40s} {c['ai_category']} -> {c['corrected_category']}")
         if len(corrections) > 5:
             print(f"[runner]   ... and {len(corrections) - 5} more")
-    else:
-        print(f"[runner] No user corrections found ({corr_time:.2f}s)")
 
-    # Load prior classifications for cache
-    t = time.time()
-    prior_classifications = sink.load_prior_classifications()
-    prior_time = time.time() - t
     if prior_classifications:
-        print(f"[runner] Loaded {len(prior_classifications)} prior classifications ({prior_time:.2f}s):")
+        print(f"[runner] {len(prior_classifications)} prior classifications:")
         for p in prior_classifications[:5]:
             print(f"[runner]   {p['normalized_title'][:40]:40s} -> {p['category_name']}")
         if len(prior_classifications) > 5:
             print(f"[runner]   ... and {len(prior_classifications) - 5} more")
-    else:
-        print(f"[runner] No prior classifications found ({prior_time:.2f}s)")
 
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
@@ -129,8 +125,6 @@ def _run_live_loop(
             )
 
             if should_decide and len(events_buffer) >= settings.min_events:
-                keystroke_summary = key_src.summary(now_dt, window_seconds=60)
-
                 if last_decision_time is not None:
                     prev_dt = datetime.fromtimestamp(last_decision_time)
                 else:
@@ -140,24 +134,20 @@ def _run_live_loop(
                 last_decision_time = time.time()
                 decision_count += 1
 
-                wait_total = time.time() - loop_start if decision_count == 1 else None
-
                 print(f"\n[runner] Decision #{decision_count} on {len(events_buffer)} events...")
-                if wait_total is not None:
-                    print(f"[runner] Time from loop start to first decision: {wait_total:.1f}s")
+                if decision_count == 1:
+                    print(f"[runner] Time from loop start to first decision: {time.time() - loop_start:.1f}s")
 
                 t = time.time()
-                decision = decide_with_critic(
+                decision = decide(
                     events_context=events_buffer,
-                    keystroke_summary=keystroke_summary,
                     settings=settings,
-                    window_dwell_info=None,
                     categories=categories,
                     corrections=corrections,
                     prior_classifications=prior_classifications,
                 )
                 llm_time = time.time() - t
-                print(f"[runner] LLM pipeline took {llm_time:.2f}s (critic_ran={decision.get('critic_ran', False)})")
+                print(f"[runner] LLM pipeline took {llm_time:.2f}s (vision_ran={decision.get('vision_ran', False)})")
 
                 # Log to console
                 _log_decision(decision)
@@ -173,7 +163,10 @@ def _run_live_loop(
 
                 # Popup alert if off-task
                 if decision.get("final_is_productive") is False and settings.popup.enabled:
-                    _show_offtask_alert(show_popup, decision, settings)
+                    cat_name = decision.get("final_category_name", "Unknown")
+                    reason = decision.get("final_reason", "")
+                    msg = f"Off-task: {cat_name}" + (f"\n{reason}" if reason else "")
+                    show_popup(msg, "Focus Alert")
 
                 if decision_count == 1:
                     total_boot_to_first = time.time() - loop_start
@@ -240,17 +233,14 @@ def _run_trace_loop(
         sink.ensure_day(evt_time.date())
 
         # Get keystroke context
-        keystroke_summary = key_src.summary(evt_time, window_seconds=60)
         typed_text = key_src.typed_text_between(prev_evt_time, evt_time)
 
         print(f"\n[runner] Decision at {evt_time} ({len(events_buffer)} events)...")
 
         t = time.time()
-        decision = decide_with_critic(
+        decision = decide(
             events_context=events_buffer,
-            keystroke_summary=keystroke_summary,
             settings=settings,
-            window_dwell_info=None,
             categories=categories,
             corrections=corrections,
             prior_classifications=prior_classifications,
@@ -308,34 +298,26 @@ def _run_trace_loop(
                 "expected_productive": expected_productive,
                 "productivity_match": prod_correct,
                 "confidence": decision.get("final_conf", 0.0),
-                "critic_ran": decision.get("critic_ran", False),
+                "vision_ran": decision.get("vision_ran", False),
             })
 
         # Write to results JSONL — full decision pipeline
         primary = decision.get("primary", {})
-        critic = decision.get("critic") or {}
         vision = decision.get("vision") or {}
         result_record = {
             "timestamp": evt_time.strftime("%Y-%m-%d %H:%M:%S"),
-            # Final decision
             "category_name": cat_name,
             "is_productive": is_productive,
             "off_score": decision.get("final_off", 0.0),
             "confidence": decision.get("final_conf", 0.0),
             "reason": decision.get("final_reason", ""),
-            # Pipeline details
             "primary_category": primary.get("category_name", ""),
             "primary_conf": primary.get("conf", ""),
             "primary_reason": primary.get("reason", ""),
-            "critic_ran": decision.get("critic_ran", False),
-            "critic_category": critic.get("category_name", ""),
-            "critic_conf": critic.get("conf", ""),
-            "critic_reason": critic.get("reason", ""),
+            "vision_ran": decision.get("vision_ran", False),
             "vision_category": vision.get("category_name", ""),
             "vision_conf": vision.get("conf", ""),
-            # Context
             "expected": event_src.get_label(evt_time),
-            "keystroke_summary": keystroke_summary,
             "typed_text": typed_text,
             "events": [k for _, k in events_buffer],
         }
@@ -395,11 +377,11 @@ def _log_decision(decision: Dict[str, Any]) -> None:
     is_productive = decision.get("final_is_productive")
     conf = decision.get("final_conf", 0.0)
     reason = decision.get("final_reason", "")
-    critic_ran = decision.get("critic_ran", False)
+    vision_ran = decision.get("vision_ran", False)
 
     p_emoji = "✓" if is_productive else "✗"
-    c_emoji = "🔍" if critic_ran else "  "
-    print(f"[runner] {c_emoji} {p_emoji} {cat_name} (conf={conf:.2f})")
+    v_emoji = "🔍" if vision_ran else "  "
+    print(f"[runner] {v_emoji} {p_emoji} {cat_name} (conf={conf:.2f})")
     print(f"[runner]   {reason}")
 
 
@@ -409,42 +391,15 @@ def _build_record(
     typed_text: str,
     now_dt: datetime,
 ) -> Dict[str, Any]:
-    """Flatten a decision into the dict that SheetsSink.enqueue_record expects."""
-
+    """Flatten a decision into the dict that SupabaseSink.enqueue_record expects."""
     primary = decision.get("primary", {})
-    critic = decision.get("critic") or {}
-    vision = decision.get("vision") or {}
-
     return {
         "timestamp":          now_dt.strftime("%Y-%m-%d %H:%M:%S"),
-        # Category
         "category_name":      decision.get("final_category_name", ""),
         "is_productive":      decision.get("final_is_productive"),
-        # AI reasoning
         "primary_confidence": primary.get("conf", ""),
         "primary_reason":     primary.get("reason", ""),
-        # Pipeline
         "main_label":         primary.get("category_name", ""),
-        "critic_label":       critic.get("category_name", ""),
-        "critic_confidence":  critic.get("conf", ""),
-        # Context
         "typed_text":         typed_text,
         "events":             [{"key": k} for _, k in events_buffer],
     }
-
-
-def _show_offtask_alert(
-    show_popup: Callable,
-    decision: Dict[str, Any],
-    settings: Settings,
-) -> None:
-    """Show a popup when the user is in a non-productive category."""
-    cat_name = decision.get("final_category_name", "Unknown")
-    reason = decision.get("final_reason", "")
-
-    title = "Focus Alert"
-    msg = f"Off-task: {cat_name}"
-    if reason:
-        msg += f"\n{reason}"
-
-    show_popup(msg, title)

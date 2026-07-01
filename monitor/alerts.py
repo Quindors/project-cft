@@ -1,21 +1,9 @@
 # monitor/alerts.py
-"""Cross-platform popup alerts — always on top."""
+"""Cross-platform popup alerts - always on top."""
 
-import platform
 import subprocess
 
-PLATFORM = platform.system()
-
-
-def _is_wsl() -> bool:
-    try:
-        with open("/proc/version", "r") as f:
-            return "microsoft" in f.read().lower()
-    except Exception:
-        return False
-
-
-IS_WSL = PLATFORM == "Linux" and _is_wsl()
+from monitor.window_capture import PLATFORM, IS_WSL
 
 
 def _popup_windows(message: str, title: str) -> None:

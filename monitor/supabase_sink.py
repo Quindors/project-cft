@@ -28,66 +28,55 @@ def _normalize_title(title: str) -> str:
     return " ".join(s.split()).lower()
 
 
-class NullSink:
-    """No-op sink used in testing/trace mode.
+_FALLBACK_CATEGORIES = [
+    {"name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
+    {"name": "Homework", "description": "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "is_productive": True},
+    {"name": "Research & Learning", "description": "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "is_productive": True},
+    {"name": "Communication", "description": "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "is_productive": True},
+    {"name": "Social Media", "description": "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "is_productive": False},
+    {"name": "Entertainment", "description": "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "is_productive": False},
+    {"name": "Gaming", "description": "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "is_productive": False},
+    {"name": "Shopping", "description": "Amazon, eBay, AliExpress, online shopping, browsing products", "is_productive": False},
+    {"name": "Other Off-Task", "description": "Any other off-task activity that doesn't fit the above categories", "is_productive": False},
+    {"name": "Ambiguous", "description": "Activity that cannot be clearly categorized from available context", "is_productive": None},
+]
 
-    Writes (ensure_day, enqueue_record, flush, close) are always no-ops.
-    Reads (get_categories, load_corrections, load_prior_classifications)
-    delegate to `read_sink` if one is provided, so trace runs can see the
-    same categories/corrections/priors that production does. Falls back to
-    hardcoded defaults if no read_sink is supplied or if a read fails.
+
+class NullSink:
+    """No-op sink for testing/trace mode.
+
+    Writes are no-ops. Reads delegate to `read_sink` if provided, else return
+    hardcoded fallbacks so trace runs still have categories to classify into.
     """
-    ws_title = "(testing mode — no database)"
-    existing_rows_tracked = 0
 
     def __init__(self, read_sink=None):
         self.read_sink = read_sink
 
-    # ---- writes: always no-op ----
-    def ensure_day(self, day):
-        return
+    def ensure_day(self, day): return
+    def enqueue_record(self, record): return
+    def flush_if_needed(self): return None
+    def close(self): return
 
-    def enqueue_record(self, record):
-        return
-
-    def flush_if_needed(self):
-        return None
-
-    def close(self):
-        return
-
-    # ---- reads: delegate if possible ----
     def get_categories(self):
         if self.read_sink is not None:
             try:
                 return self.read_sink.get_categories()
             except Exception as e:
-                print(f"[warn] NullSink: read_sink.get_categories failed ({e}) — using fallback defaults")
-        return [
-            {"name": "Deep Work", "description": "VS Code, PyCharm, coding, writing, focused tasks", "is_productive": True},
-            {"name": "Homework", "description": "OneNote with HW notes, PDF textbooks, Desmos, educational PDFs, calculus tools, assignment work", "is_productive": True},
-            {"name": "Research & Learning", "description": "Khan Academy, Wolfram Alpha, Wikipedia for homework topics, educational YouTube tutorials, documentation", "is_productive": True},
-            {"name": "Communication", "description": "Teams for schoolwork, email about classes, Slack for project collaboration, work-related messaging", "is_productive": True},
-            {"name": "Social Media", "description": "Twitter/X, Instagram, TikTok, Reddit browsing, Discord chatting (non-work), Facebook", "is_productive": False},
-            {"name": "Entertainment", "description": "YouTube entertainment videos, Netflix, Twitch, Hulu, Prime Video, funny cat videos, streams", "is_productive": False},
-            {"name": "Gaming", "description": "Steam, Epic Games, Minecraft, Roblox, game launchers, playing games", "is_productive": False},
-            {"name": "Shopping", "description": "Amazon, eBay, AliExpress, online shopping, browsing products", "is_productive": False},
-            {"name": "Other Off-Task", "description": "Any other off-task activity that doesn't fit the above categories", "is_productive": False},
-            {"name": "Ambiguous", "description": "Activity that cannot be clearly categorized from available context", "is_productive": None},
-        ]
+                print(f"[warn] NullSink: read_sink.get_categories failed ({e}) - using fallback defaults")
+        return _FALLBACK_CATEGORIES
 
-    def load_corrections(self, max_sheets: int = 7):
+    def load_corrections(self, days_back: int = 7):
         if self.read_sink is not None:
             try:
-                return self.read_sink.load_corrections(max_sheets)
+                return self.read_sink.load_corrections(days_back)
             except Exception as e:
                 print(f"[warn] NullSink: read_sink.load_corrections failed ({e})")
         return []
 
-    def load_prior_classifications(self, max_sheets: int = 7, min_confidence: float = 0.85):
+    def load_prior_classifications(self, days_back: int = 7, min_confidence: float = 0.85):
         if self.read_sink is not None:
             try:
-                return self.read_sink.load_prior_classifications(max_sheets, min_confidence)
+                return self.read_sink.load_prior_classifications(days_back, min_confidence)
             except Exception as e:
                 print(f"[warn] NullSink: read_sink.load_prior_classifications failed ({e})")
         return []
@@ -105,34 +94,13 @@ class SupabaseSink:
 
         self.buffer: List[Dict[str, Any]] = []
         self.last_flush_time = time.time()
-
-        # For boot logging compatibility
-        self.ws_title = "supabase"
-        self._existing_rows_count: Optional[int] = None
         self._categories_cache: Optional[List[Dict]] = None
-
-    @property
-    def existing_rows_tracked(self) -> int:
-        if self._existing_rows_count is None:
-            try:
-                today = date.today().isoformat()
-                result = (
-                    self.sb.table("focus_logs")
-                    .select("id", count="exact")
-                    .gte("timestamp", f"{today}T00:00:00")
-                    .execute()
-                )
-                self._existing_rows_count = result.count or 0
-            except Exception as e:
-                print(f"[warn] Could not count today's rows: {e}")
-                self._existing_rows_count = 0
-        return self._existing_rows_count
 
     # ------------------- public API -------------------
 
     def ensure_day(self, day: date) -> None:
-        """No-op — Supabase uses a single table, no daily tabs."""
-        self.ws_title = f"supabase ({day:%Y-%m-%d})"
+        """No-op - Supabase uses a single table, no daily tabs."""
+        return
 
     def enqueue_record(self, record: Dict[str, Any]) -> None:
         row = self._flatten_row(record)
@@ -175,8 +143,6 @@ class SupabaseSink:
                     return None
 
         self.last_flush_time = time.time()
-        if self._existing_rows_count is not None:
-            self._existing_rows_count += appended
         return FlushResult(updated=0, appended=appended, sent=appended)
 
     def close(self) -> None:
@@ -201,9 +167,8 @@ class SupabaseSink:
             print(f"[error] Failed to load categories: {e}")
             return []
 
-    def load_corrections(self, max_sheets: int = 7) -> List[Dict]:
-        """Load recent human corrections. max_sheets is reinterpreted as days_back."""
-        days_back = max_sheets
+    def load_corrections(self, days_back: int = 7) -> List[Dict]:
+        """Load recent human corrections from the last `days_back` days."""
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
 
         try:
@@ -243,9 +208,8 @@ class SupabaseSink:
         print(f"[info] Loaded {len(result_list)} corrections from last {days_back} days")
         return result_list
 
-    def load_prior_classifications(self, max_sheets: int = 7, min_confidence: float = 0.85) -> List[Dict]:
+    def load_prior_classifications(self, days_back: int = 7, min_confidence: float = 0.85) -> List[Dict]:
         """Load recent high-confidence classifications for cache priming."""
-        days_back = max_sheets
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         skip_categories = {"ambiguous", "[error]", "[parse_error]"}
 
@@ -300,28 +264,12 @@ class SupabaseSink:
         return s
 
     def _flatten_row(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        """Convert a decision record into a dict for Supabase insert.
+        """Convert a decision record from runner._build_record() into a Supabase row."""
+        titles = [str(e.get("key", "")) for e in (record.get("events") or []) if isinstance(e, dict)]
 
-        The record comes from runner._build_record() which produces:
-            events: [{"key": "window title"}, ...] — last item is current window
-            primary_confidence / primary_reason — AI pipeline outputs
-            category_name — final classification
-        """
-        # Extract event titles from list of {"key": ...} dicts
-        events_raw = record.get("events") or []
-        titles = []
-        for e in events_raw:
-            if isinstance(e, dict):
-                titles.append(str(e.get("key", "")))
-            elif isinstance(e, str):
-                titles.append(e)
+        current_window = self._clean_window_title(titles[-1]) if titles else ""
 
-        # Current window is the last event
-        current_window = ""
-        if titles:
-            current_window = self._clean_window_title(titles[-1])
-
-        # Deduplicate events, excluding current_window
+        # Deduplicate events, excluding the current window
         seen = set()
         events = []
         for t in titles:
@@ -330,22 +278,17 @@ class SupabaseSink:
                 seen.add(cleaned)
                 events.append(cleaned)
 
-        # Map confidence/reason — _build_record uses primary_confidence/primary_reason
-        confidence = record.get("primary_confidence") or record.get("confidence")
-        if confidence is not None:
-            try:
-                confidence = float(confidence)
-            except (ValueError, TypeError):
-                confidence = None
-
-        reason = record.get("primary_reason") or record.get("reason") or None
+        try:
+            confidence = float(record.get("primary_confidence")) if record.get("primary_confidence") not in ("", None) else None
+        except (ValueError, TypeError):
+            confidence = None
 
         return {
             "timestamp": record.get("timestamp", datetime.now().isoformat()),
             "current_window": current_window or None,
             "category_name": record.get("category_name") or None,
             "confidence": confidence,
-            "reason": reason,
+            "reason": record.get("primary_reason") or None,
             "human_label": record.get("human_label") or None,
             "typed_text": record.get("typed_text") or None,
             "events": json.dumps(events) if events else None,

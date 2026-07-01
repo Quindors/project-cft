@@ -5,7 +5,11 @@ import os
 from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
-tracing = True
+from monitor.paths import is_frozen as _is_frozen
+
+# Default tracing OFF in frozen exe builds (no trace fixtures bundled),
+# ON in source mode for the dev/test workflow.
+tracing = not _is_frozen()
 
 @dataclass(frozen=True)
 class PopupSettings:
@@ -18,14 +22,7 @@ class PopupSettings:
 
 @dataclass(frozen=True)
 class CriticSettings:
-    enabled: bool = True
-    model: Optional[str] = None  # None => use Settings.model
-    max_tokens: int = 90
-    temperature: float = 0.0
-
-    trigger_conf_max: float = 0.70
-
-    # Vision tiebreaker
+    # Vision tiebreaker (the "critic" text-LLM step was removed; only vision remains).
     vision_enabled: bool = True
     vision_model: str = "gpt-4o"
     vision_max_tokens: int = 120
@@ -75,10 +72,6 @@ class Settings:
     # Context window
     context_window_size: int = 10  # Number of recent events to keep
     min_events: int = 1  # Minimum events before making first decision
-    
-    # Legacy settings (kept for compatibility)
-    interval_sec: float = 3.0  # Old name for poll_interval
-    max_events: int = 10  # Old context window size
 
     # OFF-TASK threshold (used by LLM parsing)
     off_threshold: float = 0.60
@@ -87,9 +80,6 @@ class Settings:
     supabase: SupabaseSettings = field(default_factory=SupabaseSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
-
-    def critic_model(self) -> str:
-        return self.critic.model or self.model
 
 
 DEFAULT_SETTINGS = Settings(
