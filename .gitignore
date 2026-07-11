@@ -1,6 +1,7 @@
 # Secrets / local config
 .env
 .venv
+.mcp.json
 
 # Virtual environments
 venv/
@@ -18,6 +19,10 @@ dist/
 models/
 vendor/
 .cache/
+
+# Dashboard build staged into the exe bundle
+dashboard/
+.dashboard-src/
 
 # Logs
 *.log

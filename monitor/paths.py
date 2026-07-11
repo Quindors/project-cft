@@ -49,3 +49,19 @@ def resource_path(*parts: str) -> Path:
 def env_path() -> Path:
     """Location of the user-editable .env file."""
     return exe_dir() / ".env"
+
+
+def data_dir() -> Path:
+    """Writable per-user data directory (for the local SQLite DB, etc.).
+
+    Honors CFT_DATA_DIR override; else %LOCALAPPDATA%\\cft on Windows (or
+    $APPDATA), falling back to a data/ folder next to the exe.
+    """
+    override = os.environ.get("CFT_DATA_DIR")
+    if override:
+        d = Path(override)
+    else:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        d = (Path(base) / "cft") if base else (exe_dir() / "data")
+    d.mkdir(parents=True, exist_ok=True)
+    return d

@@ -5,6 +5,7 @@
 #
 # Produces dist/cft/cft.exe (onedir). Distribute via installer.iss.
 
+import os
 from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
@@ -16,6 +17,11 @@ datas = [
     ('prompt-main.txt',   '.'),
     ('prompt-critic.txt', '.'),
 ]
+
+# The focus-dashboard production build, if build.ps1 staged it into ./dashboard.
+# Optional: when absent, the tray falls back to a hosted DASHBOARD_URL.
+if os.path.isdir('dashboard'):
+    datas.append(('dashboard', 'dashboard'))
 
 
 # --- Hidden imports ---------------------------------------------------------
@@ -31,6 +37,7 @@ hiddenimports += collect_submodules('storage3')
 hiddenimports += collect_submodules('realtime')
 hiddenimports += collect_submodules('openai')
 hiddenimports += ['h2', 'hpack', 'hyperframe']
+hiddenimports += ['pystray._win32', 'PIL.ImageDraw']
 
 
 a = Analysis(

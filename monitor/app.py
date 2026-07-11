@@ -1,6 +1,7 @@
 # monitor/app.py
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -25,18 +26,37 @@ def _llm_init(box: dict) -> None:
         box["elapsed"] = time.time() - t
 
 
-def _supabase_init(box: dict, settings: Settings, *, want_writes: bool) -> None:
-    """Build the sink (writes or no-writes) and preload categories/corrections/priors."""
+def _choose_storage() -> str:
+    """'supabase' or 'local'. Explicit STORAGE wins; else Supabase iff configured."""
+    storage = os.getenv("STORAGE", "").strip().lower()
+    if storage in ("supabase", "local"):
+        return storage
+    if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"):
+        return "supabase"
+    return "local"
+
+
+def _make_live_sink(settings: Settings):
+    if _choose_storage() == "supabase":
+        return SupabaseSink(settings=settings)
+    from monitor.local_sink import LocalSink
+    return LocalSink(settings=settings)
+
+
+def _storage_init(box: dict, settings: Settings, *, want_writes: bool) -> None:
+    """Build the sink and preload categories/corrections/priors."""
     t = time.time()
     try:
         if want_writes:
-            sink = SupabaseSink(settings=settings)
+            sink = _make_live_sink(settings)
+            box["backend"] = _choose_storage()
         else:
+            # trace/testing: no writes; read categories from Supabase if configured
             try:
-                read_sink = SupabaseSink(settings=settings)
-                sink = NullSink(read_sink=read_sink)
+                sink = NullSink(read_sink=SupabaseSink(settings=settings))
             except Exception:
                 sink = NullSink()
+            box["backend"] = "null"
         box["sink"] = sink
         box["categories"] = sink.get_categories()
         box["corrections"] = sink.load_corrections()
@@ -45,6 +65,30 @@ def _supabase_init(box: dict, settings: Settings, *, want_writes: bool) -> None:
     except Exception as e:
         box["error"] = e
         box["elapsed"] = time.time() - t
+
+
+def _start_tray(settings: Settings, shutdown: threading.Event):
+    """Serve the bundled dashboard (if present) and show a tray icon. Returns the icon."""
+    dashboard_url = None
+    try:
+        from monitor.dashboard_server import serve_bundled_dashboard
+        dashboard_url = serve_bundled_dashboard()
+        if dashboard_url:
+            print(f"[boot] dashboard served locally at {dashboard_url}")
+    except Exception as e:
+        print(f"[boot] local dashboard server not started ({e})")
+
+    if not dashboard_url:
+        dashboard_url = os.getenv("DASHBOARD_URL")  # hosted fallback
+
+    try:
+        from monitor.tray import start_tray
+        icon = start_tray(dashboard_url, on_quit=shutdown.set)
+        print(f"[boot] tray ready (dashboard: {dashboard_url or 'not configured'})")
+        return icon
+    except Exception as e:
+        print(f"[boot] tray not started ({e})")
+        return None
 
 
 def run(settings: Settings | None = None) -> None:
@@ -65,11 +109,11 @@ def run(settings: Settings | None = None) -> None:
     llm_box: dict = {}
     supabase_box: dict = {}
     llm_thread = threading.Thread(target=_llm_init, args=(llm_box,), name="llm-init", daemon=True)
-    supabase_thread = threading.Thread(target=_supabase_init, args=(supabase_box, settings),
-                                       kwargs={"want_writes": want_writes}, name="supabase-init", daemon=True)
+    supabase_thread = threading.Thread(target=_storage_init, args=(supabase_box, settings),
+                                       kwargs={"want_writes": want_writes}, name="storage-init", daemon=True)
     llm_thread.start()
     supabase_thread.start()
-    print("[boot] llm + supabase init dispatched in background...")
+    print("[boot] llm + storage init dispatched in background...")
 
     # --- Cheap main-thread work while those run ---
     t = time.time()
@@ -95,8 +139,14 @@ def run(settings: Settings | None = None) -> None:
     if "error" in supabase_box:
         raise supabase_box["error"]
     sink = supabase_box["sink"]
-    print(f"[boot] supabase + reads             {supabase_box['elapsed']:.2f}s  "
+    print(f"[boot] storage ({supabase_box.get('backend','?')}) + reads     {supabase_box['elapsed']:.2f}s  "
           f"(cats={len(supabase_box['categories'])} corrections={len(supabase_box['corrections'])} priors={len(supabase_box['prior_classifications'])})")
+
+    # --- Tray + local dashboard (live mode only) ---
+    shutdown = threading.Event()
+    tray_icon = None
+    if not testing_mode:
+        tray_icon = _start_tray(settings, shutdown)
 
     print(f"\n[boot] === INIT COMPLETE in {time.time() - boot_start:.2f}s ===\n")
 
@@ -110,9 +160,15 @@ def run(settings: Settings | None = None) -> None:
             categories=supabase_box["categories"],
             corrections=supabase_box["corrections"],
             prior_classifications=supabase_box["prior_classifications"],
+            stop_event=shutdown,
         )
     finally:
         print("[info] final flush...")
         sink.close()
         print("[info] stopping key capture...")
         key_src.stop()
+        if tray_icon is not None:
+            try:
+                tray_icon.stop()
+            except Exception:
+                pass

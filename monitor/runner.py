@@ -25,6 +25,7 @@ def run_monitor_loop(
     categories: Optional[List[Dict]] = None,
     corrections: Optional[List[Dict]] = None,
     prior_classifications: Optional[List[Dict]] = None,
+    stop_event=None,
 ) -> None:
     """Main monitoring loop. Called by monitor/app.py.
 
@@ -67,7 +68,7 @@ def run_monitor_loop(
     if isinstance(event_src, TraceEventSource):
         _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications)
     else:
-        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications)
+        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications, stop_event)
 
 
 def _run_live_loop(
@@ -79,6 +80,7 @@ def _run_live_loop(
     categories: List[Dict],
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
+    stop_event=None,
 ) -> None:
     """Live monitoring loop — polls every poll_interval, decides every decision_interval."""
 
@@ -96,7 +98,7 @@ def _run_live_loop(
     print(f"[runner] Press Ctrl+C to stop\n")
 
     try:
-        while True:
+        while not (stop_event is not None and stop_event.is_set()):
             now_dt = event_src.now_dt()
 
             # --- poll for new window title (in-memory capture) ---
@@ -176,6 +178,8 @@ def _run_live_loop(
 
     except KeyboardInterrupt:
         print("\n[runner] Interrupted by user")
+    if stop_event is not None and stop_event.is_set():
+        print("\n[runner] Shutdown requested from tray")
 
 
 def _run_trace_loop(
