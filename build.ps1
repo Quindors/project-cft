@@ -25,25 +25,28 @@ Write-Host "[pip ] installing build deps..."
 & $py -m pip install --quiet --upgrade pip
 & $py -m pip install --quiet -r requirements-build.txt
 
-# --- 2. Build & stage the focus-dashboard (optional) -----------------------
-# Requires npm on PATH and the two Supabase env vars set. When skipped, the
-# tray falls back to a hosted DASHBOARD_URL instead of a local copy.
+# --- 2. Build & stage the focus-dashboard (local mode) ---------------------
+# The bundled dashboard reads from the exe's local /api (SQLite), so it needs
+# only npm — no Supabase env. When npm is absent the bundle is skipped and the
+# tray falls back to a hosted DASHBOARD_URL.
+$DASH_BRANCH = 'integrate-dashboard-hosting'   # branch with the local data source
 $npm = Get-Command npm -ErrorAction SilentlyContinue
-if ($npm -and $env:VITE_SUPABASE_URL -and $env:VITE_SUPABASE_ANON_KEY) {
+if ($npm) {
     if (-not (Test-Path '.\.dashboard-src')) {
-        Write-Host "[dash] cloning focus-dashboard..."
-        git clone --depth 1 https://github.com/Quindors/focus-dashboard.git .dashboard-src
+        Write-Host "[dash] cloning focus-dashboard ($DASH_BRANCH)..."
+        git clone --depth 1 --branch $DASH_BRANCH https://github.com/Quindors/focus-dashboard.git .dashboard-src
     }
     Push-Location .dashboard-src
-    Write-Host "[dash] npm ci + build..."
+    Write-Host "[dash] npm ci + build (local mode)..."
     & npm ci --no-audit --no-fund
+    $env:VITE_DATA_SOURCE = 'local'
     & npm run build
     Pop-Location
     Remove-Item .\dashboard -Recurse -Force -ErrorAction SilentlyContinue
     Copy-Item .\.dashboard-src\dist .\dashboard -Recurse
-    Write-Host "[dash] staged dashboard build into .\dashboard"
+    Write-Host "[dash] staged local-mode dashboard into .\dashboard"
 } else {
-    Write-Host "[dash] skipping dashboard bundle (need npm on PATH + VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY)."
+    Write-Host "[dash] npm not on PATH - skipping dashboard bundle."
     Write-Host "       Tray will use DASHBOARD_URL from .env instead."
 }
 
