@@ -25,29 +25,38 @@ Write-Host "[pip ] installing build deps..."
 & $py -m pip install --quiet --upgrade pip
 & $py -m pip install --quiet -r requirements-build.txt
 
-# --- 2. Build & stage the focus-dashboard (local mode) ---------------------
-# The bundled dashboard reads from the exe's local /api (SQLite), so it needs
-# only npm — no Supabase env. When npm is absent the bundle is skipped and the
-# tray falls back to a hosted DASHBOARD_URL.
-$DASH_BRANCH = 'integrate-dashboard-hosting'   # branch with the local data source
-$npm = Get-Command npm -ErrorAction SilentlyContinue
-if ($npm) {
-    if (-not (Test-Path '.\.dashboard-src')) {
-        Write-Host "[dash] cloning focus-dashboard ($DASH_BRANCH)..."
-        git clone --depth 1 --branch $DASH_BRANCH https://github.com/Quindors/focus-dashboard.git .dashboard-src
-    }
-    Push-Location .dashboard-src
-    Write-Host "[dash] npm ci + build (local mode)..."
-    & npm ci --no-audit --no-fund
-    $env:VITE_DATA_SOURCE = 'local'
-    & npm run build
-    Pop-Location
-    Remove-Item .\dashboard -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item .\.dashboard-src\dist .\dashboard -Recurse
-    Write-Host "[dash] staged local-mode dashboard into .\dashboard"
+# --- 2. Stage the focus-dashboard (local mode) -----------------------------
+# Preferred: a pre-staged .\dashboard (build it in WSL: `VITE_DATA_SOURCE=local
+# npm run build`, then copy dist -> .\dashboard). This avoids needing Node on
+# the Windows PATH. Fallback: build here if npm is available. If neither, the
+# bundle is skipped and the tray uses a hosted DASHBOARD_URL.
+$DASH_BRANCH = 'integrate-dashboard-hosting'
+if (Test-Path '.\dashboard\index.html') {
+    Write-Host "[dash] using pre-staged .\dashboard (built elsewhere)"
 } else {
-    Write-Host "[dash] npm not on PATH - skipping dashboard bundle."
-    Write-Host "       Tray will use DASHBOARD_URL from .env instead."
+    $npm = Get-Command npm.cmd -ErrorAction SilentlyContinue
+    if (-not $npm) { $npm = Get-Command npm -ErrorAction SilentlyContinue }
+    if ($npm) {
+        if (-not (Test-Path '.\.dashboard-src')) {
+            Write-Host "[dash] cloning focus-dashboard ($DASH_BRANCH)..."
+            git clone --depth 1 --branch $DASH_BRANCH https://github.com/Quindors/focus-dashboard.git .dashboard-src
+        }
+        Push-Location .dashboard-src
+        Write-Host "[dash] npm ci + build (local mode)..."
+        & $npm.Source ci --no-audit --no-fund
+        $env:VITE_DATA_SOURCE = 'local'
+        & $npm.Source run build
+        Pop-Location
+        if (Test-Path '.\.dashboard-src\dist\index.html') {
+            Copy-Item .\.dashboard-src\dist .\dashboard -Recurse -Force
+            Write-Host "[dash] staged local-mode dashboard into .\dashboard"
+        } else {
+            Write-Host "[dash] WARN: dashboard build produced no dist - bundle skipped"
+        }
+    } else {
+        Write-Host "[dash] no pre-staged .\dashboard and no npm - skipping bundle."
+        Write-Host "       Tray will use DASHBOARD_URL from .env instead."
+    }
 }
 
 # --- 3. PyInstaller --------------------------------------------------------
