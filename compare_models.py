@@ -59,8 +59,7 @@ _FALLBACK_CATEGORIES = [
     {"name": "Entertainment", "description": "Video, music, streaming for fun", "is_productive": False},
     {"name": "Gaming", "description": "Playing games", "is_productive": False},
     {"name": "Shopping", "description": "Online shopping", "is_productive": False},
-    {"name": "Other Off-Task", "description": "Other non-productive activity", "is_productive": False},
-    {"name": "Ambiguous", "description": "Cannot determine", "is_productive": None},
+    {"name": "Ambiguous", "description": "Default catch-all, treated as off-task", "is_productive": False},
     {"name": "System", "description": "System/utility windows", "is_productive": None},
 ]
 
