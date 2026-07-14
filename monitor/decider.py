@@ -449,9 +449,9 @@ OVERRIDE RULES (asymmetric — direction matters):
     Examples:
       - Title says "Khan Academy" but screen shows YouTube comments scroll → Entertainment
       - Title says "myproject - VS Code" but screen shows Discord overlay in foreground → Social Media
-      - Title says "Wikipedia: Calculus" but screen shows an unrelated article (celebrity gossip, sports) → Other Off-Task
+      - Title says "Wikipedia: Calculus" but screen shows an unrelated article (celebrity gossip, sports) → Ambiguous
 
-  CASE B — Primary said "Other Off-Task" or "Ambiguous":
+  CASE B — Primary said "Ambiguous":
     The primary defaulted because the window title had no specific productive evidence (bare "Chrome", "VS Code", "New Tab", etc.). PROMOTE to a productive category ONLY if the screenshot clearly shows a productive activity.
     Examples:
       - Title is "Google Chrome" but screen shows a calculus textbook PDF → Homework
@@ -566,7 +566,7 @@ def decide(
       3. Primary text-LLM (window title + history, no screenshot)
       4. Vision tiebreaker fires if EITHER:
            (A) primary returned a productive category, OR
-           (B) primary returned Other Off-Task/Ambiguous with CONF <= 0.70
+           (B) primary returned Ambiguous with CONF <= 0.70
 
     Returns: dict with final_category_name, final_is_productive, final_off,
     final_conf, final_reason, vision_ran, primary, vision.

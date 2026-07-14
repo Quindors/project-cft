@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "focus-dashboard",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "C:\\Users\\abl96\\AppData\\Local\\Temp\\claude\\--wsl-localhost-Ubuntu-home-abl96-projects-project-cft\\d1283c1e-e429-4c53-8229-6a940d9e9a96\\scratchpad\\start-dashboard.bat"],
+      "port": 5173
+    }
+  ]
+}
