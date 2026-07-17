@@ -54,6 +54,18 @@ def _prod_lookup(categories):
     return {c["name"].lower(): c.get("is_productive") for c in categories}
 
 
+def _predicted_productive(row, prod):
+    """Which side of the productive line the model's call landed on.
+
+    Trace rows carry the decision's own final_is_productive. DB rows (Supabase /
+    local) don't — they only store category_name — so derive it from the
+    predicted category's flag.
+    """
+    if "final_is_productive" in row:
+        return row.get("final_is_productive")
+    return prod.get((row.get("category_name") or "").strip().lower())
+
+
 def _report(rows, categories, header):
     print("=" * 70)
     print(f"  {header}")
@@ -73,7 +85,7 @@ def _report(rows, categories, header):
     prod_scored = [r for r in labeled if r["human_label"].lower() in prod]
     if prod_scored:
         prod_ok = sum(1 for r in prod_scored
-                      if r.get("final_is_productive") == prod.get(r["human_label"].lower()))
+                      if _predicted_productive(r, prod) == prod.get(r["human_label"].lower()))
         print(f"Productivity accuracy: {100.0*prod_ok/len(prod_scored):.1f}%  "
               f"({prod_ok}/{len(prod_scored)})")
 
