@@ -68,18 +68,20 @@ def _storage_init(box: dict, settings: Settings, *, want_writes: bool) -> None:
 
 
 def _start_tray(settings: Settings, shutdown: threading.Event):
-    """Serve the bundled dashboard (if present) and show a tray icon. Returns the icon."""
-    dashboard_url = None
-    try:
-        from monitor.dashboard_server import serve_bundled_dashboard
-        dashboard_url = serve_bundled_dashboard()
-        if dashboard_url:
-            print(f"[boot] dashboard served locally at {dashboard_url}")
-    except Exception as e:
-        print(f"[boot] local dashboard server not started ({e})")
+    """Start the local API, then show a tray icon pointing at the dashboard.
 
-    if not dashboard_url:
-        dashboard_url = os.getenv("DASHBOARD_URL")  # hosted fallback
+    The API always starts (on a fixed port) because a hosted dashboard reads
+    from it. DASHBOARD_URL (e.g. the Vercel site) wins when set; otherwise we
+    fall back to the bundled copy served locally.
+    """
+    local_url = None
+    try:
+        from monitor.dashboard_server import start_local_server
+        local_url = start_local_server()
+    except Exception as e:
+        print(f"[boot] local API not started ({e})")
+
+    dashboard_url = os.getenv("DASHBOARD_URL", "").strip() or local_url
 
     # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0).
     if dashboard_url and os.getenv("CFT_OPEN_DASHBOARD", "1").strip().lower() not in ("0", "false", "no"):
