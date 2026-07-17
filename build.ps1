@@ -30,7 +30,7 @@ Write-Host "[pip ] installing build deps..."
 # npm run build`, then copy dist -> .\dashboard). This avoids needing Node on
 # the Windows PATH. Fallback: build here if npm is available. If neither, the
 # bundle is skipped and the tray uses a hosted DASHBOARD_URL.
-$DASH_BRANCH = 'integrate-dashboard-hosting'
+$DASH_BRANCH = 'main'
 if (Test-Path '.\dashboard\index.html') {
     Write-Host "[dash] using pre-staged .\dashboard (built elsewhere)"
 } else {
