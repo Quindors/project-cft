@@ -28,9 +28,11 @@ def _prompt_for_key(label: str) -> str:
         "'project-cft setup','')"
     )
     try:
+        # CREATE_NO_WINDOW: in the windowed exe, don't flash a console for powershell.
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, timeout=300,
+            capture_output=True, text=True, timeout=300, creationflags=no_window,
         )
         return result.stdout.strip()
     except Exception:

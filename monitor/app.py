@@ -81,6 +81,15 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
     if not dashboard_url:
         dashboard_url = os.getenv("DASHBOARD_URL")  # hosted fallback
 
+    # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0).
+    if dashboard_url and os.getenv("CFT_OPEN_DASHBOARD", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            import webbrowser
+            webbrowser.open(dashboard_url)
+            print(f"[boot] opened dashboard in browser")
+        except Exception as e:
+            print(f"[boot] could not auto-open dashboard ({e})")
+
     try:
         from monitor.tray import start_tray
         icon = start_tray(dashboard_url, on_quit=shutdown.set)
