@@ -60,8 +60,31 @@ if (Test-Path '.\dashboard\index.html') {
 }
 
 # --- 3. PyInstaller --------------------------------------------------------
+# PyInstaller wipes dist\cft, which would delete the user's .env (API key,
+# DASHBOARD_URL). Preserve it across the rebuild.
+$envBackup = $null
+if (Test-Path '.\dist\cft\.env') {
+    $envBackup = Get-Content '.\dist\cft\.env' -Raw
+    Write-Host "[env ] preserving existing dist\cft\.env"
+}
+
 Write-Host "[pyi ] running PyInstaller..."
 & $py -m PyInstaller cft.spec --noconfirm
+
+# --- 3b. Restore or seed the exe's .env ------------------------------------
+if ($envBackup) {
+    Set-Content '.\dist\cft\.env' -Value $envBackup -Encoding utf8 -NoNewline
+    Write-Host "[env ] restored dist\cft\.env"
+} elseif (Test-Path '.\.env') {
+    # Fresh build: seed DASHBOARD_URL from the dev .env so the hosted (Vercel)
+    # dashboard is CORS-allowed out of the box. The API key is prompted on
+    # first launch and appended by the app itself.
+    $dash = (Select-String -Path '.\.env' -Pattern '^DASHBOARD_URL=').Line
+    if ($dash) {
+        Set-Content '.\dist\cft\.env' -Value "$dash`n" -Encoding utf8
+        Write-Host "[env ] seeded dist\cft\.env with $dash"
+    }
+}
 
 # --- 3. Inno Setup (optional) ----------------------------------------------
 $iscc = Get-Command 'iscc.exe' -ErrorAction SilentlyContinue
