@@ -259,7 +259,11 @@ def _build_fewshot_prompt(
 
     if all_lines:
         all_lines.append(
-            "\nIf the current window is similar to a corrected or previously classified example, follow the pattern."
+            "\nEach correction applies to that EXACT window title. Generalize by the CONTENT "
+            "of the title (its topic/subject), never by the app or site alone: one YouTube "
+            "video corrected to a category says nothing about other YouTube videos - judge "
+            "each video by its own title. Only reuse a correction's category when the current "
+            "window is about the same specific content."
         )
 
     return "\n".join(all_lines) if all_lines else ""
