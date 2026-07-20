@@ -102,6 +102,32 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
         return None
 
 
+def run_dashboard_only() -> None:
+    """Serve the dashboard + correction API WITHOUT monitoring.
+
+    No window capture, no keystrokes, no LLM — just the local API over the
+    existing focus.db so the user can browse stats and make corrections.
+    Launch with: cft.exe --dashboard
+    """
+    print(f"\n{'='*50}\n  project-cft dashboard (monitoring OFF)\n{'='*50}\n")
+    load_env(override=True)
+
+    shutdown = threading.Event()
+    icon = _start_tray(None, shutdown)
+    print("[boot] dashboard-only mode ready — quit from the tray icon")
+    try:
+        while not shutdown.wait(timeout=1.0):
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+
+
 def run(settings: Settings | None = None) -> None:
     boot_start = time.time()
     print(f"\n{'='*50}\n  project-cft starting up...\n{'='*50}\n")

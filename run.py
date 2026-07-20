@@ -14,7 +14,11 @@ if getattr(sys, "frozen", False):
     sys.stdout = _log
     sys.stderr = _log
 
-from monitor.app import run
+from monitor.app import run, run_dashboard_only
 
 if __name__ == "__main__":
-    run()
+    if "--dashboard" in sys.argv[1:]:
+        # Dashboard + corrections only; no monitoring, no LLM, no API key needed.
+        run_dashboard_only()
+    else:
+        run()

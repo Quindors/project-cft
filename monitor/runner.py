@@ -7,6 +7,7 @@ Called by monitor/app.py which handles all initialization.
 
 from __future__ import annotations
 
+import os
 import time
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable
@@ -90,6 +91,15 @@ def _run_live_loop(
     loop_start = time.time()
     waiting_logged = False
 
+    # Corrections made in the dashboard while we run take effect within this
+    # interval — no restart needed. decide() checks corrections before its
+    # session cache, so a refreshed correction overrides cached classifications.
+    try:
+        corrections_refresh_sec = float(os.getenv("CFT_CORRECTIONS_REFRESH_SEC", "120"))
+    except ValueError:
+        corrections_refresh_sec = 120.0
+    last_corrections_reload = time.time()
+
     print(f"\n[runner] Starting LIVE monitoring loop")
     print(f"[runner] Poll interval: {settings.poll_interval}s")
     print(f"[runner] Decision interval: {settings.decision_interval}s")
@@ -119,6 +129,17 @@ def _run_live_loop(
 
             # --- ensure correct daily sheet ---
             sink.ensure_day(now_dt.date())
+
+            # --- periodic corrections refresh (dashboard edits apply live) ---
+            if corrections_refresh_sec > 0 and (time.time() - last_corrections_reload) >= corrections_refresh_sec:
+                last_corrections_reload = time.time()
+                try:
+                    fresh = sink.load_corrections()
+                    if len(fresh) != len(corrections or []):
+                        print(f"[runner] corrections refreshed: {len(corrections or [])} -> {len(fresh)}")
+                    corrections = fresh
+                except Exception as e:
+                    print(f"[runner] corrections refresh failed ({e}); keeping current set")
 
             # --- decide if it's time ---
             should_decide = (
