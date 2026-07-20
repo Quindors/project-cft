@@ -68,8 +68,20 @@ if (Test-Path '.\dist\cft\.env') {
     Write-Host "[env ] preserving existing dist\cft\.env"
 }
 
+# A running cft.exe holds locks on dist\cft and makes PyInstaller's cleanup
+# fail halfway, leaving a corrupted dist. Stop it first.
+$running = Get-Process cft -ErrorAction SilentlyContinue
+if ($running) {
+    Write-Host "[pyi ] stopping running cft.exe (it locks dist\cft)..."
+    $running | Stop-Process -Force
+    Start-Sleep -Seconds 2
+}
+
 Write-Host "[pyi ] running PyInstaller..."
 & $py -m PyInstaller cft.spec --noconfirm
+if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller failed (exit $LASTEXITCODE) - dist\cft may be incomplete"
+}
 
 # --- 3b. Restore or seed the exe's .env ------------------------------------
 if ($envBackup) {
