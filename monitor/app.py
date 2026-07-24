@@ -27,10 +27,13 @@ def _llm_init(box: dict) -> None:
 
 
 def _choose_storage() -> str:
-    """'supabase' or 'local'. Explicit STORAGE wins; else Supabase iff configured."""
+    """'supabase' or 'local'. Explicit STORAGE wins; MIRROR_SUPABASE keeps local
+    primary (with cloud mirroring); else Supabase iff configured."""
     storage = os.getenv("STORAGE", "").strip().lower()
     if storage in ("supabase", "local"):
         return storage
+    if os.getenv("MIRROR_SUPABASE", "").strip().lower() in ("1", "true", "yes"):
+        return "local"
     if os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY"):
         return "supabase"
     return "local"
@@ -40,7 +43,17 @@ def _make_live_sink(settings: Settings):
     if _choose_storage() == "supabase":
         return SupabaseSink(settings=settings)
     from monitor.local_sink import LocalSink
-    return LocalSink(settings=settings)
+    local = LocalSink(settings=settings)
+
+    from monitor import supa_mirror
+    if supa_mirror.enabled():
+        try:
+            from monitor.dual_sink import DualSink
+            print("[boot] Supabase mirroring ON (local is primary)")
+            return DualSink(local, SupabaseSink(settings=settings))
+        except Exception as e:
+            print(f"[boot] Supabase mirror unavailable ({e}); running local-only")
+    return local
 
 
 def _storage_init(box: dict, settings: Settings, *, want_writes: bool) -> None:

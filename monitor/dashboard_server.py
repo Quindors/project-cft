@@ -46,6 +46,7 @@ from typing import Optional, Set
 from urllib.parse import urlparse, parse_qs
 
 from monitor.paths import resource_path, data_dir
+from monitor import supa_mirror
 
 
 DEFAULT_API_PORT = 47113
@@ -259,8 +260,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         conn.commit()
         if cur.rowcount == 0:
             self._send_json({"error": f"no row with id {row_id}"}, status=404)
-        else:
-            self._send_json({"ok": True, "id": row_id, "human_label": label})
+            return
+
+        row = conn.execute(
+            "SELECT timestamp, current_window FROM focus_logs WHERE id = ?", (row_id,)
+        ).fetchone()
+        if row is not None:
+            supa_mirror.mirror_correction(row["timestamp"], row["current_window"], label)
+        self._send_json({"ok": True, "id": row_id, "human_label": label})
 
     @staticmethod
     def _productive_flag(value):
@@ -279,11 +286,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if exists:
             self._send_json({"error": f"category {name!r} already exists"}, status=409)
             return
+        productive = self._productive_flag(body.get("is_productive"))
         conn.execute(
             "INSERT INTO categories (name, description, is_productive) VALUES (?,?,?)",
-            (name, description, self._productive_flag(body.get("is_productive"))),
+            (name, description, productive),
         )
         conn.commit()
+        supa_mirror.mirror_category_add(name, description, None if productive is None else bool(productive))
         self._send_json({"ok": True, "name": name})
 
     def _post_category_update(self, conn, body) -> None:
@@ -330,6 +339,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 (new_name, name),
             ).rowcount
         conn.commit()
+        supa_mirror.mirror_category_update(
+            name, new_name, description, None if productive is None else bool(productive)
+        )
         self._send_json({"ok": True, "name": new_name, "renamed_log_rows": renamed_logs})
 
 
