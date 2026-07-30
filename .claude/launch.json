@@ -6,9 +6,18 @@
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
         "-e", "bash", "-c",
-        "rm -rf /tmp/cft-e2e && cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 venv/bin/python -u tests/e2e/serve.py"
+        "rm -rf /tmp/cft-e2e && cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 CFT_ALLOWED_ORIGINS=http://localhost:4173 venv/bin/python -u tests/e2e/serve.py"
       ],
       "port": 47997
+    },
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && npm run preview -- --port 4173 --strictPort"
+      ],
+      "port": 4173
     },
     {
       "name": "cft-api",
