@@ -15,6 +15,8 @@ from typing import List, Tuple, Dict, Any, Optional, Callable
 from monitor.config import Settings
 from monitor.decider import decide
 from monitor.sources import EventSource, KeystrokeSource, TraceEventSource
+from monitor import intentions as intentions_store
+from monitor import app_state
 
 
 def run_monitor_loop(
@@ -91,6 +93,18 @@ def _run_live_loop(
     loop_start = time.time()
     waiting_logged = False
 
+    # Session-intention drift tracking. While an intention is active the
+    # generic off-task popup is replaced by a dwell-based alert: only
+    # sustained off-intention time (settings.intention.dwell_sec) triggers it.
+    current_intention_id: Optional[int] = None
+    off_intention_since: Optional[float] = None
+    last_drift_alert: Optional[float] = None
+
+    # Monitor mode (dashboard toggle applies live). Tracking always runs;
+    # alerts only fire in distraction-free mode.
+    current_mode = app_state.get_mode()
+    print(f"[runner] mode: {current_mode}")
+
     # Corrections made in the dashboard while we run take effect within this
     # interval — no restart needed. decide() checks corrections before its
     # session cache, so a refreshed correction overrides cached classifications.
@@ -161,6 +175,33 @@ def _run_live_loop(
                 if decision_count == 1:
                     print(f"[runner] Time from loop start to first decision: {time.time() - loop_start:.1f}s")
 
+                # --- monitor mode (dashboard toggle applies live) ---
+                try:
+                    mode = app_state.get_mode()
+                except Exception as e:
+                    print(f"[runner] mode lookup failed ({e}); keeping {current_mode}")
+                    mode = current_mode
+                if mode != current_mode:
+                    current_mode = mode
+                    print(f"[runner] mode changed -> {current_mode}")
+                alerts_enabled = current_mode == app_state.MODE_DISTRACTION_FREE
+
+                # --- active session intention (dashboard/tray edits apply live) ---
+                intention = None
+                try:
+                    intention = intentions_store.get_active()
+                except Exception as e:
+                    print(f"[runner] intention lookup failed ({e}); continuing without")
+                new_id = intention["id"] if intention else None
+                if new_id != current_intention_id:
+                    current_intention_id = new_id
+                    off_intention_since = None
+                    last_drift_alert = None
+                    if intention:
+                        print(f"[runner] session intention active: \"{intention['text']}\" until {intention['ends_at']}")
+                    else:
+                        print("[runner] session intention ended")
+
                 t = time.time()
                 decision = decide(
                     events_context=events_buffer,
@@ -168,6 +209,7 @@ def _run_live_loop(
                     categories=categories,
                     corrections=corrections,
                     prior_classifications=prior_classifications,
+                    intention=intention,
                 )
                 llm_time = time.time() - t
                 print(f"[runner] LLM pipeline took {llm_time:.2f}s (vision_ran={decision.get('vision_ran', False)})")
@@ -175,17 +217,48 @@ def _run_live_loop(
                 # Log to console
                 _log_decision(decision)
 
+                # Error verdicts (LLM/parse failures) are transient noise, not
+                # activity — keep them out of the log entirely.
+                if decision.get("final_category_name") in ("[ERROR]", "[PARSE_ERROR]"):
+                    print("[runner] error verdict - not logged")
+                    time.sleep(settings.poll_interval)
+                    continue
+
                 # Write to sheets
                 t = time.time()
-                record = _build_record(decision, events_buffer, typed_text, now_dt)
+                record = _build_record(decision, events_buffer, typed_text, now_dt, intention=intention)
                 sink.enqueue_record(record)
                 flush_result = sink.flush_if_needed()
                 sheets_time = time.time() - t
                 if flush_result:
                     print(f"[runner] Flushed to sheets ({sheets_time:.2f}s, appended={flush_result.appended}, updated={flush_result.updated})")
 
-                # Popup alert if off-task
-                if decision.get("final_is_productive") is False and settings.popup.enabled:
+                # Alerts. Time-tracking mode suppresses them entirely (dwell
+                # state resets so a stale streak can't fire on mode switch).
+                # With an active intention: dwell-based drift alert.
+                # Without: the original immediate off-task popup.
+                if not alerts_enabled:
+                    off_intention_since = None
+                elif intention is not None:
+                    off_intention = _is_off_intention(decision, settings)
+                    if off_intention:
+                        if off_intention_since is None:
+                            off_intention_since = time.time()
+                        dwell = time.time() - off_intention_since
+                        due = (
+                            dwell >= settings.intention.dwell_sec
+                            and (last_drift_alert is None
+                                 or (time.time() - last_drift_alert) >= settings.intention.realert_sec)
+                        )
+                        if due and settings.popup.enabled:
+                            cat_name = decision.get("final_category_name", "Unknown")
+                            msg = (f"Off-intention for {int(dwell // 60)}m ({cat_name})\n"
+                                   f"Session: {intention['text']}")
+                            show_popup(msg, "Focus Alert")
+                            last_drift_alert = time.time()
+                    else:
+                        off_intention_since = None
+                elif decision.get("final_is_productive") is False and settings.popup.enabled:
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
                     msg = f"Off-task: {cat_name}" + (f"\n{reason}" if reason else "")
@@ -396,6 +469,20 @@ def _run_trace_loop(
 
 # --------------- helpers ---------------
 
+def _is_off_intention(decision: Dict[str, Any], settings: Settings) -> bool:
+    """Is this decision drifting from the active session intention?
+
+    ALIGN is authoritative when the LLM produced it; the shortcut paths
+    (corrections, cache of pre-intention decisions, System) have no ALIGN and
+    fall back to the category's productivity. System/neutral never counts as
+    drift.
+    """
+    align = decision.get("final_align")
+    if align is not None:
+        return align < settings.intention.align_threshold
+    return decision.get("final_is_productive") is False
+
+
 def _log_decision(decision: Dict[str, Any]) -> None:
     """Print decision to console."""
     cat_name = decision.get("final_category_name", "Unknown")
@@ -403,10 +490,12 @@ def _log_decision(decision: Dict[str, Any]) -> None:
     conf = decision.get("final_conf", 0.0)
     reason = decision.get("final_reason", "")
     vision_ran = decision.get("vision_ran", False)
+    align = decision.get("final_align")
 
     p_emoji = "✓" if is_productive else "✗"
     v_emoji = "🔍" if vision_ran else "  "
-    print(f"[runner] {v_emoji} {p_emoji} {cat_name} (conf={conf:.2f})")
+    align_str = f" align={align:.2f}" if align is not None else ""
+    print(f"[runner] {v_emoji} {p_emoji} {cat_name} (conf={conf:.2f}{align_str})")
     print(f"[runner]   {reason}")
 
 
@@ -415,6 +504,7 @@ def _build_record(
     events_buffer: List[Tuple[str, str]],
     typed_text: str,
     now_dt: datetime,
+    intention: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """Flatten a decision into the dict that SupabaseSink.enqueue_record expects."""
     primary = decision.get("primary", {})
@@ -427,4 +517,6 @@ def _build_record(
         "main_label":         primary.get("category_name", ""),
         "typed_text":         typed_text,
         "events":             [{"key": k} for _, k in events_buffer],
+        "intention_id":       intention["id"] if intention else None,
+        "align_score":        decision.get("final_align"),
     }

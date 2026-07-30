@@ -21,6 +21,18 @@ class PopupSettings:
     cooldown_sec: float = 5.0   # re-alert every 5s while OFF-TASK
 
 @dataclass(frozen=True)
+class IntentionSettings:
+    """Alerting behavior while a session intention is active.
+
+    During a declared session the generic off-task popup is replaced by a
+    dwell-based drift alert: only sustained off-intention time triggers it.
+    """
+    align_threshold: float = 0.5   # final_align below this counts as off-intention
+    dwell_sec: float = 120.0       # continuous off-intention time before alerting
+    realert_sec: float = 300.0     # minimum gap between drift alerts
+
+
+@dataclass(frozen=True)
 class CriticSettings:
     # Vision tiebreaker (the "critic" text-LLM step was removed; only vision remains).
     vision_enabled: bool = True
@@ -80,6 +92,7 @@ class Settings:
     supabase: SupabaseSettings = field(default_factory=SupabaseSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
+    intention: IntentionSettings = field(default_factory=IntentionSettings)
 
 
 DEFAULT_SETTINGS = Settings(

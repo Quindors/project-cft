@@ -2,14 +2,16 @@
 """System-tray icon for the background monitor.
 
 The monitor normally runs hidden (launched via VBS / Startup shortcut). The
-tray gives it a visible entry point: "Open Dashboard" and "Quit". pystray is
-imported lazily so environments without it (dev on WSL, headless) don't fail
-at import time.
+tray gives it a visible entry point: "Open Dashboard", focus-session controls,
+and "Quit". pystray is imported lazily so environments without it (dev on WSL,
+headless) don't fail at import time.
 """
 from __future__ import annotations
 
 import webbrowser
 from typing import Callable, Optional
+
+from monitor import intentions
 
 
 def _icon_image():
@@ -22,7 +24,28 @@ def _icon_image():
     return img
 
 
-def start_tray(dashboard_url: Optional[str], on_quit: Callable[[], None]):
+def _intention_status(item=None) -> str:
+    """Dynamic menu text: the active session intention, if any."""
+    try:
+        active = intentions.get_active()
+    except Exception:
+        return "Session: (unavailable)"
+    if active is None:
+        return "No focus session"
+    text = active["text"]
+    if len(text) > 40:
+        text = text[:37] + "..."
+    return f"Session: {text} (until {active['ends_at'][11:16]})"
+
+
+def _has_active_intention(item=None) -> bool:
+    try:
+        return intentions.get_active() is not None
+    except Exception:
+        return False
+
+
+def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_quit: Callable[[], None]):
     """Create and run (detached) the tray icon. Returns the icon, or None on failure."""
     try:
         import pystray
@@ -34,6 +57,18 @@ def start_tray(dashboard_url: Optional[str], on_quit: Callable[[], None]):
         if dashboard_url:
             webbrowser.open(dashboard_url)
 
+    def _start_session(icon, item):
+        if intention_url:
+            webbrowser.open(intention_url)
+
+    def _end_session(icon, item):
+        try:
+            ended = intentions.end_active("completed")
+            if ended:
+                print(f"[tray] focus session ended: \"{ended['text']}\"")
+        except Exception as e:
+            print(f"[tray] could not end session ({e})")
+
     def _quit(icon, item):
         try:
             icon.stop()
@@ -42,6 +77,11 @@ def start_tray(dashboard_url: Optional[str], on_quit: Callable[[], None]):
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Dashboard", _open, default=True, enabled=bool(dashboard_url)),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(_intention_status, None, enabled=False),
+        pystray.MenuItem("Start Focus Session...", _start_session, enabled=bool(intention_url)),
+        pystray.MenuItem("End Focus Session", _end_session, enabled=_has_active_intention),
+        pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _quit),
     )
     icon = pystray.Icon("project-cft", _icon_image(), "project-cft focus monitor", menu)

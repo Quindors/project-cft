@@ -30,3 +30,6 @@ dashboard/
 
 # Test fixtures / results (kept local)
 tests/
+
+# Runtime data (source-mode fallback data dir: focus.db etc.)
+data/

@@ -87,7 +87,9 @@ class LocalSink:
                     human_label    TEXT,
                     typed_text     TEXT,
                     events         TEXT,
-                    reviewed_at    TEXT
+                    reviewed_at    TEXT,
+                    intention_id   INTEGER,
+                    align_score    REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_focus_ts ON focus_logs(timestamp);
                 CREATE TABLE IF NOT EXISTS categories (
@@ -97,6 +99,19 @@ class LocalSink:
                 );
                 """
             )
+            # Migrate pre-intention databases in place.
+            for col, typ in (("intention_id", "INTEGER"), ("align_score", "REAL")):
+                try:
+                    self._conn.execute(f"ALTER TABLE focus_logs ADD COLUMN {col} {typ}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+            # Error verdicts are transient noise; sweep any that made it in
+            # (e.g. rows written by older builds).
+            purged = self._conn.execute(
+                "DELETE FROM focus_logs WHERE category_name IN ('[ERROR]', '[PARSE_ERROR]')"
+            ).rowcount
+            if purged:
+                print(f"[sink] purged {purged} error rows from focus.db")
             cur = self._conn.execute("SELECT COUNT(*) AS n FROM categories")
             if cur.fetchone()["n"] == 0:
                 self._conn.executemany(
@@ -133,9 +148,10 @@ class LocalSink:
                 self._conn.executemany(
                     """INSERT INTO focus_logs
                        (timestamp, current_window, category_name, confidence,
-                        reason, human_label, typed_text, events)
+                        reason, human_label, typed_text, events, intention_id, align_score)
                        VALUES (:timestamp, :current_window, :category_name, :confidence,
-                               :reason, :human_label, :typed_text, :events)""",
+                               :reason, :human_label, :typed_text, :events,
+                               :intention_id, :align_score)""",
                     batch,
                 )
                 self._conn.commit()
@@ -293,4 +309,6 @@ class LocalSink:
             "human_label": record.get("human_label") or None,
             "typed_text": record.get("typed_text") or None,
             "events": json.dumps(events) if events else None,
+            "intention_id": record.get("intention_id"),
+            "align_score": record.get("align_score"),
         }

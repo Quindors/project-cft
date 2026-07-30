@@ -100,6 +100,17 @@ class SupabaseSink:
         self.last_flush_time = time.time()
         self._categories_cache: Optional[List[Dict]] = None
 
+        # Sweep transient error verdicts left by older builds. Best-effort:
+        # a failed purge should never block startup.
+        try:
+            res = (self.sb.table("focus_logs").delete()
+                   .in_("category_name", ["[ERROR]", "[PARSE_ERROR]"])
+                   .execute())
+            if res.data:
+                print(f"[sink] purged {len(res.data)} error rows from Supabase")
+        except Exception as e:
+            print(f"[warn] Supabase error-row purge failed: {e}")
+
     # ------------------- public API -------------------
 
     def ensure_day(self, day: date) -> None:

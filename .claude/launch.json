@@ -2,9 +2,27 @@
   "version": "0.0.1",
   "configurations": [
     {
+      "name": "intention-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "rm -rf /tmp/cft-e2e && cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 venv/bin/python -u tests/e2e/serve.py"
+      ],
+      "port": 47997
+    },
+    {
+      "name": "cft-api",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "cd ~/projects/project-cft && CFT_OPEN_DASHBOARD=0 CFT_ALLOWED_ORIGINS=http://localhost:5173 venv/bin/python run.py --dashboard"
+      ],
+      "port": 47113
+    },
+    {
       "name": "focus-dashboard",
       "runtimeExecutable": "cmd.exe",
-      "runtimeArgs": ["/c", "C:\\Users\\abl96\\AppData\\Local\\Temp\\claude\\--wsl-localhost-Ubuntu-home-abl96-projects-project-cft\\d1283c1e-e429-4c53-8229-6a940d9e9a96\\scratchpad\\start-dashboard.bat"],
+      "runtimeArgs": ["/c", "C:\\Users\\abl96\\AppData\\Local\\Temp\\claude\\--wsl-localhost-Ubuntu-home-abl96-projects-project-cft\\4c6dd7b2-ff48-4f62-8170-3421a14f85ae\\scratchpad\\start-vite.bat"],
       "port": 5173
     }
   ]

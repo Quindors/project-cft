@@ -81,10 +81,12 @@ def _read_prompt_file(filename: str) -> str:
 
 # ==================== SESSION CACHE ====================
 #
-# In-process cache of normalized_title -> (decision, timestamp). Lets the
-# decision loop skip the LLM when the same window has been classified
-# recently with high confidence. Reset on process restart; corrections and
-# prior_classifications already handle the cross-session story.
+# In-process cache of (intention, normalized_title) -> (decision, timestamp).
+# Lets the decision loop skip the LLM when the same window has been classified
+# recently with high confidence. Keyed by the active intention id because an
+# intention change flips what counts as aligned — a decision cached under the
+# old intention must not leak into the new session. Reset on process restart;
+# corrections and prior_classifications already handle the cross-session story.
 
 _session_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
 
@@ -93,8 +95,12 @@ _CACHE_MIN_CONF = 0.80
 _CACHE_SKIP_CATS = {"[ERROR]", "[PARSE_ERROR]", "System", "Ambiguous"}
 
 
-def _cache_get(window_title: str) -> Optional[Dict[str, Any]]:
-    key = _normalize_title(window_title)
+def _cache_key(window_title: str, intention_id) -> str:
+    return f"{intention_id if intention_id is not None else ''}|{_normalize_title(window_title)}"
+
+
+def _cache_get(window_title: str, intention_id=None) -> Optional[Dict[str, Any]]:
+    key = _cache_key(window_title, intention_id)
     entry = _session_cache.get(key)
     if entry is None:
         return None
@@ -105,12 +111,12 @@ def _cache_get(window_title: str) -> Optional[Dict[str, Any]]:
     return decision
 
 
-def _cache_put(window_title: str, decision: Dict[str, Any]) -> None:
+def _cache_put(window_title: str, decision: Dict[str, Any], intention_id=None) -> None:
     if decision.get("final_conf", 0.0) < _CACHE_MIN_CONF:
         return
     if decision.get("final_category_name") in _CACHE_SKIP_CATS:
         return
-    _session_cache[_normalize_title(window_title)] = (decision, time.time())
+    _session_cache[_cache_key(window_title, intention_id)] = (decision, time.time())
 
 
 # ==================== TITLE NORMALIZATION ====================
@@ -156,16 +162,17 @@ def _format_activity(events: List[Tuple[str, str]]) -> str:
     return "\n".join(parts)
 
 def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[Dict]:
-    """Check if current window exactly matches a known correction."""
+    """Check if current window matches a known correction.
+
+    Titles are compared after _normalize_title (same normalization as the
+    session cache), so "(2) Chat | Teams" still matches a correction saved
+    as "(1) Chat | Teams".
+    """
     if not corrections:
         return None
-    clean = current_window.strip()
-    # Strip WIN: prefix for matching
-    if clean.upper().startswith("WIN:"):
-        clean = clean[4:]
-    clean_lower = clean.lower()
+    current_norm = _normalize_title(current_window)
     for c in corrections:
-        if c["window_title"].lower() == clean_lower:
+        if _normalize_title(c["window_title"]) == current_norm:
             return c
     return None
 
@@ -269,11 +276,41 @@ def _build_fewshot_prompt(
     return "\n".join(all_lines) if all_lines else ""
 
 
+def _intention_block(intention: Dict) -> str:
+    """Prompt section for an active session intention.
+
+    Appended after the main template (like the few-shot section) so
+    prompt-main.txt stays unchanged for tune_prompt/compare_models runs.
+    """
+    return (
+        f'ACTIVE FOCUS SESSION (until {intention["ends_at"]}):\n'
+        f'The user declared: "{intention["text"]}"\n\n'
+        "In addition to the category, judge how well the CURRENT WINDOW serves this "
+        "declared session intention. Append one extra field to the output line:\n"
+        "ALIGN=<0.0-1.0> where:\n"
+        "- 0.8-1.0: directly doing the declared work\n"
+        "- 0.5-0.7: adjacent/supporting activity (docs, research, tooling for it)\n"
+        "- 0.2-0.4: productive in general but NOT what they declared\n"
+        "- 0.0-0.1: clearly off-task\n"
+        "Judge alignment by content, not platform: a video or article on the declared "
+        "topic is aligned; unrelated productive work is not. ALIGN is independent of "
+        "CATEGORY — an activity can be a productive category with low ALIGN."
+    )
+
+
+def _parse_align(content: str) -> Optional[float]:
+    m = re.search(r"ALIGN\s*=\s*([01](?:\.\d+)?|\.\d+)", content or "", flags=re.I)
+    if not m:
+        return None
+    return min(max(float(m.group(1)), 0.0), 1.0)
+
+
 def build_prompt(
     events: List[Tuple[str, str]],
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
+    intention: Optional[Dict] = None,
 ) -> str:
     activity_str = _format_activity(events)
 
@@ -306,6 +343,9 @@ def build_prompt(
         )
         if fewshot_section:
             filled = filled + "\n\n" + fewshot_section
+
+    if intention:
+        filled = filled + "\n\n" + _intention_block(intention)
 
     return filled
 
@@ -405,12 +445,13 @@ def ask_gpt_vision_verdict(
     model: str,
     max_tokens: int,
     categories: List[Dict] = None,
-) -> Tuple[str, float, float, str, Optional[bool]]:
+    intention: Optional[Dict] = None,
+) -> Tuple[str, float, float, str, Optional[bool], str]:
     """Vision tiebreaker. Reviews the primary's window-title-only call against
     the screenshot, then either agrees or overrides.
 
-    Returns (category_name, off_score, conf, reason, is_productive) — same
-    shape as the primary call's parse output.
+    Returns (category_name, off_score, conf, reason, is_productive, raw_content)
+    — the primary call's parse output plus the raw response (for ALIGN parsing).
     """
     if not events:
         current_window = "(unknown)"
@@ -468,6 +509,9 @@ DEFAULT BEHAVIOR — AGREE WITH PRIMARY:
 Output format (strict, single line):
 CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0> | REASON=<brief explanation citing what you saw on screen>"""
 
+    if intention:
+        prompt = prompt + "\n\n" + _intention_block(intention)
+
     try:
         resp = _client().chat.completions.create(
             model=model,
@@ -482,10 +526,10 @@ CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0
             temperature=0.0,
         )
         content = (resp.choices[0].message.content or "").strip()
-        return _parse_llm_line(content, categories)
+        return _parse_llm_line(content, categories) + (content,)
 
     except Exception as e:
-        return "[ERROR]", 0.5, 0.5, str(e), None
+        return "[ERROR]", 0.5, 0.5, str(e), None, ""
 
 # ==================== SYSTEM WINDOW DETECTION ====================
 
@@ -561,6 +605,7 @@ def decide(
     categories: List[Dict] = None,
     corrections: List[Dict] = None,
     prior_classifications: List[Dict] = None,
+    intention: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     """Window-title primary + two-direction vision tiebreaker.
 
@@ -572,9 +617,14 @@ def decide(
            (A) primary returned a productive category, OR
            (B) primary returned Ambiguous with CONF <= 0.70
 
+    `intention` is the active session intention (monitor/intentions.py). When
+    set, prompts additionally request an ALIGN score against it and the result
+    carries final_align (None on the LLM-skipping shortcut paths).
+
     Returns: dict with final_category_name, final_is_productive, final_off,
-    final_conf, final_reason, vision_ran, primary, vision.
+    final_conf, final_reason, final_align, vision_ran, primary, vision.
     """
+    intention_id = intention["id"] if intention else None
     # --- 1. User correction exact-match ---
     if corrections and events_context:
         match = _match_correction(events_context[-1][1], corrections)
@@ -594,6 +644,7 @@ def decide(
                 "final_off": 0.0 if is_productive else 1.0,
                 "final_conf": 1.0,
                 "final_reason": f"User correction: was {match['ai_category']}, corrected to {cat_name}",
+                "final_align": None,
                 "vision_ran": False,
                 "primary": {"category_name": cat_name, "is_productive": is_productive,
                             "off": 0.0, "conf": 1.0, "reason": "user correction"},
@@ -608,6 +659,7 @@ def decide(
             "final_off": 0.5,
             "final_conf": 1.0,
             "final_reason": "System/utility window - not a user activity",
+            "final_align": None,
             "vision_ran": False,
             "primary": {"category_name": "System", "is_productive": None,
                         "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
@@ -616,7 +668,7 @@ def decide(
 
     # --- 2.5. Session cache: same window classified recently? ---
     if events_context:
-        cached = _cache_get(events_context[-1][1])
+        cached = _cache_get(events_context[-1][1], intention_id)
         if cached is not None:
             print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
             result = dict(cached)
@@ -629,6 +681,7 @@ def decide(
         categories=categories,
         corrections=corrections,
         prior_classifications=prior_classifications,
+        intention=intention,
     )
     p1_name, p1_off, p1_conf, p1_reason, p1_prod, p1_raw = ask_gpt(
         p1_prompt,
@@ -637,29 +690,32 @@ def decide(
         temperature=0.0,
         categories=categories,
     )
+    p1_align = _parse_align(p1_raw) if intention else None
     primary_res = {
         "category_name": p1_name,
         "is_productive": p1_prod,
         "off": p1_off,
         "conf": p1_conf,
         "reason": p1_reason or "",
+        "align": p1_align,
     }
 
     current_window = events_context[-1][1] if events_context else ""
 
-    def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None):
+    def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None, align=None):
         result = {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
             "final_off": off,
             "final_conf": conf,
             "final_reason": reason,
+            "final_align": align,
             "vision_ran": vision_ran,
             "primary": primary_res,
             "vision": vision_res,
         }
         if current_window:
-            _cache_put(current_window, result)
+            _cache_put(current_window, result, intention_id)
         return result
 
     # Primary errored
@@ -668,7 +724,7 @@ def decide(
 
     # --- 4. Vision tiebreaker? ---
     if not _should_run_vision(p1_prod, p1_conf, settings):
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
 
     direction = "verify-productive" if p1_prod is True else "second-guess-default"
 
@@ -680,7 +736,7 @@ def decide(
         b64_img = _load_trace_screenshot(events_context, settings)
         if b64_img is None:
             print(f"[vision] WOULD FIRE ({direction}): primary={p1_name}, conf={p1_conf:.2f} — no fixture screenshot")
-            return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+            return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
         source = "trace fixture"
     else:
         b64_img = take_screenshot_b64()
@@ -688,11 +744,11 @@ def decide(
 
     if not b64_img:
         print("[vision] No screenshot available — primary stands.")
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False)
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
 
     print(f"[vision] Triggered ({direction}, {source}): primary={p1_name}, conf={p1_conf:.2f}")
 
-    v_name, v_off, v_conf, v_reason, v_prod = ask_gpt_vision_verdict(
+    v_name, v_off, v_conf, v_reason, v_prod, v_raw = ask_gpt_vision_verdict(
         b64_img,
         events_context,
         primary_category=p1_name,
@@ -702,22 +758,27 @@ def decide(
         model=settings.critic.vision_model,
         max_tokens=settings.critic.vision_max_tokens,
         categories=categories,
+        intention=intention,
     )
+    v_align = _parse_align(v_raw) if intention else None
     vision_res = {
         "category_name": v_name,
         "is_productive": v_prod,
         "off": v_off,
         "conf": v_conf,
         "reason": v_reason or "",
+        "align": v_align,
     }
 
     # Vision errored → primary stands
     if v_name in ("[ERROR]", "[PARSE_ERROR]"):
         print(f"[vision] Error ({v_reason}) — primary stands.")
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res)
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res, align=p1_align)
 
     # Vision verdict wins
     overrode = (v_name.lower() != p1_name.lower())
     tag = "OVERRIDE" if overrode else "AGREE"
     print(f"[vision] {tag}: {p1_name} -> {v_name} (conf {p1_conf:.2f} -> {v_conf:.2f})")
-    return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True, vision_res)
+    # Vision saw the screen; its ALIGN wins when present, else the primary's stands.
+    final_align = v_align if v_align is not None else p1_align
+    return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True, vision_res, align=final_align)

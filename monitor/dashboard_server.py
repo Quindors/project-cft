@@ -11,16 +11,27 @@ local SQLite DB. Two ways to reach it:
      this same origin (no CORS needed).
 
 Endpoints:
+    GET  /api/mode              -> {mode}  ("distraction_free" | "time_tracking")
+    POST /api/mode              -> {mode} switches monitor mode; alerts only
+                                   fire in distraction_free (picked up live by
+                                   the runner within one decision interval)
     GET  /api/categories        -> [{name, description, is_productive}, ...]
     GET  /api/focus?since=<ts>  -> [{timestamp, category_name, confidence}, ...]
     GET  /api/events?limit=<n>  -> recent rows with id/current_window/human_label,
                                    for the dashboard's review (re-classify) tab
+    GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null}
     POST /api/correct           -> {id, human_label} sets a human correction on a
                                    row (human_label of null/"" clears it)
     POST /api/category          -> {name, description, is_productive} adds a category
     POST /api/category/update   -> {name, new_name?, description?, is_productive?}
                                    edits a category; a rename cascades to
                                    focus_logs.category_name / human_label
+    POST /api/intention         -> {text, duration_min} starts a session intention
+                                   (supersedes any active one)
+    POST /api/intention/end     -> {status?: completed|abandoned} ends the active one
+
+GET /intention serves a minimal built-in page for starting/ending a session
+intention — usable even without the bundled dashboard (the tray links to it).
 
 Corrections and category changes reach the classifier at the next monitor
 start, when they are re-read from the DB.
@@ -47,6 +58,8 @@ from urllib.parse import urlparse, parse_qs
 
 from monitor.paths import resource_path, data_dir
 from monitor import supa_mirror
+from monitor import intentions
+from monitor import app_state
 
 
 DEFAULT_API_PORT = 47113
@@ -142,6 +155,15 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if self.path.startswith("/api/"):
             self._handle_api()
             return
+        if urlparse(self.path).path == "/intention":
+            body = _INTENTION_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if _STATIC_ROOT is None:
             # API-only mode (dashboard is hosted): don't serve arbitrary files.
             self._send_json({"error": "dashboard not bundled; use the hosted URL"}, status=404)
@@ -161,6 +183,24 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _handle_api(self) -> None:
         u = urlparse(self.path)
         qs = parse_qs(u.query)
+
+        # Intentions go through monitor/intentions.py (it creates the DB and
+        # its own table on demand), not the read-only connection below.
+        if u.path == "/api/intention":
+            try:
+                self._send_json({"active": intentions.get_active()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
+        # Mode lives in monitor/app_state.py — same on-demand DB pattern.
+        if u.path == "/api/mode":
+            try:
+                self._send_json({"mode": app_state.get_mode()})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
         conn = _db_ro()
         if conn is None:
             # No data yet — return empty so the dashboard renders zeros, not an error.
@@ -214,12 +254,19 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         u = urlparse(self.path)
+        # Intention endpoints manage their own DB access (and create the DB
+        # if needed), so they run before the shared read-write connection.
+        no_conn_handlers = {
+            "/api/intention": self._post_intention_start,
+            "/api/intention/end": self._post_intention_end,
+            "/api/mode": self._post_mode,
+        }
         handlers = {
             "/api/correct": self._post_correct,
             "/api/category": self._post_category_add,
             "/api/category/update": self._post_category_update,
         }
-        handler = handlers.get(u.path)
+        handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
             self._send_json({"error": "not found"}, status=404)
             return
@@ -233,6 +280,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": "expected a JSON object body"}, status=400)
             return
 
+        if u.path in no_conn_handlers:
+            try:
+                handler(body)
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
         conn = _db_rw()
         if conn is None:
             self._send_json({"error": "no local database yet"}, status=503)
@@ -243,6 +297,34 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=500)
         finally:
             conn.close()
+
+    def _post_intention_start(self, body) -> None:
+        text = body.get("text") or ""
+        try:
+            duration_min = int(body.get("duration_min") or 0)
+            active = intentions.start(text, duration_min)
+        except (ValueError, TypeError) as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, "active": active})
+
+    def _post_mode(self, body) -> None:
+        mode = (body.get("mode") or "").strip().lower()
+        try:
+            app_state.set_mode(mode)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, "mode": mode})
+
+    def _post_intention_end(self, body) -> None:
+        status = (body.get("status") or "completed").strip().lower()
+        try:
+            ended = intentions.end_active(status)
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, "ended": ended})
 
     def _post_correct(self, conn, body) -> None:
         try:
@@ -343,6 +425,92 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             name, new_name, description, None if productive is None else bool(productive)
         )
         self._send_json({"ok": True, "name": new_name, "renamed_log_rows": renamed_logs})
+
+
+# Minimal built-in page for session intentions. Same-origin, no build step —
+# this is the tray's "Start Focus Session" target and works even when the
+# React dashboard isn't bundled.
+_INTENTION_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Focus Session</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 48px auto;
+         padding: 0 16px; background: Canvas; color: CanvasText; }
+  h1 { font-size: 1.2rem; }
+  textarea { width: 100%; box-sizing: border-box; min-height: 72px; font: inherit;
+             padding: 8px; border-radius: 8px; border: 1px solid #8884; }
+  .durations { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+  .durations button { padding: 6px 14px; border-radius: 999px; border: 1px solid #8886;
+                      background: transparent; color: inherit; cursor: pointer; }
+  .durations button.sel { background: #10b981; border-color: #10b981; color: #fff; }
+  .primary { width: 100%; padding: 10px; border-radius: 8px; border: none;
+             background: #10b981; color: #fff; font: inherit; cursor: pointer; }
+  .secondary { padding: 8px 14px; border-radius: 8px; border: 1px solid #8886;
+               background: transparent; color: inherit; cursor: pointer; }
+  #active { border: 1px solid #10b98166; border-radius: 12px; padding: 16px; }
+  .muted { opacity: 0.7; font-size: 0.9rem; }
+  .row { display: flex; gap: 8px; margin-top: 12px; }
+  #err { color: #ef4444; min-height: 1.2em; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Focus session</h1>
+<div id="app">Loading…</div>
+<p id="err"></p>
+<script>
+let duration = 45;
+async function load() {
+  const r = await fetch('/api/intention');
+  const d = await r.json();
+  const app = document.getElementById('app');
+  if (d.active) {
+    app.innerHTML = `
+      <div id="active">
+        <div><strong>${esc(d.active.text)}</strong></div>
+        <div class="muted">started ${esc(d.active.started_at)} · ends ${esc(d.active.ends_at)}</div>
+        <div class="row">
+          <button class="secondary" onclick="end('completed')">Done</button>
+          <button class="secondary" onclick="end('abandoned')">Abandon</button>
+        </div>
+      </div>`;
+  } else {
+    app.innerHTML = `
+      <textarea id="text" placeholder="What do you intend to work on?"></textarea>
+      <div class="durations">
+        ${[15,25,45,60,90].map(m =>
+          `<button onclick="pick(${m},this)" class="${m===duration?'sel':''}">${m}m</button>`).join('')}
+      </div>
+      <button class="primary" onclick="start()">Start session</button>`;
+  }
+}
+function pick(m, el) {
+  duration = m;
+  document.querySelectorAll('.durations button').forEach(b => b.classList.remove('sel'));
+  el.classList.add('sel');
+}
+async function start() {
+  const text = document.getElementById('text').value;
+  await post('/api/intention', {text, duration_min: duration});
+}
+async function end(status) { await post('/api/intention/end', {status}); }
+async function post(url, body) {
+  document.getElementById('err').textContent = '';
+  const r = await fetch(url, {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  if (!r.ok || d.error) { document.getElementById('err').textContent = d.error || r.statusText; }
+  else { load(); }
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+load();
+</script>
+</body>
+</html>
+"""
 
 
 class _Server(socketserver.ThreadingTCPServer):

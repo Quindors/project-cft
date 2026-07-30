@@ -95,6 +95,8 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
         print(f"[boot] local API not started ({e})")
 
     dashboard_url = os.getenv("DASHBOARD_URL", "").strip() or local_url
+    # The intention page is always served by the local API, not the hosted site.
+    intention_url = (local_url.rstrip("/") + "/intention") if local_url else None
 
     # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0).
     if dashboard_url and os.getenv("CFT_OPEN_DASHBOARD", "1").strip().lower() not in ("0", "false", "no"):
@@ -107,7 +109,7 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
 
     try:
         from monitor.tray import start_tray
-        icon = start_tray(dashboard_url, on_quit=shutdown.set)
+        icon = start_tray(dashboard_url, intention_url, on_quit=shutdown.set)
         print(f"[boot] tray ready (dashboard: {dashboard_url or 'not configured'})")
         return icon
     except Exception as e:
