@@ -12,10 +12,12 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def load_env(*, override: bool = True) -> None:
+    # utf-8-sig: tolerate a UTF-8 BOM (e.g. from PowerShell's Set-Content),
+    # which would otherwise silently corrupt the first line's variable name.
     if is_frozen():
-        load_dotenv(dotenv_path=str(env_path()), override=override)
+        load_dotenv(dotenv_path=str(env_path()), override=override, encoding="utf-8-sig")
     else:
-        load_dotenv(override=override)
+        load_dotenv(override=override, encoding="utf-8-sig")
 
 
 def _prompt_for_key(label: str) -> str:

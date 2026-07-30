@@ -84,8 +84,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- 3b. Restore or seed the exe's .env ------------------------------------
+# Write without a BOM: PowerShell 5.1's `-Encoding utf8` prepends one, which
+# corrupts the first line's variable name when the app parses the .env.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 if ($envBackup) {
-    Set-Content '.\dist\cft\.env' -Value $envBackup -Encoding utf8 -NoNewline
+    # Strip a BOM a previous buggy restore may have baked into the backup.
+    $envBackup = $envBackup.TrimStart([char]0xFEFF)
+    [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').Path + '\.env', $envBackup, $utf8NoBom)
     Write-Host "[env ] restored dist\cft\.env"
 } elseif (Test-Path '.\.env') {
     # Fresh build: seed DASHBOARD_URL from the dev .env so the hosted (Vercel)
@@ -93,7 +98,7 @@ if ($envBackup) {
     # first launch and appended by the app itself.
     $dash = (Select-String -Path '.\.env' -Pattern '^DASHBOARD_URL=').Line
     if ($dash) {
-        Set-Content '.\dist\cft\.env' -Value "$dash`n" -Encoding utf8
+        [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').Path + '\.env', "$dash`n", $utf8NoBom)
         Write-Host "[env ] seeded dist\cft\.env with $dash"
     }
 }
