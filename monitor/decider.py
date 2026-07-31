@@ -111,11 +111,15 @@ def _cache_get(window_title: str, intention_id=None) -> Optional[Dict[str, Any]]
     return decision
 
 
-def _cache_put(window_title: str, decision: Dict[str, Any], intention_id=None) -> None:
-    if decision.get("final_conf", 0.0) < _CACHE_MIN_CONF:
-        return
-    if decision.get("final_category_name") in _CACHE_SKIP_CATS:
-        return
+def _cache_put(window_title: str, decision: Dict[str, Any], intention_id=None, force: bool = False) -> None:
+    """force=True bypasses the conf/category gates — used for correction-pinned
+    decisions, which are human ground truth even when the category (e.g.
+    Ambiguous) would normally be excluded from caching."""
+    if not force:
+        if decision.get("final_conf", 0.0) < _CACHE_MIN_CONF:
+            return
+        if decision.get("final_category_name") in _CACHE_SKIP_CATS:
+            return
     _session_cache[_cache_key(window_title, intention_id)] = (decision, time.time())
 
 
@@ -160,6 +164,18 @@ def _format_activity(events: List[Tuple[str, str]]) -> str:
         parts.append(f"OLDER CONTEXT ({len(older)} events): {', '.join(unique_older[-5:])}")
 
     return "\n".join(parts)
+
+def _resolve_category(name: str, categories: Optional[List[Dict]]) -> Tuple[str, Optional[bool]]:
+    """Match a category name case-insensitively against the category list.
+
+    Returns (exact-cased name, is_productive) — (name, None) if not found.
+    """
+    if categories:
+        for cat in categories:
+            if cat["name"].lower() == name.lower():
+                return cat["name"], cat.get("is_productive")
+    return name, None
+
 
 def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[Dict]:
     """Check if current window matches a known correction.
@@ -626,30 +642,29 @@ def decide(
     """
     intention_id = intention["id"] if intention else None
     # --- 1. User correction exact-match ---
+    # A correction pins the CATEGORY (human ground truth), but ALIGN is
+    # intention-relative and a category label says nothing about it. With no
+    # session active, skip the LLM entirely (as always). With one, fall
+    # through so the primary call can score ALIGN — the corrected category is
+    # pinned after the call (see step 3.5).
+    correction = None
     if corrections and events_context:
-        match = _match_correction(events_context[-1][1], corrections)
-        if match:
-            cat_name = match["corrected_category"]
-            is_productive = None
-            if categories:
-                for cat in categories:
-                    if cat["name"].lower() == cat_name.lower():
-                        cat_name = cat["name"]
-                        is_productive = cat.get("is_productive")
-                        break
-            print(f"[correction] Exact match: '{match['window_title'][:40]}' -> {cat_name} (skipping LLM)")
-            return {
-                "final_category_name": cat_name,
-                "final_is_productive": is_productive,
-                "final_off": 0.0 if is_productive else 1.0,
-                "final_conf": 1.0,
-                "final_reason": f"User correction: was {match['ai_category']}, corrected to {cat_name}",
-                "final_align": None,
-                "vision_ran": False,
-                "primary": {"category_name": cat_name, "is_productive": is_productive,
-                            "off": 0.0, "conf": 1.0, "reason": "user correction"},
-                "vision": None,
-            }
+        correction = _match_correction(events_context[-1][1], corrections)
+    if correction and intention is None:
+        cat_name, is_productive = _resolve_category(correction["corrected_category"], categories)
+        print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name} (skipping LLM)")
+        return {
+            "final_category_name": cat_name,
+            "final_is_productive": is_productive,
+            "final_off": 0.0 if is_productive else 1.0,
+            "final_conf": 1.0,
+            "final_reason": f"User correction: was {correction['ai_category']}, corrected to {cat_name}",
+            "final_align": None,
+            "vision_ran": False,
+            "primary": {"category_name": cat_name, "is_productive": is_productive,
+                        "off": 0.0, "conf": 1.0, "reason": "user correction"},
+            "vision": None,
+        }
 
     # --- 2. System window shortcut ---
     if events_context and _is_system_window(events_context[-1][1]):
@@ -667,9 +682,15 @@ def decide(
         }
 
     # --- 2.5. Session cache: same window classified recently? ---
+    # A cached entry that disagrees with a (possibly newer) correction is
+    # stale — bypass it so the correction wins within one decision, matching
+    # the no-intention path where corrections are checked before the cache.
     if events_context:
         cached = _cache_get(events_context[-1][1], intention_id)
-        if cached is not None:
+        if cached is not None and (
+            correction is None
+            or cached.get("final_category_name", "").lower() == correction["corrected_category"].lower()
+        ):
             print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
             result = dict(cached)
             result["final_reason"] = f"[cache] {cached.get('final_reason', '')}"
@@ -716,6 +737,26 @@ def decide(
         }
         if current_window:
             _cache_put(current_window, result, intention_id)
+        return result
+
+    # --- 3.5. Correction with an active session: pin category, keep ALIGN ---
+    # The LLM ran only to score alignment against the intention; its category
+    # choice is discarded in favor of the user's correction. Vision is skipped
+    # — it exists to verify the category, which is human-pinned here.
+    if correction:
+        cat_name, is_productive = _resolve_category(correction["corrected_category"], categories)
+        align_note = " (ALIGN scored by LLM)" if p1_align is not None else ""
+        print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name}"
+              f" (category pinned{align_note})")
+        result = mk_ret(
+            cat_name, is_productive, 0.0 if is_productive else 1.0, 1.0,
+            f"User correction: was {correction['ai_category']}, corrected to {cat_name}{align_note}",
+            False, align=p1_align,
+        )
+        # mk_ret's cache gate skips categories like Ambiguous; pin corrected
+        # decisions regardless so the align call isn't repeated for 10 minutes.
+        if current_window:
+            _cache_put(current_window, result, intention_id, force=True)
         return result
 
     # Primary errored
