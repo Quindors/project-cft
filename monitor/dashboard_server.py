@@ -28,6 +28,10 @@ Endpoints:
     POST /api/category/update   -> {name, new_name?, description?, is_productive?}
                                    edits a category; a rename cascades to
                                    focus_logs.category_name / human_label
+    POST /api/category/delete   -> {name, reassign_to?} deletes a category and
+                                   moves its logged rows to reassign_to
+                                   (default "Ambiguous"); Ambiguous/System are
+                                   protected because the classifier needs them
     POST /api/intention         -> {text, duration_min} starts a session intention
                                    (supersedes any active one)
     POST /api/intention/end     -> {status?: completed|abandoned} ends the active one
@@ -267,6 +271,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/correct": self._post_correct,
             "/api/category": self._post_category_add,
             "/api/category/update": self._post_category_update,
+            "/api/category/delete": self._post_category_delete,
         }
         handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
@@ -379,6 +384,59 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         supa_mirror.mirror_category_add(name, description, None if productive is None else bool(productive))
         self._send_json({"ok": True, "name": name})
 
+    # The classifier's mandated fallback: prompt-main.txt instructs the LLM to
+    # default here, and decider tags system windows "System". Deleting either
+    # would leave the monitor unable to name its own output.
+    _UNDELETABLE = {"ambiguous", "system"}
+
+    def _post_category_delete(self, conn, body) -> None:
+        """Delete a category, moving any logged rows to `reassign_to`.
+
+        Rows keep their history rather than being deleted: the default target
+        is "Ambiguous" (the catch-all), and human_label follows too, exactly
+        like a rename cascade.
+        """
+        name = (body.get("name") or "").strip()
+        row = conn.execute(
+            "SELECT name FROM categories WHERE name = ? COLLATE NOCASE", (name,)
+        ).fetchone()
+        if row is None:
+            self._send_json({"error": f"no category named {name!r}"}, status=404)
+            return
+        name = row["name"]  # exact casing
+
+        if name.lower() in self._UNDELETABLE:
+            self._send_json(
+                {"error": f"{name!r} is required by the classifier and cannot be deleted"},
+                status=400,
+            )
+            return
+
+        target = (body.get("reassign_to") or "Ambiguous").strip()
+        target_row = conn.execute(
+            "SELECT name FROM categories WHERE name = ? COLLATE NOCASE", (target,)
+        ).fetchone()
+        if target_row is None:
+            self._send_json({"error": f"no category named {target!r} to reassign to"}, status=400)
+            return
+        target = target_row["name"]
+        if target.lower() == name.lower():
+            self._send_json({"error": "cannot reassign a category to itself"}, status=400)
+            return
+
+        moved = conn.execute(
+            "UPDATE focus_logs SET category_name = ? WHERE category_name = ?", (target, name)
+        ).rowcount
+        moved += conn.execute(
+            "UPDATE focus_logs SET human_label = ? WHERE human_label = ?", (target, name)
+        ).rowcount
+        conn.execute("DELETE FROM categories WHERE name = ?", (name,))
+        conn.commit()
+
+        supa_mirror.mirror_category_delete(name, target)
+        self._send_json({"ok": True, "deleted": name, "reassigned_to": target,
+                         "moved_log_rows": moved})
+
     def _post_category_update(self, conn, body) -> None:
         name = (body.get("name") or "").strip()
         row = conn.execute(
@@ -449,6 +507,10 @@ _INTENTION_PAGE = """<!doctype html>
   .durations button { padding: 6px 14px; border-radius: 999px; border: 1px solid #8886;
                       background: transparent; color: inherit; cursor: pointer; }
   .durations button.sel { background: #10b981; border-color: #10b981; color: #fff; }
+  #custom { width: 5.5em; padding: 6px 8px; border-radius: 8px; font: inherit;
+            border: 1px solid #8884; background: transparent; color: inherit; }
+  #custom.bad { border-color: #ef4444; }
+  .customrow { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; }
   .primary { width: 100%; padding: 10px; border-radius: 8px; border: none;
              background: #10b981; color: #fff; font: inherit; cursor: pointer; }
   .secondary { padding: 8px 14px; border-radius: 8px; border: 1px solid #8886;
@@ -465,6 +527,8 @@ _INTENTION_PAGE = """<!doctype html>
 <p id="err"></p>
 <script>
 let duration = 45;
+// Mirrors the monitor's own validation (monitor/intentions.py).
+const MIN_MIN = __MIN_MIN__, MAX_MIN = __MAX_MIN__;
 async function load() {
   const r = await fetch('/api/intention');
   const d = await r.json();
@@ -485,6 +549,13 @@ async function load() {
       <div class="durations">
         ${[15,25,45,60,90].map(m =>
           `<button onclick="pick(${m},this)" class="${m===duration?'sel':''}">${m}m</button>`).join('')}
+        <button onclick="pick('custom',this)" class="${duration==='custom'?'sel':''}">Custom</button>
+      </div>
+      <div class="customrow" id="customrow" style="display:${duration==='custom'?'flex':'none'}">
+        <input id="custom" type="number" min="${MIN_MIN}" max="${MAX_MIN}" placeholder="120"
+               aria-label="Custom session length in minutes"
+               oninput="markCustom()" onkeydown="if(event.key==='Enter')start()">
+        <span class="muted">minutes (${MIN_MIN}-${MAX_MIN})</span>
       </div>
       <button class="primary" onclick="start()">Start session</button>`;
   }
@@ -493,10 +564,31 @@ function pick(m, el) {
   duration = m;
   document.querySelectorAll('.durations button').forEach(b => b.classList.remove('sel'));
   el.classList.add('sel');
+  const row = document.getElementById('customrow');
+  row.style.display = (m === 'custom') ? 'flex' : 'none';
+  if (m === 'custom') document.getElementById('custom').focus();
+}
+function customMinutes() {
+  const raw = (document.getElementById('custom') || {}).value;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= MIN_MIN && n <= MAX_MIN ? n : null;
+}
+function markCustom() {
+  const el = document.getElementById('custom');
+  el.classList.toggle('bad', el.value !== '' && customMinutes() === null);
 }
 async function start() {
   const text = document.getElementById('text').value;
-  await post('/api/intention', {text, duration_min: duration});
+  let mins = duration;
+  if (duration === 'custom') {
+    mins = customMinutes();
+    if (mins === null) {
+      document.getElementById('err').textContent =
+        `Enter a length between ${MIN_MIN} and ${MAX_MIN} minutes.`;
+      return;
+    }
+  }
+  await post('/api/intention', {text, duration_min: mins});
 }
 async function end(status) { await post('/api/intention/end', {status}); }
 async function post(url, body) {
@@ -512,7 +604,8 @@ load();
 </script>
 </body>
 </html>
-"""
+""".replace("__MIN_MIN__", str(intentions.MIN_DURATION_MIN)) \
+   .replace("__MAX_MIN__", str(intentions.MAX_DURATION_MIN))
 
 
 class _Server(socketserver.ThreadingTCPServer):

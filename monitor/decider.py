@@ -302,7 +302,10 @@ def _intention_block(intention: Dict) -> str:
         f'ACTIVE FOCUS SESSION (until {intention["ends_at"]}):\n'
         f'The user declared: "{intention["text"]}"\n\n'
         "In addition to the category, judge how well the CURRENT WINDOW serves this "
-        "declared session intention. Append one extra field to the output line:\n"
+        "declared session intention. Add ALIGN as an extra field placed BEFORE "
+        "REASON, so REASON stays last:\n"
+        "CATEGORY=... | OFF_SCORE=... | CONF=... | ALIGN=<0.0-1.0> | REASON=...\n"
+        "Output that one line only — no commentary after it.\n"
         "ALIGN=<0.0-1.0> where:\n"
         "- 0.8-1.0: directly doing the declared work\n"
         "- 0.5-0.7: adjacent/supporting activity (docs, research, tooling for it)\n"
@@ -393,9 +396,16 @@ def _parse_llm_line(
     off_score = min(max(off_score, 0.0), 1.0)
     conf = min(max(conf, 0.0), 1.0)
 
-    # Extract REASON
+    # Extract REASON. It is the last field, so the capture runs to the end of
+    # the response — trim anything the model tacked on after it: a further
+    # pipe-delimited field (e.g. "| ALIGN=0.1") or a trailing essay separated
+    # by a blank line ("**Explanation of ALIGN=0.1:** ...").
     m_reason = re.search(r"REASON\s*=\s*(.+)", content, flags=re.I | re.S)
-    reason = m_reason.group(1).strip() if m_reason else ""
+    if m_reason:
+        reason = re.split(r"\s*\|\s*[A-Z_]{3,}\s*=", m_reason.group(1))[0]
+        reason = reason.split("\n\n")[0].strip()
+    else:
+        reason = ""
 
     # Look up category in list
     is_productive = None

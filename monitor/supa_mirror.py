@@ -83,6 +83,21 @@ def mirror_category_add(name: str, description: str, is_productive) -> None:
     _run_async("category-add", op)
 
 
+def mirror_category_delete(name: str, reassign_to: str) -> None:
+    """Mirror a category delete; logged rows move to reassign_to like locally."""
+    if not enabled():
+        return
+
+    def op(sb):
+        # Reassign first: deleting the category before its rows move would
+        # leave orphaned category_name values upstream if the update failed.
+        sb.table("focus_logs").update({"category_name": reassign_to}).eq("category_name", name).execute()
+        sb.table("focus_logs").update({"human_label": reassign_to}).eq("human_label", name).execute()
+        sb.table("categories").delete().eq("name", name).execute()
+
+    _run_async("category-delete", op)
+
+
 def mirror_category_update(old_name: str, new_name: str, description: str, is_productive) -> None:
     """Mirror a category edit; renames cascade to focus_logs like locally."""
     if not enabled():
