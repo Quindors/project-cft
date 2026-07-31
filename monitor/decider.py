@@ -748,12 +748,26 @@ def decide(
         align_note = " (ALIGN scored by LLM)" if p1_align is not None else ""
         print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name}"
               f" (category pinned{align_note})")
-        result = mk_ret(
-            cat_name, is_productive, 0.0 if is_productive else 1.0, 1.0,
-            f"User correction: was {correction['ai_category']}, corrected to {cat_name}{align_note}",
-            False, align=p1_align,
-        )
-        # mk_ret's cache gate skips categories like Ambiguous; pin corrected
+        reason = f"User correction: was {correction['ai_category']}, corrected to {cat_name}{align_note}"
+        result = {
+            "final_category_name": cat_name,
+            "final_is_productive": is_productive,
+            "final_off": 0.0 if is_productive else 1.0,
+            "final_conf": 1.0,
+            "final_reason": reason,
+            "final_align": p1_align,
+            "vision_ran": False,
+            # Report the human correction as the primary, not the LLM call we
+            # made only to score ALIGN — sinks log primary conf/reason, and the
+            # rejected category's reasoning would misexplain the pinned one.
+            "primary": {"category_name": cat_name, "is_productive": is_productive,
+                        "off": 0.0, "conf": 1.0, "reason": "user correction",
+                        "align": p1_align},
+            "vision": None,
+            # Keep what the LLM would have said, for accuracy analysis.
+            "align_primary": primary_res,
+        }
+        # The normal cache gate skips categories like Ambiguous; pin corrected
         # decisions regardless so the align call isn't repeated for 10 minutes.
         if current_window:
             _cache_put(current_window, result, intention_id, force=True)
