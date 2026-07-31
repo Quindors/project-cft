@@ -14,10 +14,26 @@ if getattr(sys, "frozen", False):
     sys.stdout = _log
     sys.stderr = _log
 
-from monitor.app import run, run_dashboard_only
-
 if __name__ == "__main__":
-    if "--dashboard" in sys.argv[1:]:
+    args = sys.argv[1:]
+
+    if "--install-autostart" in args or "--uninstall-autostart" in args:
+        # Register/remove the logon+unlock scheduled task, then exit.
+        from monitor.autostart import install_task, uninstall_task
+        ok = install_task() if "--install-autostart" in args else uninstall_task()
+        sys.exit(0 if ok else 1)
+
+    if getattr(sys, "frozen", False):
+        # The task retriggers on every unlock; the mutex keeps that (and manual
+        # double-launches) from stacking a second monitor onto the same DB.
+        from monitor.autostart import acquire_single_instance
+        if not acquire_single_instance():
+            print("[cft] another instance is already running; exiting.")
+            sys.exit(0)
+
+    from monitor.app import run, run_dashboard_only
+
+    if "--dashboard" in args:
         # Dashboard + corrections only; no monitoring, no LLM, no API key needed.
         run_dashboard_only()
     else:

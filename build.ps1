@@ -90,7 +90,7 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 if ($envBackup) {
     # Strip a BOM a previous buggy restore may have baked into the backup.
     $envBackup = $envBackup.TrimStart([char]0xFEFF)
-    [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').Path + '\.env', $envBackup, $utf8NoBom)
+    [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').ProviderPath + '\.env', $envBackup, $utf8NoBom)
     Write-Host "[env ] restored dist\cft\.env"
 } elseif (Test-Path '.\.env') {
     # Fresh build: seed DASHBOARD_URL from the dev .env so the hosted (Vercel)
@@ -98,7 +98,7 @@ if ($envBackup) {
     # first launch and appended by the app itself.
     $dash = (Select-String -Path '.\.env' -Pattern '^DASHBOARD_URL=').Line
     if ($dash) {
-        [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').Path + '\.env', "$dash`n", $utf8NoBom)
+        [System.IO.File]::WriteAllText((Resolve-Path '.\dist\cft').ProviderPath + '\.env', "$dash`n", $utf8NoBom)
         Write-Host "[env ] seeded dist\cft\.env with $dash"
     }
 }
