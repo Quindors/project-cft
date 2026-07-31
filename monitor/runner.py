@@ -94,10 +94,13 @@ def _run_live_loop(
     waiting_logged = False
 
     # Session-intention drift tracking. While an intention is active the
-    # generic off-task popup is replaced by a dwell-based alert: only
-    # sustained off-intention time (settings.intention.dwell_sec) triggers it.
+    # generic off-task popup is replaced by a dwell-based alert: only a
+    # sustained run in the same drift tier (off-intent, or the more patient
+    # partial-intent) earns one. drift_tier is the tier being timed; the
+    # timer restarts whenever the tier changes.
     current_intention_id: Optional[int] = None
-    off_intention_since: Optional[float] = None
+    drift_tier: Optional[str] = None
+    drift_since: Optional[float] = None
     last_drift_alert: Optional[float] = None
 
     # Monitor mode (dashboard toggle applies live). Tracking always runs;
@@ -195,7 +198,8 @@ def _run_live_loop(
                 new_id = intention["id"] if intention else None
                 if new_id != current_intention_id:
                     current_intention_id = new_id
-                    off_intention_since = None
+                    drift_tier = None
+                    drift_since = None
                     last_drift_alert = None
                     if intention:
                         print(f"[runner] session intention active: \"{intention['text']}\" until {intention['ends_at']}")
@@ -215,7 +219,7 @@ def _run_live_loop(
                 print(f"[runner] LLM pipeline took {llm_time:.2f}s (vision_ran={decision.get('vision_ran', False)})")
 
                 # Log to console
-                _log_decision(decision)
+                _log_decision(decision, settings)
 
                 # Error verdicts (LLM/parse failures) are transient noise, not
                 # activity — keep them out of the log entirely.
@@ -238,26 +242,31 @@ def _run_live_loop(
                 # With an active intention: dwell-based drift alert.
                 # Without: the original immediate off-task popup.
                 if not alerts_enabled:
-                    off_intention_since = None
+                    drift_tier, drift_since = None, None
                 elif intention is not None:
-                    off_intention = _is_off_intention(decision, settings)
-                    if off_intention:
-                        if off_intention_since is None:
-                            off_intention_since = time.time()
-                        dwell = time.time() - off_intention_since
+                    tier = _intent_tier(decision, settings)
+                    if tier == INTENT_ON:
+                        drift_tier, drift_since = None, None
+                    else:
+                        # A tier change restarts the clock: 3 minutes of
+                        # partial-intent followed by off-intent is not 3
+                        # minutes of off-intent.
+                        if tier != drift_tier:
+                            drift_tier, drift_since = tier, time.time()
+                        dwell = time.time() - drift_since
                         due = (
-                            dwell >= settings.intention.dwell_sec
+                            dwell >= _dwell_for(tier, settings)
                             and (last_drift_alert is None
                                  or (time.time() - last_drift_alert) >= settings.intention.realert_sec)
                         )
                         if due and settings.popup.enabled:
                             cat_name = decision.get("final_category_name", "Unknown")
-                            msg = (f"Off-intention for {int(dwell // 60)}m ({cat_name})\n"
+                            lead = ("Off-intent" if tier == INTENT_OFF
+                                    else "Only loosely related to your session")
+                            msg = (f"{lead} for {int(dwell // 60)}m ({cat_name})\n"
                                    f"Session: {intention['text']}")
                             show_popup(msg, "Focus Alert")
                             last_drift_alert = time.time()
-                    else:
-                        off_intention_since = None
                 elif decision.get("final_is_productive") is False and settings.popup.enabled:
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
@@ -469,21 +478,38 @@ def _run_trace_loop(
 
 # --------------- helpers ---------------
 
-def _is_off_intention(decision: Dict[str, Any], settings: Settings) -> bool:
-    """Is this decision drifting from the active session intention?
+INTENT_ON = "on-intent"
+INTENT_PARTIAL = "partial-intent"
+INTENT_OFF = "off-intent"
+
+
+def _intent_tier(decision: Dict[str, Any], settings: Settings) -> str:
+    """How well does this decision serve the active session intention?
+
+    Returns INTENT_ON / INTENT_PARTIAL / INTENT_OFF.
 
     ALIGN is authoritative when the LLM produced it; the shortcut paths
-    (corrections, cache of pre-intention decisions, System) have no ALIGN and
-    fall back to the category's productivity. System/neutral never counts as
-    drift.
+    (system windows, cached pre-intention decisions) have no ALIGN and fall
+    back to the category's productivity. System/neutral never counts as drift.
     """
+    cfg = settings.intention
     align = decision.get("final_align")
-    if align is not None:
-        return align < settings.intention.align_threshold
-    return decision.get("final_is_productive") is False
+    if align is None:
+        return INTENT_OFF if decision.get("final_is_productive") is False else INTENT_ON
+    if align >= cfg.on_intent_min:
+        return INTENT_ON
+    if align >= cfg.off_intent_max:
+        return INTENT_PARTIAL
+    return INTENT_OFF
 
 
-def _log_decision(decision: Dict[str, Any]) -> None:
+def _dwell_for(tier: str, settings: Settings) -> float:
+    """Seconds of continuous drift in `tier` before it earns an alert."""
+    return (settings.intention.partial_dwell_sec if tier == INTENT_PARTIAL
+            else settings.intention.dwell_sec)
+
+
+def _log_decision(decision: Dict[str, Any], settings: Optional[Settings] = None) -> None:
     """Print decision to console."""
     cat_name = decision.get("final_category_name", "Unknown")
     is_productive = decision.get("final_is_productive")
@@ -494,7 +520,12 @@ def _log_decision(decision: Dict[str, Any]) -> None:
 
     p_emoji = "✓" if is_productive else "✗"
     v_emoji = "🔍" if vision_ran else "  "
-    align_str = f" align={align:.2f}" if align is not None else ""
+    if align is None:
+        align_str = ""
+    elif settings is not None:
+        align_str = f" {_intent_tier(decision, settings)}={align:.2f}"
+    else:
+        align_str = f" align={align:.2f}"
     print(f"[runner] {v_emoji} {p_emoji} {cat_name} (conf={conf:.2f}{align_str})")
     print(f"[runner]   {reason}")
 

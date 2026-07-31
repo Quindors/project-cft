@@ -18,6 +18,8 @@ Endpoints:
     GET  /api/categories        -> [{name, description, is_productive}, ...]
     GET  /api/focus?since=<ts>  -> [{timestamp, category_name, confidence}, ...]
     GET  /api/events?limit=<n>  -> recent rows with id/current_window/human_label,
+                                   plus intention_id/align_score (0-1 intent
+                                   alignment, null outside a focus session),
                                    for the dashboard's review (re-classify) tab
     GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null}
     POST /api/correct           -> {id, human_label} sets a human correction on a
@@ -239,7 +241,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     limit = 100
                 rows = conn.execute(
                     "SELECT id, timestamp, current_window, category_name, confidence, "
-                    "human_label, reason FROM focus_logs "
+                    "human_label, reason, intention_id, align_score FROM focus_logs "
                     "WHERE current_window IS NOT NULL "
                     "ORDER BY timestamp DESC LIMIT ?",
                     (limit,),

@@ -25,11 +25,21 @@ class IntentionSettings:
     """Alerting behavior while a session intention is active.
 
     During a declared session the generic off-task popup is replaced by a
-    dwell-based drift alert: only sustained off-intention time triggers it.
+    dwell-based drift alert. Activity falls into three intent tiers by its
+    ALIGN score, and each tier gets its own patience:
+
+      on-intent      >= on_intent_min   doing the declared work; never alerts
+      partial-intent >= off_intent_max  loosely related (supporting work,
+                                        adjacent research) — alerts only after
+                                        a long stretch, since this is often
+                                        legitimate work that drifted sideways
+      off-intent     <  off_intent_max  unrelated; alerts on the short dwell
     """
-    align_threshold: float = 0.5   # final_align below this counts as off-intention
-    dwell_sec: float = 120.0       # continuous off-intention time before alerting
-    realert_sec: float = 300.0     # minimum gap between drift alerts
+    on_intent_min: float = 0.7      # ALIGN at/above this is on-intent
+    off_intent_max: float = 0.5     # ALIGN below this is off-intent
+    dwell_sec: float = 120.0        # continuous off-intent time before alerting
+    partial_dwell_sec: float = 600.0  # ... and the longer fuse for partial-intent
+    realert_sec: float = 300.0      # minimum gap between drift alerts
 
 
 @dataclass(frozen=True)
