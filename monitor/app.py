@@ -98,14 +98,19 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
     # The intention page is always served by the local API, not the hosted site.
     intention_url = (local_url.rstrip("/") + "/intention") if local_url else None
 
-    # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0).
+    # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0),
+    # but only if one isn't already open — the autostart task relaunches this
+    # exe at every logon, and a fresh tab each time piles up. Deferred to a
+    # thread because deciding waits for an open page to poll the API.
     if dashboard_url and os.getenv("CFT_OPEN_DASHBOARD", "1").strip().lower() not in ("0", "false", "no"):
-        try:
-            import webbrowser
-            webbrowser.open(dashboard_url)
-            print(f"[boot] opened dashboard in browser")
-        except Exception as e:
-            print(f"[boot] could not auto-open dashboard ({e})")
+        def _open_when_absent():
+            try:
+                from monitor.browser import open_dashboard_if_absent
+                open_dashboard_if_absent(dashboard_url)
+            except Exception as e:
+                print(f"[boot] could not auto-open dashboard ({e})")
+
+        threading.Thread(target=_open_when_absent, daemon=True, name="open-dashboard").start()
 
     try:
         from monitor.tray import start_tray

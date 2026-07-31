@@ -11,7 +11,7 @@ from __future__ import annotations
 import webbrowser
 from typing import Callable, Optional
 
-from monitor import intentions
+from monitor import browser, intentions
 
 
 def _icon_image():
@@ -54,8 +54,10 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
         return None
 
     def _open(icon, item):
+        # Raise the dashboard if it's already open in a window; only open a new
+        # tab when there is nothing to raise (the user asked to see it now).
         if dashboard_url:
-            webbrowser.open(dashboard_url)
+            browser.open_dashboard(dashboard_url)
 
     def _start_session(icon, item):
         if intention_url:

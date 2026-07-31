@@ -58,6 +58,7 @@ import os
 import socketserver
 import sqlite3
 import threading
+import time
 from datetime import datetime
 from typing import Optional, Set
 from urllib.parse import urlparse, parse_qs
@@ -72,6 +73,17 @@ DEFAULT_API_PORT = 47113
 
 # Set by start_local_server(): the bundled dashboard dir, or None if not bundled.
 _STATIC_ROOT: Optional[str] = None
+
+# When a dashboard page last read from this API. The page polls every few
+# seconds, so a recent read means one is open somewhere — including a pinned
+# or background tab, which no window-title search can find. monitor/browser.py
+# uses this to avoid opening a second tab.
+_last_client_seen: float = 0.0
+
+
+def client_seen_within(seconds: float) -> bool:
+    """True if a dashboard page read from this API in the last `seconds`."""
+    return _last_client_seen > 0.0 and (time.time() - _last_client_seen) <= seconds
 
 
 def _api_port() -> int:
@@ -187,6 +199,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _handle_api(self) -> None:
+        global _last_client_seen
+        _last_client_seen = time.time()  # a dashboard page is alive out there
         u = urlparse(self.path)
         qs = parse_qs(u.query)
 
