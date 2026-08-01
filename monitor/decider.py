@@ -313,7 +313,20 @@ def _intention_block(intention: Dict) -> str:
         "- 0.0-0.1: clearly off-task\n"
         "Judge alignment by content, not platform: a video or article on the declared "
         "topic is aligned; unrelated productive work is not. ALIGN is independent of "
-        "CATEGORY — an activity can be a productive category with low ALIGN."
+        "CATEGORY — an activity can be a productive category with low ALIGN.\n\n"
+        "THE DECLARED INTENTION ALSO OUTRANKS PLATFORM-BASED CATEGORY RULES.\n"
+        "Category rules that name a site (Reddit -> Social Media, YouTube -> "
+        "Entertainment, and so on) describe the DEFAULT use of that site. When the "
+        "content on screen is plainly about the declared intention, it is work on that "
+        "intention: choose the productive category that fits the work, not the site's "
+        "default off-task category. Examples, with the session intention in brackets:\n"
+        "- \"r/ApplyingToCollege\" [applying to college] -> the college-application "
+        "category, NOT Social Media — it is a forum about the declared task.\n"
+        "- \"How to write a personal statement - YouTube\" [applying to college] -> "
+        "the college-application category, NOT Entertainment.\n"
+        "- \"r/nba\" [applying to college] -> Social Media, as usual: unrelated content.\n"
+        "Apply the site's default off-task category only when the content is unrelated "
+        "to the declared intention."
     )
 
 

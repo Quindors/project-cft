@@ -244,20 +244,17 @@ def _run_live_loop(
                 if not alerts_enabled:
                     drift_tier, drift_since = None, None
                 elif intention is not None:
+                    now_t = time.time()
                     tier = _intent_tier(decision, settings)
-                    if tier == INTENT_ON:
-                        drift_tier, drift_since = None, None
-                    else:
-                        # A tier change restarts the clock: 3 minutes of
-                        # partial-intent followed by off-intent is not 3
-                        # minutes of off-intent.
-                        if tier != drift_tier:
-                            drift_tier, drift_since = tier, time.time()
-                        dwell = time.time() - drift_since
+                    drift_tier, drift_since = _update_drift(tier, drift_tier, drift_since, now_t)
+                    # Alert only on a decision that is itself drift, so the
+                    # popup never names a System window as the culprit.
+                    if tier in (INTENT_OFF, INTENT_PARTIAL) and drift_since is not None:
+                        dwell = now_t - drift_since
                         due = (
-                            dwell >= _dwell_for(tier, settings)
+                            dwell >= _dwell_for(drift_tier, settings)
                             and (last_drift_alert is None
-                                 or (time.time() - last_drift_alert) >= settings.intention.realert_sec)
+                                 or (now_t - last_drift_alert) >= settings.intention.realert_sec)
                         )
                         if due and settings.popup.enabled:
                             cat_name = decision.get("final_category_name", "Unknown")
@@ -266,7 +263,7 @@ def _run_live_loop(
                             msg = (f"{lead} for {int(dwell // 60)}m ({cat_name})\n"
                                    f"Session: {intention['text']}")
                             show_popup(msg, "Focus Alert")
-                            last_drift_alert = time.time()
+                            last_drift_alert = now_t
                 elif decision.get("final_is_productive") is False and settings.popup.enabled:
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
@@ -481,21 +478,30 @@ def _run_trace_loop(
 INTENT_ON = "on-intent"
 INTENT_PARTIAL = "partial-intent"
 INTENT_OFF = "off-intent"
+# No evidence either way (a System window, a neutral category with no ALIGN).
+# Distinct from on-intent: alt-tabbing past the tray for one decision is not
+# evidence you returned to your session, so it must not clear a drift streak.
+INTENT_UNKNOWN = "no-signal"
 
 
 def _intent_tier(decision: Dict[str, Any], settings: Settings) -> str:
     """How well does this decision serve the active session intention?
 
-    Returns INTENT_ON / INTENT_PARTIAL / INTENT_OFF.
+    Returns INTENT_ON / INTENT_PARTIAL / INTENT_OFF / INTENT_UNKNOWN.
 
     ALIGN is authoritative when the LLM produced it; the shortcut paths
     (system windows, cached pre-intention decisions) have no ALIGN and fall
-    back to the category's productivity. System/neutral never counts as drift.
+    back to the category's productivity, with neutral meaning "no signal".
     """
     cfg = settings.intention
     align = decision.get("final_align")
     if align is None:
-        return INTENT_OFF if decision.get("final_is_productive") is False else INTENT_ON
+        productive = decision.get("final_is_productive")
+        if productive is False:
+            return INTENT_OFF
+        if productive is True:
+            return INTENT_ON
+        return INTENT_UNKNOWN
     if align >= cfg.on_intent_min:
         return INTENT_ON
     if align >= cfg.off_intent_max:
@@ -507,6 +513,22 @@ def _dwell_for(tier: str, settings: Settings) -> float:
     """Seconds of continuous drift in `tier` before it earns an alert."""
     return (settings.intention.partial_dwell_sec if tier == INTENT_PARTIAL
             else settings.intention.dwell_sec)
+
+
+def _update_drift(tier: str, drift_tier, drift_since, now: float):
+    """Advance the drift streak by one decision -> (drift_tier, drift_since).
+
+    - on-intent clears the streak (you came back)
+    - no-signal holds it unchanged (a System blip is not coming back)
+    - a different drift tier restarts the clock
+    """
+    if tier == INTENT_UNKNOWN:
+        return drift_tier, drift_since
+    if tier == INTENT_ON:
+        return None, None
+    if tier != drift_tier:
+        return tier, now
+    return drift_tier, drift_since
 
 
 def _log_decision(decision: Dict[str, Any], settings: Optional[Settings] = None) -> None:
