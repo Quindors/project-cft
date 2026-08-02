@@ -313,7 +313,12 @@ def _intention_block(intention: Dict) -> str:
         "- 0.0-0.1: clearly off-task\n"
         "Judge alignment by content, not platform: a video or article on the declared "
         "topic is aligned; unrelated productive work is not. ALIGN is independent of "
-        "CATEGORY — an activity can be a productive category with low ALIGN.\n\n"
+        "CATEGORY — an activity can be a productive category with low ALIGN.\n"
+        "ALIGN IS NOT A PRODUCTIVITY SCORE. Focused, skilled work on a DIFFERENT "
+        "project scores LOW (0.0-0.3) — drifting into other good work is exactly what "
+        "a focus session exists to catch. Declared \"finish my personal statement\" "
+        "while composing music in MuseScore -> ALIGN 0.05, even though composing is "
+        "real work and keeps its own productive category.\n\n"
         "THE DECLARED INTENTION ALSO OUTRANKS PLATFORM-BASED CATEGORY RULES.\n"
         "Category rules that name a site (Reddit -> Social Media, YouTube -> "
         "Entertainment, and so on) describe the DEFAULT use of that site. When the "
@@ -326,7 +331,9 @@ def _intention_block(intention: Dict) -> str:
         "the college-application category, NOT Entertainment.\n"
         "- \"r/nba\" [applying to college] -> Social Media, as usual: unrelated content.\n"
         "Apply the site's default off-task category only when the content is unrelated "
-        "to the declared intention."
+        "to the declared intention. This paragraph is about CATEGORY only — it never "
+        "raises ALIGN. An activity can take a productive category and still score "
+        "near 0 for alignment."
     )
 
 
@@ -509,8 +516,38 @@ def ask_gpt_vision_verdict(
     else:
         category_list = "(no categories available)"
 
-    prompt = f"""You are reviewing a window-title-based classification using the screen contents as ground truth.
+    # With a session active the intention has to frame the whole judgment, not
+    # trail the output spec: this call sees the screen, so it is the one that
+    # decides ALIGN, and it must not read "productive" as "aligned".
+    if intention:
+        intent_header = (
+            f'\nACTIVE FOCUS SESSION — the user declared: "{intention["text"]}"\n'
+        )
+        align_field = " | ALIGN=<0.0-1.0>"
+        intent_rules = f"""
+ALSO SCORE ALIGN — how well the screen serves that declared intention.
 
+ALIGN IS NOT A PRODUCTIVITY SCORE. It answers one question: is this the work
+they said they would do? Judge it separately from CATEGORY.
+  0.8-1.0  the screen shows the declared work itself
+  0.5-0.7  supporting work for it (research, tooling, notes for that task)
+  0.2-0.4  real, focused work — but on something else
+  0.0-0.1  unrelated to the declared intention
+
+Skilled, productive, deeply-focused work on a DIFFERENT project scores LOW.
+Drifting into other good work is the exact thing a focus session exists to
+catch, so do not rescue it with a high ALIGN.
+  - Declared "finish my personal statement", screen shows a music score being
+    composed in MuseScore -> ALIGN 0.05. Composing is real work; it is not
+    the declared work. (CATEGORY is still the composing category.)
+  - Declared "finish my personal statement", screen shows that essay in Google
+    Docs -> ALIGN 0.95.
+"""
+    else:
+        intent_header = align_field = intent_rules = ""
+
+    prompt = f"""You are reviewing a window-title-based classification using the screen contents as ground truth.
+{intent_header}
 AVAILABLE CATEGORIES:
 {category_list}
 
@@ -544,12 +581,9 @@ OVERRIDE RULES (asymmetric — direction matters):
 
 DEFAULT BEHAVIOR — AGREE WITH PRIMARY:
   If the screenshot is unclear, low-resolution, shows a lock/idle screen, doesn't show a recognizable activity, or is consistent with the primary's call — AGREE. Do not override on uncertainty. The primary's window-title evidence stands.
-
+{intent_rules}
 Output format (strict, single line):
-CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0> | REASON=<brief explanation citing what you saw on screen>"""
-
-    if intention:
-        prompt = prompt + "\n\n" + _intention_block(intention)
+CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0>{align_field} | REASON=<brief explanation citing what you saw on screen>"""
 
     try:
         resp = _client().chat.completions.create(
