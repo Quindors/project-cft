@@ -193,6 +193,27 @@ def _match_correction(current_window: str, corrections: List[Dict]) -> Optional[
     return None
 
 
+# Words that say WHERE something happened, not WHAT it was: browser and app
+# chrome, plus generic window furniture. Two windows sharing only these are
+# not similar — "Claude" and "Common App activities list - Claude - Google
+# Chrome" overlap on the app name alone, which is no evidence at all.
+_APP_CHROME_WORDS = {
+    "google", "chrome", "firefox", "edge", "safari", "brave", "opera", "arc",
+    "microsoft", "windows", "app", "desktop", "window", "tab", "new", "untitled",
+    "claude", "chatgpt", "gpt", "gemini", "copilot", "perplexity",
+    "visual", "studio", "vscode", "profile", "home", "file", "edit", "view",
+}
+
+
+def _content_words(title: str) -> set:
+    """Topic-bearing words of a window title, with app/browser chrome removed."""
+    s = title.strip()
+    if s.upper().startswith("WIN:"):
+        s = s[4:]
+    words = re.findall(r"[a-z0-9']+", s.lower())
+    return {w for w in words if len(w) > 1 and w not in _APP_CHROME_WORDS}
+
+
 def _build_fewshot_prompt(
     current_window: str,
     corrections: List[Dict],
@@ -202,15 +223,14 @@ def _build_fewshot_prompt(
     """Build a few-shot prompt section from corrections AND prior classifications.
 
     Human corrections take priority. Prior classifications fill remaining slots,
-    scored by keyword overlap with the current window.
+    scored by CONTENT-word overlap with the current window: matching on the app
+    name alone pulled in examples about unrelated topics, and the model then
+    cited the example's subject as if it described the current window.
     """
     if not corrections and not prior_classifications:
         return ""
 
-    clean = current_window.strip()
-    if clean.upper().startswith("WIN:"):
-        clean = clean[4:]
-    current_words = set(clean.lower().split())
+    current_words = _content_words(current_window)
 
     # --- Collect correction examples (highest priority) ---
     correction_lines = []
@@ -219,8 +239,7 @@ def _build_fewshot_prompt(
     if corrections:
         scored = []
         for c in corrections:
-            corr_words = set(c["window_title"].lower().split())
-            overlap = len(current_words & corr_words)
+            overlap = len(current_words & _content_words(c["window_title"]))
             if overlap > 0:
                 scored.append((overlap, c))
         scored.sort(key=lambda x: -x[0])
@@ -257,8 +276,7 @@ def _build_fewshot_prompt(
             # Skip exact match with current window (that's handled by tier 1)
             if p["normalized_title"] == _normalize_title(current_window):
                 continue
-            prior_words = set(p["window_title"].lower().split())
-            overlap = len(current_words & prior_words)
+            overlap = len(current_words & _content_words(p["window_title"]))
             if overlap > 0:
                 scored_prior.append((overlap, p))
 
@@ -287,6 +305,10 @@ def _build_fewshot_prompt(
             "video corrected to a category says nothing about other YouTube videos - judge "
             "each video by its own title. Only reuse a correction's category when the current "
             "window is about the same specific content."
+            "\n\nThese examples are PAST WINDOWS, not the current one. Never describe their "
+            "subject matter as if it were on screen now, never quote their titles as evidence "
+            "about the CURRENT WINDOW, and never let them raise ALIGN — alignment is judged "
+            "from the current window alone."
         )
 
     return "\n".join(all_lines) if all_lines else ""
