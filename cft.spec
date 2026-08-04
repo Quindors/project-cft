@@ -49,7 +49,8 @@ a = Analysis(
     hookspath=[],
     runtime_hooks=[],
     excludes=[
-        'tkinter',
+        # NOT excluded: tkinter. The floating timer widget and the full-screen
+        # focus alert (monitor/tk_host.py) are Tk, so the build needs it.
         'matplotlib',
         'pytest',
         'IPython',

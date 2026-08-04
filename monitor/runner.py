@@ -17,6 +17,8 @@ from monitor.decider import decide
 from monitor.sources import EventSource, KeystrokeSource, TraceEventSource
 from monitor import intentions as intentions_store
 from monitor import app_state
+from monitor import breaks as breaks_store
+from monitor import status as status_store
 
 
 def run_monitor_loop(
@@ -108,6 +110,12 @@ def _run_live_loop(
     current_mode = app_state.get_mode()
     print(f"[runner] mode: {current_mode}")
 
+    # Break state. A break is a hard stop, not a quieter mode: while one runs
+    # we do not poll windows, do not capture keystrokes, do not classify, do
+    # not log and do not alert. `on_break` tracks the transition so capture is
+    # torn down once on the way in and rebuilt once on the way out.
+    on_break = False
+
     # Corrections made in the dashboard while we run take effect within this
     # interval — no restart needed. decide() checks corrections before its
     # session cache, so a refreshed correction overrides cached classifications.
@@ -126,6 +134,37 @@ def _run_live_loop(
 
     try:
         while not (stop_event is not None and stop_event.is_set()):
+            # --- break: monitoring is off entirely ---
+            try:
+                active_break = breaks_store.get_active()
+            except Exception as e:
+                print(f"[runner] break lookup failed ({e}); assuming no break")
+                active_break = None
+
+            if active_break is not None:
+                if not on_break:
+                    on_break = True
+                    key_src.stop()
+                    status_store.set_paused(True)
+                    drift_tier, drift_since, last_drift_alert = None, None, None
+                    mins = active_break.get("remaining_sec", 0) // 60
+                    print(f"[runner] BREAK — tracking and alerts off for ~{mins}m "
+                          f"(until {active_break['ends_at'][11:16]})")
+                time.sleep(settings.poll_interval)
+                continue
+
+            if on_break:
+                # Break over: start capture again from a clean slate. Titles
+                # and keystrokes from before the break are not evidence about
+                # what you are doing now.
+                on_break = False
+                events_buffer = []
+                event_src.reset()
+                key_src.start()
+                status_store.set_paused(False)
+                last_decision_time = time.time()
+                print("[runner] break over — monitoring resumed")
+
             now_dt = event_src.now_dt()
 
             # --- poll for new window title (in-memory capture) ---
@@ -241,11 +280,12 @@ def _run_live_loop(
                 # state resets so a stale streak can't fire on mode switch).
                 # With an active intention: dwell-based drift alert.
                 # Without: the original immediate off-task popup.
+                tier = _intent_tier(decision, settings) if intention is not None else None
+
                 if not alerts_enabled:
                     drift_tier, drift_since = None, None
                 elif intention is not None:
                     now_t = time.time()
-                    tier = _intent_tier(decision, settings)
                     drift_tier, drift_since = _update_drift(tier, drift_tier, drift_since, now_t)
                     # Alert only on a decision that is itself drift, so the
                     # popup never names a System window as the culprit.
@@ -269,6 +309,16 @@ def _run_live_loop(
                     reason = decision.get("final_reason", "")
                     msg = f"Off-task: {cat_name}" + (f"\n{reason}" if reason else "")
                     show_popup(msg, "Focus Alert")
+
+                # Hand this verdict to the UI: the timer widget colors itself
+                # by tier, and /api/status reports it to the dashboard.
+                status_store.publish(
+                    tier=tier,
+                    category=decision.get("final_category_name"),
+                    align=decision.get("final_align"),
+                    is_productive=decision.get("final_is_productive"),
+                    drift_since=drift_since,
+                )
 
                 if decision_count == 1:
                     total_boot_to_first = time.time() - loop_start

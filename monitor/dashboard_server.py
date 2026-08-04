@@ -11,6 +11,15 @@ local SQLite DB. Two ways to reach it:
      this same origin (no CORS needed).
 
 Endpoints:
+    GET  /api/status            -> the one resolved view of what's happening now:
+                                   {phase, state, label, ends_at, remaining_sec,
+                                    mode, intention, break, tier, category, ...}
+                                   The timer widget, the tray and the dashboard
+                                   all render from this (see monitor/status.py).
+    GET  /api/break             -> {active: {started_at, ends_at, remaining_sec} | null}
+    POST /api/break             -> {duration_min?} starts a break: tracking AND
+                                   alerts stop until it runs out
+    POST /api/break/end         -> ends the break early, resuming the monitor
     GET  /api/mode              -> {mode}  ("distraction_free" | "time_tracking")
     POST /api/mode              -> {mode} switches monitor mode; alerts only
                                    fire in distraction_free (picked up live by
@@ -34,10 +43,12 @@ Endpoints:
                                    protected because the classifier needs them
     POST /api/intention         -> {text, duration_min} starts a session intention
                                    (supersedes any active one)
-    POST /api/intention/end     -> {status?: completed|abandoned} ends the active one
+    POST /api/intention/end     -> {status?: completed|abandoned} ends the active one;
+                                   completing one rolls into the post-session break
 
-GET /intention serves a minimal built-in page for starting/ending a session
-intention — usable even without the bundled dashboard (the tray links to it).
+GET /intention serves a built-in page for starting/ending a session intention
+and taking a break — usable even without the bundled dashboard (the tray and
+the timer widget both link to it).
 
 Corrections and category changes reach the classifier at the next monitor
 start, when they are re-read from the DB.
@@ -67,6 +78,8 @@ from monitor.paths import resource_path, data_dir
 from monitor import supa_mirror
 from monitor import intentions
 from monitor import app_state
+from monitor import breaks
+from monitor import status as status_store
 
 
 DEFAULT_API_PORT = 47113
@@ -221,6 +234,22 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=500)
             return
 
+        if u.path == "/api/break":
+            try:
+                self._send_json({"active": breaks.get_active(),
+                                 "default_min": breaks.DEFAULT_BREAK_MIN})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
+        # The resolved everything-at-once view the timer widget renders from.
+        if u.path == "/api/status":
+            try:
+                self._send_json(status_store.full_snapshot())
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
         conn = _db_ro()
         if conn is None:
             # No data yet — return empty so the dashboard renders zeros, not an error.
@@ -280,6 +309,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/intention": self._post_intention_start,
             "/api/intention/end": self._post_intention_end,
             "/api/mode": self._post_mode,
+            "/api/break": self._post_break_start,
+            "/api/break/end": self._post_break_end,
         }
         handlers = {
             "/api/correct": self._post_correct,
@@ -345,7 +376,22 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         except ValueError as e:
             self._send_json({"error": str(e)}, status=400)
             return
-        self._send_json({"ok": True, "ended": ended})
+        # Completing a session starts the break; report it so the caller can
+        # render the new countdown without a second round trip.
+        self._send_json({"ok": True, "ended": ended, "break": breaks.get_active()})
+
+    def _post_break_start(self, body) -> None:
+        raw = body.get("duration_min")
+        try:
+            duration = breaks.DEFAULT_BREAK_MIN if raw in (None, "") else int(raw)
+            active = breaks.start(duration)
+        except (ValueError, TypeError) as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, "active": active})
+
+    def _post_break_end(self, body) -> None:
+        self._send_json({"ok": True, "ended": breaks.end()})
 
     def _post_correct(self, conn, body) -> None:
         try:
@@ -501,125 +547,302 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self._send_json({"ok": True, "name": new_name, "renamed_log_rows": renamed_logs})
 
 
-# Minimal built-in page for session intentions. Same-origin, no build step —
-# this is the tray's "Start Focus Session" target and works even when the
-# React dashboard isn't bundled.
-_INTENTION_PAGE = """<!doctype html>
+# Built-in page for session intentions and breaks. Same-origin, no build step —
+# this is the tray's "Start Focus Session" target and the timer widget's click
+# target, and it works even when the React dashboard isn't bundled. It renders
+# from /api/status, so its countdown and colors match the floating widget's.
+_INTENTION_PAGE_SRC = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Focus Session</title>
+<title>Focus</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, sans-serif; max-width: 480px; margin: 48px auto;
-         padding: 0 16px; background: Canvas; color: CanvasText; }
-  h1 { font-size: 1.2rem; }
-  textarea { width: 100%; box-sizing: border-box; min-height: 72px; font: inherit;
-             padding: 8px; border-radius: 8px; border: 1px solid #8884; }
-  .durations { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
-  .durations button { padding: 6px 14px; border-radius: 999px; border: 1px solid #8886;
-                      background: transparent; color: inherit; cursor: pointer; }
-  .durations button.sel { background: #10b981; border-color: #10b981; color: #fff; }
-  #custom { width: 5.5em; padding: 6px 8px; border-radius: 8px; font: inherit;
-            border: 1px solid #8884; background: transparent; color: inherit; }
+  :root {
+    color-scheme: dark;
+    --bg: #0b0f19; --card: #111827; --line: #1e293b;
+    --ink: #f1f5f9; --muted: #94a3b8; --faint: #64748b;
+    --accent: #94a3b8; --accent-soft: #94a3b81f;
+  }
+  [data-state="on"], [data-state="session"] { --accent: #10b981; --accent-soft: #10b98122; }
+  [data-state="partial"] { --accent: #f59e0b; --accent-soft: #f59e0b22; }
+  [data-state="off"]     { --accent: #ef4444; --accent-soft: #ef444422; }
+  [data-state="break"]   { --accent: #38bdf8; --accent-soft: #38bdf822; }
+
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+         font-family: "Segoe UI", system-ui, sans-serif;
+         display: flex; align-items: center; justify-content: center; padding: 24px; }
+  main { width: 100%; max-width: 460px; }
+
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 20px;
+          padding: 28px; box-shadow: 0 18px 40px #0006; }
+  .chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px;
+          border-radius: 999px; background: var(--accent-soft); color: var(--accent);
+          font-size: .74rem; font-weight: 600; letter-spacing: .06em;
+          text-transform: uppercase; }
+  .chip i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+  .dial { display: flex; align-items: center; gap: 20px; margin: 22px 0 6px; }
+  .dial svg { flex: none; transform: rotate(-90deg); }
+  .ring-track { stroke: var(--line); }
+  .ring-fill { stroke: var(--accent); transition: stroke-dashoffset 1s linear; }
+  .time { font-size: 2.5rem; font-weight: 700; line-height: 1;
+          font-variant-numeric: tabular-nums; }
+  .word { font-size: 1.75rem; font-weight: 700; line-height: 1.1; }
+  .sub { color: var(--muted); font-size: .85rem; margin-top: 7px; word-break: break-word; }
+  .note { color: var(--faint); font-size: .8rem; margin-top: 16px; line-height: 1.5; }
+
+  label { display: block; font-size: .78rem; font-weight: 600; color: var(--muted);
+          text-transform: uppercase; letter-spacing: .06em; margin-bottom: 9px; }
+  textarea { width: 100%; min-height: 74px; resize: vertical; font: inherit;
+             padding: 11px 13px; border-radius: 12px; color: var(--ink);
+             background: #0b111f; border: 1px solid var(--line); }
+  textarea:focus, input:focus { outline: none; border-color: #10b981; }
+  .chips { display: flex; gap: 7px; flex-wrap: wrap; margin: 16px 0 0; }
+  .chips button { padding: 7px 14px; border-radius: 999px; font: inherit;
+                  font-size: .88rem; cursor: pointer; color: var(--muted);
+                  background: transparent; border: 1px solid var(--line); }
+  .chips button:hover { color: var(--ink); }
+  .chips button.sel { background: #10b981; border-color: #10b981; color: #04150e;
+                      font-weight: 600; }
+  .customrow { display: none; align-items: center; gap: 8px; margin-top: 12px; }
+  .customrow.show { display: flex; }
+  #custom { width: 6.5em; padding: 8px 11px; border-radius: 10px; font: inherit;
+            background: #0b111f; border: 1px solid var(--line); color: var(--ink); }
   #custom.bad { border-color: #ef4444; }
-  .customrow { display: flex; align-items: center; gap: 6px; margin-bottom: 12px; }
-  .primary { width: 100%; padding: 10px; border-radius: 8px; border: none;
-             background: #10b981; color: #fff; font: inherit; cursor: pointer; }
-  .secondary { padding: 8px 14px; border-radius: 8px; border: 1px solid #8886;
-               background: transparent; color: inherit; cursor: pointer; }
-  #active { border: 1px solid #10b98166; border-radius: 12px; padding: 16px; }
-  .muted { opacity: 0.7; font-size: 0.9rem; }
-  .row { display: flex; gap: 8px; margin-top: 12px; }
-  #err { color: #ef4444; min-height: 1.2em; font-size: 0.9rem; }
+
+  .row { display: flex; gap: 10px; margin-top: 20px; }
+  button.primary { flex: 1; padding: 12px; border-radius: 12px; border: none;
+                   background: #10b981; color: #04150e; font: inherit;
+                   font-weight: 700; cursor: pointer; }
+  button.primary:hover:not(:disabled) { background: #34d399; }
+  button.primary:disabled { opacity: .45; cursor: not-allowed; }
+  button.ghost { padding: 12px 16px; border-radius: 12px; font: inherit;
+                 background: transparent; border: 1px solid var(--line);
+                 color: var(--muted); cursor: pointer; }
+  button.ghost:hover { color: var(--ink); border-color: var(--faint); }
+  button.link { background: none; border: none; color: var(--faint); font: inherit;
+                font-size: .82rem; cursor: pointer; padding: 0; margin-top: 14px;
+                text-decoration: underline; text-underline-offset: 3px; }
+  button.link:hover { color: var(--muted); }
+  #err { color: #f87171; font-size: .85rem; min-height: 1.2em; margin: 12px 2px 0; }
 </style>
 </head>
 <body>
-<h1>Focus session</h1>
-<div id="app">Loading…</div>
-<p id="err"></p>
+<main>
+  <div class="card" id="card" data-state="idle"><div class="sub">Loading…</div></div>
+  <p id="err"></p>
+</main>
 <script>
-let duration = 45;
-// Mirrors the monitor's own validation (monitor/intentions.py).
-const MIN_MIN = __MIN_MIN__, MAX_MIN = __MAX_MIN__;
-async function load() {
-  const r = await fetch('/api/intention');
-  const d = await r.json();
-  const app = document.getElementById('app');
-  if (d.active) {
-    app.innerHTML = `
-      <div id="active">
-        <div><strong>${esc(d.active.text)}</strong></div>
-        <div class="muted">started ${esc(d.active.started_at)} · ends ${esc(d.active.ends_at)}</div>
-        <div class="row">
-          <button class="secondary" onclick="end('completed')">Done</button>
-          <button class="secondary" onclick="end('abandoned')">Abandon</button>
-        </div>
-      </div>`;
-  } else {
-    app.innerHTML = `
-      <textarea id="text" placeholder="What do you intend to work on?"></textarea>
-      <div class="durations">
-        ${[15,25,45,60,90].map(m =>
-          `<button onclick="pick(${m},this)" class="${m===duration?'sel':''}">${m}m</button>`).join('')}
-        <button onclick="pick('custom',this)" class="${duration==='custom'?'sel':''}">Custom</button>
-      </div>
-      <div class="customrow" id="customrow" style="display:${duration==='custom'?'flex':'none'}">
-        <input id="custom" type="number" min="${MIN_MIN}" max="${MAX_MIN}" placeholder="120"
-               aria-label="Custom session length in minutes"
-               oninput="markCustom()" onkeydown="if(event.key==='Enter')start()">
-        <span class="muted">minutes (${MIN_MIN}-${MAX_MIN})</span>
-      </div>
-      <button class="primary" onclick="start()">Start session</button>`;
-  }
+// Mirrors the monitor's own validation (monitor/intentions.py, monitor/breaks.py).
+const MIN_MIN = __MIN_MIN__, MAX_MIN = __MAX_MIN__, BREAK_MIN = __BREAK_MIN__;
+const PRESETS = __PRESETS__;
+const R = 46, CIRC = 2 * Math.PI * R;
+
+let duration = PRESETS[0];
+let snap = null;        // last /api/status payload
+let form = {text: '', custom: ''};   // survives re-renders
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+// Same, but safe to drop inside a quoted HTML attribute.
+function escAttr(s) { return esc(s).replace(/"/g, '&quot;'); }
+
+// The server's naive local "YYYY-MM-DD HH:MM:SS" — parsed explicitly, since
+// Date's handling of that format is implementation-defined.
+function parseStamp(s) {
+  const m = /^(\\d{4})-(\\d{2})-(\\d{2}) (\\d{2}):(\\d{2}):(\\d{2})$/.exec(s || '');
+  return m ? new Date(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]) : null;
 }
-function pick(m, el) {
+function secsLeft() {
+  const ends = parseStamp(snap && snap.ends_at);
+  return ends ? Math.max(0, Math.round((ends - Date.now()) / 1000)) : null;
+}
+function fmt(secs) {
+  const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
+  return h ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+           : `${m}:${String(s).padStart(2,'0')}`;
+}
+function usedFraction() {
+  const started = parseStamp(snap && snap.started_at), ends = parseStamp(snap && snap.ends_at);
+  if (!started || !ends) return 0;
+  const span = ends - started;
+  return span > 0 ? Math.min(1, Math.max(0, (Date.now() - started) / span)) : 0;
+}
+function ring() {
+  const off = CIRC * (1 - usedFraction());
+  return `<svg width="108" height="108" viewBox="0 0 108 108">
+    <circle class="ring-track" cx="54" cy="54" r="${R}" fill="none" stroke-width="7"/>
+    <circle class="ring-fill" cx="54" cy="54" r="${R}" fill="none" stroke-width="7"
+            stroke-linecap="round" stroke-dasharray="${CIRC.toFixed(1)}"
+            stroke-dashoffset="${off.toFixed(1)}"/>
+  </svg>`;
+}
+const CHIP = {on: 'On intention', partial: 'Drifting', off: 'Off intention',
+              session: 'Session running', break: 'On a break',
+              tracking: 'Tracking only', idle: 'No session'};
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/status');
+    snap = await r.json();
+  } catch { return; }   // monitor unreachable — keep showing the last state
+  render();
+}
+
+function render(force) {
+  if (!snap) return;
+  const card = document.getElementById('card');
+  const left = secsLeft();
+
+  // The idle card contains a form. Rebuilding it under the user's cursor
+  // every poll would eat their caret position, so while they're typing we
+  // only repaint the state readout and leave the inputs alone. `force` is for
+  // the cases that must rebuild it — picking a duration changes the chips.
+  const typing = !force && card.dataset.phase === 'idle' && snap.phase === 'idle'
+                 && card.contains(document.activeElement);
+  card.dataset.state = snap.state;
+  card.dataset.phase = snap.phase;
+  if (typing) {
+    const chip = card.querySelector('.chip');
+    const word = card.querySelector('.word');
+    if (chip) chip.innerHTML = `<i></i>${CHIP[snap.state] || CHIP.idle}`;
+    if (word) word.textContent = snap.label;
+    return;
+  }
+
+  if (snap.phase === 'break') {
+    card.innerHTML = `
+      <span class="chip"><i></i>${CHIP.break}</span>
+      <div class="dial">${ring()}
+        <div><div class="time">${fmt(left ?? 0)}</div>
+             <div class="sub">until focus resumes</div></div></div>
+      <p class="note">Tracking and alerts are both off. Nothing you do right now
+         is classified or logged, and no intention is needed.</p>
+      <div class="row"><button class="ghost" onclick="endBreak()">End break now</button></div>`;
+    return;
+  }
+
+  if (snap.phase === 'session') {
+    card.innerHTML = `
+      <span class="chip"><i></i>${CHIP[snap.state] || CHIP.session}</span>
+      <div class="dial">${ring()}
+        <div><div class="time">${fmt(left ?? 0)}</div>
+             <div class="sub">${esc(snap.label)}</div></div></div>
+      ${snap.category ? `<p class="note">Currently reading as
+        <strong>${esc(snap.category)}</strong>.</p>` : ''}
+      <div class="row">
+        <button class="primary" onclick="endSession('completed')">Done — take a break</button>
+        <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
+      </div>`;
+    return;
+  }
+
+  card.innerHTML = `
+    <span class="chip"><i></i>${CHIP[snap.state] || CHIP.idle}</span>
+    <div class="dial"><div><div class="word">${esc(snap.label)}</div>
+      <div class="sub">${snap.category ? esc(snap.category) : 'Nothing declared yet'}</div></div></div>
+    <label for="text">What are you working on?</label>
+    <textarea id="text" maxlength="300" placeholder="e.g. finish the migration write-up"
+              oninput="form.text = this.value">${esc(form.text)}</textarea>
+    <div class="chips">
+      ${PRESETS.map(m => `<button onclick="pick(${m})"
+          class="${m === duration ? 'sel' : ''}">${m}m</button>`).join('')}
+      <button onclick="pick('custom')" class="${duration === 'custom' ? 'sel' : ''}">Custom</button>
+    </div>
+    <div class="customrow ${duration === 'custom' ? 'show' : ''}">
+      <input id="custom" type="number" min="${MIN_MIN}" max="${MAX_MIN}" placeholder="120"
+             value="${escAttr(form.custom)}" aria-label="Custom session length in minutes"
+             oninput="form.custom = this.value; markCustom()"
+             onkeydown="if (event.key === 'Enter') start()">
+      <span class="sub">minutes (${MIN_MIN}–${MAX_MIN})</span>
+    </div>
+    <div class="row"><button class="primary" onclick="start()">Start session</button></div>
+    <button class="link" onclick="startBreak()">or take a ${BREAK_MIN}-minute break now</button>`;
+
+  const t = document.getElementById('text');
+  if (t && document.activeElement !== t) t.focus();
+}
+
+function pick(m) {
   duration = m;
-  document.querySelectorAll('.durations button').forEach(b => b.classList.remove('sel'));
-  el.classList.add('sel');
-  const row = document.getElementById('customrow');
-  row.style.display = (m === 'custom') ? 'flex' : 'none';
-  if (m === 'custom') document.getElementById('custom').focus();
+  render(true);
+  if (m === 'custom') { const el = document.getElementById('custom'); if (el) el.focus(); }
+}
+// Read the live inputs, not the cached copy. `form` exists to survive a
+// re-render, but the field is the truth: a value put there without an input
+// event (autofill, session restore, an extension) must still submit.
+function fieldValue(id) {
+  const el = document.getElementById(id);
+  return el ? el.value : '';
 }
 function customMinutes() {
-  const raw = (document.getElementById('custom') || {}).value;
-  const n = Number(raw);
+  const n = Number(fieldValue('custom'));
   return Number.isInteger(n) && n >= MIN_MIN && n <= MAX_MIN ? n : null;
 }
 function markCustom() {
   const el = document.getElementById('custom');
-  el.classList.toggle('bad', el.value !== '' && customMinutes() === null);
+  if (el) el.classList.toggle('bad', el.value !== '' && customMinutes() === null);
 }
+
 async function start() {
-  const text = document.getElementById('text').value;
   let mins = duration;
   if (duration === 'custom') {
     mins = customMinutes();
     if (mins === null) {
-      document.getElementById('err').textContent =
-        `Enter a length between ${MIN_MIN} and ${MAX_MIN} minutes.`;
+      showError(`Enter a length between ${MIN_MIN} and ${MAX_MIN} minutes.`);
       return;
     }
   }
-  await post('/api/intention', {text, duration_min: mins});
+  const text = fieldValue('text') || form.text;
+  if (!text.trim()) { showError('Say what you intend to work on first.'); return; }
+  if (await post('/api/intention', {text, duration_min: mins})) {
+    form = {text: '', custom: ''};
+  }
 }
-async function end(status) { await post('/api/intention/end', {status}); }
+async function endSession(status) { await post('/api/intention/end', {status}); }
+async function startBreak() { await post('/api/break', {duration_min: BREAK_MIN}); }
+async function endBreak() { await post('/api/break/end', {}); }
+
+function showError(msg) { document.getElementById('err').textContent = msg; }
+
 async function post(url, body) {
-  document.getElementById('err').textContent = '';
-  const r = await fetch(url, {method: 'POST',
-    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  const d = await r.json();
-  if (!r.ok || d.error) { document.getElementById('err').textContent = d.error || r.statusText; }
-  else { load(); }
+  showError('');
+  let r, d;
+  try {
+    r = await fetch(url, {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    d = await r.json();
+  } catch {
+    showError("Can't reach the monitor. Is it still running?");
+    return false;
+  }
+  if (!r.ok || d.error) { showError(d.error || r.statusText); return false; }
+  await refresh();
+  return true;
 }
-function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
-load();
+
+// Tick locally every second so the countdown is smooth, and re-read the
+// monitor every few seconds to pick up changes made in the tray or widget.
+setInterval(() => { if (snap && snap.ends_at) render(); }, 1000);
+setInterval(refresh, 5000);
+refresh();
 </script>
 </body>
 </html>
-""".replace("__MIN_MIN__", str(intentions.MIN_DURATION_MIN)) \
-   .replace("__MAX_MIN__", str(intentions.MAX_DURATION_MIN))
+"""
+
+_INTENTION_PAGE = (
+    _INTENTION_PAGE_SRC
+    .replace("__MIN_MIN__", str(intentions.MIN_DURATION_MIN))
+    .replace("__MAX_MIN__", str(intentions.MAX_DURATION_MIN))
+    .replace("__BREAK_MIN__", str(breaks.DEFAULT_BREAK_MIN))
+    # Presets start at the real minimum, so the page can never offer a length
+    # the monitor will reject.
+    .replace("__PRESETS__", json.dumps(
+        [m for m in (30, 45, 60, 90, 120) if intentions.MIN_DURATION_MIN <= m <= intentions.MAX_DURATION_MIN]
+    ))
+)
 
 
 class _Server(socketserver.ThreadingTCPServer):

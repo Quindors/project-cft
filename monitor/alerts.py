@@ -1,16 +1,31 @@
 # monitor/alerts.py
-"""Cross-platform popup alerts - always on top."""
+"""Cross-platform popup alerts - always on top.
+
+On Windows the alert is the full-screen sheet in monitor/focus_alert.py: a
+MessageBox is far too easy to dismiss without reading. The MessageBox is kept
+as the fallback for when there is no usable Tk display.
+"""
 
 import subprocess
 
 from monitor.window_capture import PLATFORM, IS_WSL
 
 
-def _popup_windows(message: str, title: str) -> None:
+def _popup_messagebox(message: str, title: str) -> None:
     """Win32 MessageBox with TOPMOST + FOREGROUND flags."""
     import ctypes
     flags = 0x40 | 0x00010000 | 0x00040000  # INFO | FOREGROUND | TOPMOST
     ctypes.windll.user32.MessageBoxW(0, message, title, flags)
+
+
+def _popup_windows(message: str, title: str) -> None:
+    try:
+        from monitor import focus_alert
+        if focus_alert.show(message, title):
+            return
+    except Exception as e:
+        print(f"[popup] full-screen alert unavailable ({e}); using MessageBox")
+    _popup_messagebox(message, title)
 
 
 def _popup_wsl(message: str, title: str) -> None:

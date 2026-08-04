@@ -47,6 +47,7 @@ class EventSource:
     def now_dt(self) -> datetime: ...
     def poll(self) -> Optional[str]: ...
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]: ...
+    def reset(self) -> None: ...
 
 
 class KeystrokeSource:
@@ -97,6 +98,17 @@ class LiveEventSource(EventSource):
         """Return the most recent events as (timestamp_str, key) tuples."""
         items = list(self._buffer)[-limit:]
         return [(dt.strftime("%Y-%m-%d %H:%M:%S"), key) for dt, key in items]
+
+    def reset(self) -> None:
+        """Drop captured history and forget the last title.
+
+        Used when monitoring resumes after a break: clearing `_last_title` is
+        the important half — without it, a user still sitting on the same
+        window as before the break produces no change, so poll() appends
+        nothing and the loop never reaches min_events again.
+        """
+        self._buffer.clear()
+        self._last_title = ""
 
 
 class LiveKeystrokeSource(KeystrokeSource):
@@ -229,6 +241,10 @@ class TraceEventSource(EventSource):
     def poll(self) -> Optional[str]:
         """No-op for trace mode — events come from the file."""
         return None
+
+    def reset(self) -> None:
+        """No-op: trace events are replayed from the file, not captured."""
+        return
 
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]:
         eligible = [x for x in self.session.trace.win if x[0] <= now_dt]

@@ -112,6 +112,16 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
 
         threading.Thread(target=_open_when_absent, daemon=True, name="open-dashboard").start()
 
+    # The floating countdown. Opt out with CFT_TIMER_WIDGET=0; it also hides
+    # itself quietly on machines with no usable display.
+    if os.getenv("CFT_TIMER_WIDGET", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            from monitor import timer_widget
+            if timer_widget.start(dashboard_url, intention_url):
+                print("[boot] timer widget started")
+        except Exception as e:
+            print(f"[boot] timer widget not started ({e})")
+
     try:
         from monitor.tray import start_tray
         icon = start_tray(dashboard_url, intention_url, on_quit=shutdown.set)
@@ -120,6 +130,17 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
     except Exception as e:
         print(f"[boot] tray not started ({e})")
         return None
+
+
+def _stop_ui() -> None:
+    """Tear down the Tk thread (timer widget, focus alerts) on shutdown."""
+    try:
+        from monitor import timer_widget, tk_host, tray
+        tray.stop_icon_updates()
+        timer_widget.stop()
+        tk_host.stop()
+    except Exception:
+        pass
 
 
 def run_dashboard_only() -> None:
@@ -146,6 +167,7 @@ def run_dashboard_only() -> None:
                 icon.stop()
             except Exception:
                 pass
+        _stop_ui()
 
 
 def run(settings: Settings | None = None) -> None:
@@ -229,3 +251,4 @@ def run(settings: Settings | None = None) -> None:
                 tray_icon.stop()
             except Exception:
                 pass
+        _stop_ui()

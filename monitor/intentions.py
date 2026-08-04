@@ -14,6 +14,11 @@ Timestamps are naive local "YYYY-MM-DD HH:MM:SS" strings, matching
 focus_logs.timestamp, so plain string comparison is correct.
 
 Status lifecycle: active -> completed | abandoned | superseded | expired.
+
+Finishing a session (completed or expired, not abandoned or superseded) hands
+off to monitor/breaks.py, which starts the post-session break. The handoff is
+guarded so it fires exactly once no matter which thread notices the session
+ended — the runner loop, an HTTP request and the tray all race to read it.
 """
 from __future__ import annotations
 
@@ -26,8 +31,23 @@ from monitor.paths import data_dir
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 MAX_TEXT_LEN = 300
-MIN_DURATION_MIN = 5
+# A focus session is a real block of work: half an hour is the floor. Anything
+# shorter is not a session, it's an interruption with a label on it.
+MIN_DURATION_MIN = 30
 MAX_DURATION_MIN = 8 * 60
+
+
+def _finished(intention: Dict, status: str) -> None:
+    """A session just ended for good — roll into the post-session break.
+
+    Imported lazily: breaks.py calls back into this module to close an active
+    session, so a module-level import would be circular.
+    """
+    try:
+        from monitor import breaks
+        breaks.after_session_end(intention, status)
+    except Exception as e:
+        print(f"[intention] post-session break skipped ({e})")
 
 
 def _now_str() -> str:
@@ -54,22 +74,34 @@ def get_active() -> Optional[Dict]:
     """Return the active session intention, or None.
 
     A past-due active intention is expired here as a side effect, so callers
-    never see a stale session.
+    never see a stale session — and the expiry starts the post-session break.
     """
+    expired = None
     with _connect() as conn:
         row = conn.execute(
             "SELECT * FROM intentions WHERE status = 'active' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if row is None:
             return None
-        now = _now_str()
-        if row["ends_at"] <= now:
-            conn.execute(
-                "UPDATE intentions SET status = 'expired', ended_at = ? WHERE id = ?",
-                (row["ends_at"], row["id"]),
-            )
-            return None
-        return dict(row)
+        if row["ends_at"] > _now_str():
+            return dict(row)
+        # Past due. `AND status = 'active'` makes the flip single-shot: of the
+        # threads that raced to read this row, only one gets rowcount 1 and so
+        # only one starts the break.
+        won = conn.execute(
+            "UPDATE intentions SET status = 'expired', ended_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (row["ends_at"], row["id"]),
+        ).rowcount == 1
+        if won:
+            expired = dict(row)
+            expired["status"] = "expired"
+            expired["ended_at"] = expired["ends_at"]
+
+    # Outside the connection block: the hook writes to the same DB file.
+    if expired is not None:
+        _finished(expired, "expired")
+    return None
 
 
 def start(text: str, duration_min: int) -> Dict:
@@ -108,18 +140,29 @@ def start(text: str, duration_min: int) -> Dict:
         }
 
 
-def end_active(status: str = "completed") -> Optional[Dict]:
-    """End the active intention (completed/abandoned). Returns it, or None."""
+def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional[Dict]:
+    """End the active intention (completed/abandoned). Returns it, or None.
+
+    Completing a session starts the post-session break; abandoning one does
+    not. fire_hook=False is for callers that are already handling the
+    aftermath themselves (breaks.start closing a session it is replacing).
+    """
     if status not in ("completed", "abandoned"):
         raise ValueError("status must be 'completed' or 'abandoned'")
     active = get_active()
     if active is None:
         return None
     with _connect() as conn:
-        conn.execute(
-            "UPDATE intentions SET status = ?, ended_at = ? WHERE id = ?",
+        # Single-shot, same as expiry: two "Done" clicks must not both count.
+        won = conn.execute(
+            "UPDATE intentions SET status = ?, ended_at = ? "
+            "WHERE id = ? AND status = 'active'",
             (status, _now_str(), active["id"]),
-        )
+        ).rowcount == 1
+    if not won:
+        return None
     active["status"] = status
     active["ended_at"] = _now_str()
+    if fire_hook:
+        _finished(active, status)
     return active
