@@ -14,16 +14,34 @@
 
 $ErrorActionPreference = 'Stop'
 
+# Run a native exe without 'Stop' treating its stderr as a fatal error.
+#
+# Windows PowerShell 5.1 wraps every stderr line from a native command in an
+# ErrorRecord, so under $ErrorActionPreference='Stop' anything that merely
+# WRITES to stderr kills the build — pip's "a new release is available"
+# notice and PyInstaller's own progress output both do. Exit code is the only
+# honest success signal for these, so check that instead.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe,
+          [Parameter(ValueFromRemainingArguments)][string[]]$Arguments,
+          [string]$What = 'command')
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try   { & $Exe @Arguments }
+    finally { $ErrorActionPreference = $prev }
+    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit $LASTEXITCODE)" }
+}
+
 # --- 1. Venv ---------------------------------------------------------------
 if (-not (Test-Path '.\build-venv\Scripts\python.exe')) {
     Write-Host "[venv] creating build-venv..."
-    python -m venv build-venv
+    Invoke-Native 'python' '-m' 'venv' 'build-venv' -What 'venv creation'
 }
 $py = '.\build-venv\Scripts\python.exe'
 
 Write-Host "[pip ] installing build deps..."
-& $py -m pip install --quiet --upgrade pip
-& $py -m pip install --quiet -r requirements-build.txt
+Invoke-Native $py '-m' 'pip' 'install' '--quiet' '--upgrade' 'pip' -What 'pip self-upgrade'
+Invoke-Native $py '-m' 'pip' 'install' '--quiet' '-r' 'requirements-build.txt' -What 'pip install'
 
 # --- 2. Stage the focus-dashboard (local mode) -----------------------------
 # Preferred: a pre-staged .\dashboard (build it in WSL: `VITE_DATA_SOURCE=local
@@ -39,14 +57,17 @@ if (Test-Path '.\dashboard\index.html') {
     if ($npm) {
         if (-not (Test-Path '.\.dashboard-src')) {
             Write-Host "[dash] cloning focus-dashboard ($DASH_BRANCH)..."
-            git clone --depth 1 --branch $DASH_BRANCH https://github.com/Quindors/focus-dashboard.git .dashboard-src
+            # git reports progress on stderr; npm reports warnings there too.
+            Invoke-Native 'git' 'clone' '--depth' '1' '--branch' $DASH_BRANCH `
+                'https://github.com/Quindors/focus-dashboard.git' '.dashboard-src' -What 'git clone'
         }
         Push-Location .dashboard-src
-        Write-Host "[dash] npm ci + build (local mode)..."
-        & $npm.Source ci --no-audit --no-fund
-        $env:VITE_DATA_SOURCE = 'local'
-        & $npm.Source run build
-        Pop-Location
+        try {
+            Write-Host "[dash] npm ci + build (local mode)..."
+            Invoke-Native $npm.Source 'ci' '--no-audit' '--no-fund' -What 'npm ci'
+            $env:VITE_DATA_SOURCE = 'local'
+            Invoke-Native $npm.Source 'run' 'build' -What 'npm run build'
+        } finally { Pop-Location }
         if (Test-Path '.\.dashboard-src\dist\index.html') {
             Copy-Item .\.dashboard-src\dist .\dashboard -Recurse -Force
             Write-Host "[dash] staged local-mode dashboard into .\dashboard"
@@ -78,9 +99,10 @@ if ($running) {
 }
 
 Write-Host "[pyi ] running PyInstaller..."
-& $py -m PyInstaller cft.spec --noconfirm
-if ($LASTEXITCODE -ne 0) {
-    throw "PyInstaller failed (exit $LASTEXITCODE) - dist\cft may be incomplete"
+try {
+    Invoke-Native $py '-m' 'PyInstaller' 'cft.spec' '--noconfirm' -What 'PyInstaller'
+} catch {
+    throw "$_ - dist\cft may be incomplete"
 }
 
 # --- 3b. Restore or seed the exe's .env ------------------------------------
@@ -108,7 +130,7 @@ $iscc = Get-Command 'iscc.exe' -ErrorAction SilentlyContinue
 if (-not $iscc) { $iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue }
 if ($iscc) {
     Write-Host "[inno] compiling installer..."
-    & $iscc.Source 'installer.iss'
+    Invoke-Native $iscc.Source 'installer.iss' -What 'Inno Setup'
     Write-Host "[done] installer at .\dist\cft-setup.exe"
 } else {
     Write-Host "[warn] Inno Setup (iscc.exe) not on PATH - skipping installer step."
