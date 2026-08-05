@@ -27,6 +27,7 @@ where you left it.
 from __future__ import annotations
 
 import json
+import sys
 import time
 from typing import Dict, Optional
 
@@ -51,6 +52,9 @@ TICK_MS = 1000
 # Hitting sqlite once a second for three tiny reads is wasteful; the countdown
 # is computed locally between refreshes.
 REFRESH_EVERY_TICKS = 2
+# How often to shoulder back to the front of the topmost band. Every few
+# seconds is enough to recover from a taskbar click without churning z-order.
+TOPMOST_EVERY_TICKS = 4
 
 # How close to an edge (reference px) a drag has to end to dock there.
 SIDES = ("left", "right", "top", "bottom")
@@ -73,6 +77,10 @@ _FALLBACK = PALETTE[status.STATE_IDLE]
 # Tk canvas colors are opaque — "#rrggbbaa" raises TclError. Grip marks are a
 # hand-picked solid instead of black-at-33%.
 GRIP_ON_ACCENT = "#0f172a"
+
+# The collapse affordance points at the edge the card will fly to, so it
+# doubles as a reminder of where the tab is about to appear.
+CHEVRON = {"left": "◂", "right": "▸", "top": "▴", "bottom": "▾"}
 
 _widget: Optional["_TimerWidget"] = None
 
@@ -192,6 +200,58 @@ class _TimerWidget:
     def _screen(self):
         return self.win.winfo_screenwidth(), self.win.winfo_screenheight()
 
+    def _work_area(self):
+        """Desktop rect EXCLUDING the taskbar, as (left, top, right, bottom).
+
+        Docking to the full screen height parks the tab underneath the
+        taskbar, where it is invisible and unclickable — the bottom edge of
+        the screen is exactly where the taskbar lives. The work area is the
+        rect Windows reserves for ordinary windows, and it moves correctly
+        when the taskbar is on another edge or auto-hidden.
+        """
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                rect = wintypes.RECT()
+                SPI_GETWORKAREA = 0x0030
+                if ctypes.windll.user32.SystemParametersInfoW(
+                        SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+                    if rect.right > rect.left and rect.bottom > rect.top:
+                        return rect.left, rect.top, rect.right, rect.bottom
+            except Exception:
+                pass
+        sw, sh = self._screen()
+        return 0, 0, sw, sh
+
+    def _keep_on_top(self) -> None:
+        """Re-assert topmost without stealing focus.
+
+        Clicking the taskbar (itself a topmost window) re-orders the topmost
+        band and can leave the widget buried. SetWindowPos with NOACTIVATE
+        puts us back at the front without taking focus from whatever the user
+        is typing into.
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+
+            HWND_TOPMOST = -1
+            SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+            hwnd = self.win.winfo_id()
+            user32 = ctypes.windll.user32
+            parent = user32.GetParent(hwnd)   # Tk may wrap the toplevel
+            ctypes.windll.user32.SetWindowPos(
+                parent or hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+        except Exception:
+            try:
+                self.win.attributes("-topmost", True)
+            except Exception:
+                pass
+
     def _size(self):
         """Outer window size for the current form and docked edge."""
         if not self.collapsed:
@@ -201,42 +261,43 @@ class _TimerWidget:
         return self.long + 2 * self.margin, self.thick + self.margin
 
     def _nearest_side(self, x: int, y: int) -> str:
-        """Which screen edge is this window closest to?"""
-        sw, sh = self._screen()
+        """Which working edge is this window closest to?"""
+        wl, wt, wr, wb = self._work_area()
         w, h = self._size()
         gaps = {
-            "left": x,
-            "right": sw - (x + w),
-            "top": y,
-            "bottom": sh - (y + h),
+            "left": x - wl,
+            "right": wr - (x + w),
+            "top": y - wt,
+            "bottom": wb - (y + h),
         }
         return min(gaps, key=gaps.get)
 
     def _place(self, x=None, y=None) -> None:
-        """Position the window, clamped on screen and edge-flush when collapsed."""
-        sw, sh = self._screen()
+        """Position the window, clamped to the work area (never under the taskbar)."""
+        wl, wt, wr, wb = self._work_area()
         w, h = self._size()
         if x is None or y is None:
-            x, y = sw - w - self._px(18), self._px(90)
+            x, y = wr - w - self._px(18), wt + self._px(90)
         x, y = int(x), int(y)
 
         if self.collapsed:
             # A tab belongs against its edge: pin the crossing axis, and let
             # the drag decide only how far along the edge it sits.
             if self.side == "left":
-                x = 0
+                x = wl
             elif self.side == "right":
-                x = sw - w
+                x = wr - w
             elif self.side == "top":
-                y = 0
+                y = wt
             else:
-                y = sh - h
+                y = wb - h
 
-        x = max(0, min(x, sw - w))
-        y = max(0, min(y, sh - h))
+        x = max(wl, min(x, wr - w))
+        y = max(wt, min(y, wb - h))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
         self.canvas.configure(width=w, height=h)
         self._x, self._y = x, y
+        self._keep_on_top()
 
     def _set_alpha(self, value: float) -> None:
         try:
@@ -272,6 +333,8 @@ class _TimerWidget:
                 self._snapshot = status.full_snapshot()
             if not self.hidden:
                 self._render()
+                if self._ticks % TOPMOST_EVERY_TICKS == 0:
+                    self._keep_on_top()
         except Exception as e:
             self._log_once(f"tick failed ({type(e).__name__}: {e})")
         finally:
@@ -369,14 +432,23 @@ class _TimerWidget:
         x2, y2 = m + self.card_w, m + self.card_h
         self._round_rect(x1, y1, x2, y2, self._px(16), fill=bg, outline=border)
 
-        dot_x, mid = x1 + self._px(18), (y1 + y2) / 2
+        mid = (y1 + y2) / 2
+        # The chevron sits at the end of the card nearest the edge it collapses
+        # into, so the content slides over to make room on that side.
+        gutter = self._px(32)
+        if self.side == "left":
+            chevron_x = x1 + self._px(16)
+            content_x1, text_right = x1 + gutter, x2 - self._px(14)
+        else:
+            chevron_x = x2 - self._px(16)
+            content_x1, text_right = x1, chevron_x - self._px(12)
+
+        dot_x = content_x1 + self._px(18)
         r = self._px(5)
         self.canvas.create_oval(dot_x - r, mid - r, dot_x + r, mid + r,
                                 fill=accent, outline="")
 
-        text_x = x1 + self._px(34)
-        chevron_x = x2 - self._px(16)
-        text_right = chevron_x - self._px(12)
+        text_x = content_x1 + self._px(34)
         text_w = text_right - text_x
         snap = self._snapshot
         left = self._remaining()
@@ -404,8 +476,8 @@ class _TimerWidget:
                 fill=MUTED, font=self.f_label, anchor="w")
             self._render_progress(text_x, y2 - self._px(9), text_right)
 
-        self.canvas.create_text(chevron_x, mid, text="›", fill=MUTED,
-                                font=self.f_word, anchor="center")
+        self.canvas.create_text(chevron_x, mid, text=CHEVRON.get(self.side, "▸"),
+                                fill=MUTED, font=self.f_word, anchor="center")
 
     def _render_progress(self, x1: float, y: float, x2: float) -> None:
         """Thin bar: how much of the session or break has been used up."""
@@ -443,16 +515,15 @@ class _TimerWidget:
             self._drag["moved"] = True
 
         nx, ny = self._drag["wx"] + dx, self._drag["wy"] + dy
-        if self.collapsed:
-            # Re-dock live, so the tab visibly turns sideways as you drag it
-            # onto the top or bottom edge instead of snapping at the end.
-            side = self._nearest_side(nx, ny)
-            if side != self.side:
-                self.side = side
-                self._place(nx, ny)
-                self._render()
-                return
+        # Track the nearest edge whether collapsed or not: collapsed, the tab
+        # re-docks live so you can see it turn sideways mid-drag; expanded,
+        # the chevron flips to point at the edge it would collapse into.
+        side = self._nearest_side(nx, ny)
+        changed = side != self.side
+        self.side = side
         self._place(nx, ny)
+        if changed:
+            self._render()
 
     def _on_release(self, event) -> None:
         drag = self._drag
@@ -464,17 +535,41 @@ class _TimerWidget:
             self._render()  # the tab's rounded end may have swapped sides
             return
         # A click, not a drag. The chevron collapses; the body opens the page
-        # where you actually set a session.
-        if not self.collapsed and event.x < self.margin + self.card_w - self._px(30):
-            self._open_intention()
-        else:
+        # where you actually set a session. The hit zone tracks the chevron,
+        # which moves to the left end when the card docks left.
+        if self.collapsed:
             self.toggle_collapsed()
+            return
+        gutter = self._px(32)
+        if self.side == "left":
+            on_chevron = event.x < self.margin + gutter
+        else:
+            on_chevron = event.x > self.margin + self.card_w - gutter
+        if on_chevron:
+            self.toggle_collapsed()
+        else:
+            self._open_intention()
 
     def toggle_collapsed(self) -> None:
         self.collapsed = not self.collapsed
         _save_prefs(collapsed=self.collapsed)
         self._place(self._x, self._y)
         self._render()
+
+    def reset_position(self) -> None:
+        """Bring the timer back to a known-good spot.
+
+        The escape hatch for "I can't find it any more" — un-hides, expands,
+        and drops it at the default corner of the work area.
+        """
+        self.hidden = False
+        self.collapsed = False
+        self.side = "right"
+        self.win.deiconify()
+        self._place(None, None)
+        self._render()
+        _save_prefs(hidden=False, collapsed=False, side="right",
+                    x=self._x, y=self._y)
 
     def set_hidden(self, hidden: bool) -> None:
         self.hidden = hidden
@@ -525,6 +620,7 @@ class _TimerWidget:
         menu.add_separator()
         menu.add_command(label="Expand" if self.collapsed else "Collapse",
                          command=self.toggle_collapsed)
+        menu.add_command(label="Reset position", command=self.reset_position)
         menu.add_command(label="Open dashboard", command=self._open_dashboard)
         menu.add_command(label="Hide timer", command=lambda: self.set_hidden(True))
         try:
@@ -591,6 +687,11 @@ def start(dashboard_url: Optional[str] = None,
 
 def set_hidden(hidden: bool) -> None:
     tk_host.submit(lambda: _widget and _widget.set_hidden(hidden))
+
+
+def reset_position() -> None:
+    """Un-hide and re-place the timer at its default corner (tray recovery)."""
+    tk_host.submit(lambda: _widget and _widget.reset_position())
 
 
 def is_hidden() -> bool:

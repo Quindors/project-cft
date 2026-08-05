@@ -125,6 +125,10 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
     def _toggle_widget(icon, item):
         timer_widget.toggle_hidden()
 
+    def _reset_widget(icon, item):
+        """Recovery for a timer that ended up somewhere unreachable."""
+        timer_widget.reset_position()
+
     def _quit(icon, item):
         try:
             icon.stop()
@@ -145,6 +149,7 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
         pystray.MenuItem("End Break", _end_break, enabled=_on_break),
         pystray.MenuItem("Show Timer", _toggle_widget,
                          checked=lambda item: not timer_widget.is_hidden()),
+        pystray.MenuItem("Reset Timer Position", _reset_widget),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", _quit),
     )
