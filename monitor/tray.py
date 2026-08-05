@@ -99,7 +99,12 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
             browser.open_dashboard(dashboard_url)
 
     def _start_session(icon, item):
-        if intention_url:
+        # The hosted dashboard is where sessions get set when one is
+        # configured; the local /intention page is the fallback for setups
+        # without a DASHBOARD_URL.
+        if dashboard_url:
+            browser.open_dashboard(dashboard_url)
+        elif intention_url:
             webbrowser.open(intention_url)
 
     def _end_session(icon, item):
@@ -140,7 +145,8 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
         pystray.Menu.SEPARATOR,
         pystray.MenuItem(_status_text, None, enabled=False),
         pystray.MenuItem("Start Focus Session...", _start_session,
-                         enabled=lambda item: bool(intention_url) and not _on_break()),
+                         enabled=lambda item: bool(dashboard_url or intention_url)
+                         and not _on_break()),
         pystray.MenuItem("Finish Session (start break)", _end_session,
                          enabled=_has_active_intention),
         pystray.Menu.SEPARATOR,

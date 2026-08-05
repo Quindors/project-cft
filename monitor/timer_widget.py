@@ -16,9 +16,12 @@ break, slate when nothing is declared. That is the same state the tray icon
 and the dashboard read, resolved once in monitor/status.py so the three can
 never disagree.
 
-Drag it anywhere; click the chevron and it collapses into a thin colored tab
-that docks to whichever screen edge you drag it near, turning sideways on the
-top and bottom edges so it always lies flat along the edge.
+It is a peek, not a panel. The resting form is a thin colored tab docked to a
+screen edge; clicking it slides the card out, and the card puts itself away
+again — when you go back to another window, or after a few seconds of being
+ignored. Anything that looks like you are still using it (the pointer resting
+on it, a drag, an open menu) holds it open. Drag it near any edge to re-dock,
+and it turns sideways on the top and bottom edges so it always lies flat.
 
 All Tk work happens on the shared UI thread (monitor/tk_host.py). Position,
 edge and collapsed/hidden state persist in app_state so the widget comes back
@@ -29,7 +32,7 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from monitor import app_state, breaks, status, tk_host
 from monitor.window_capture import PLATFORM
@@ -44,6 +47,7 @@ MARGIN = 6            # chroma-keyed gutter that lets the card have round corner
 CARD_W, CARD_H = 274, 62
 BUMP_THICK = 13       # the collapsed tab's thin dimension
 BUMP_LONG = 78        # ... and its long one
+GUTTER = 32           # the chevron's hit area, drawn so it reads as a button
 
 # The magenta that -transparentcolor knocks out. Nothing in the design uses it.
 CHROMA = "#ff00fe"
@@ -56,7 +60,12 @@ REFRESH_EVERY_TICKS = 2
 # seconds is enough to recover from a taskbar click without churning z-order.
 TOPMOST_EVERY_TICKS = 4
 
-# How close to an edge (reference px) a drag has to end to dock there.
+# Open/close animation. 500ms reads as deliberate rather than sluggish.
+ANIM_MS = 500.0
+ANIM_FRAME_MS = 16          # ~60fps
+# How long an ignored card stays out before putting itself away.
+AUTO_COLLAPSE_SEC = 10.0
+
 SIDES = ("left", "right", "top", "bottom")
 
 INK = "#f8fafc"
@@ -126,6 +135,38 @@ def _fmt_compact(seconds: Optional[int]) -> str:
     return str(mins)
 
 
+def _lerp(a: float, b: float, t: float) -> float:
+    return a + (b - a) * t
+
+
+def _lerp_color(c1: str, c2: str, t: float) -> str:
+    """Blend two #rrggbb colors. Tk has no alpha, so blending is explicit."""
+    try:
+        a = tuple(int(c1[i:i + 2], 16) for i in (1, 3, 5))
+        b = tuple(int(c2[i:i + 2], 16) for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return c2
+    t = min(1.0, max(0.0, t))
+    return "#%02x%02x%02x" % tuple(int(round(_lerp(a[i], b[i], t))) for i in range(3))
+
+
+def _ease(t: float) -> float:
+    """Ease-in-out cubic — slow at both ends, quick through the middle."""
+    t = min(1.0, max(0.0, t))
+    return 4 * t * t * t if t < 0.5 else 1 - pow(-2 * t + 2, 3) / 2
+
+
+def _foreground_window() -> int:
+    """HWND of whatever the user is working in, or 0 where unsupported."""
+    if sys.platform != "win32":
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
 class _TimerWidget:
     def __init__(self, dashboard_url: Optional[str], intention_url: Optional[str]):
         import tkinter as tk
@@ -162,6 +203,7 @@ class _TimerWidget:
         self.margin = self._px(MARGIN)
         self.card_w, self.card_h = self._px(CARD_W), self._px(CARD_H)
         self.thick, self.long = self._px(BUMP_THICK), self._px(BUMP_LONG)
+        self.gutter = self._px(GUTTER)
 
         self.canvas = tk.Canvas(self.win, highlightthickness=0, bd=0, bg=CHROMA)
         self.canvas.pack(fill="both", expand=True)
@@ -178,13 +220,22 @@ class _TimerWidget:
         self._ticks = 0
         self._drag: Optional[Dict] = None
         self._last_error = (None, 0.0)
+        self._anim: Optional[Dict] = None
+        self._hover_chevron = False
+        self._pointer_in = False
+        self._menu_open = False
+        # Auto-collapse bookkeeping: when the card came out, and what the user
+        # was working in at that moment.
+        self._shown_at = time.time()
+        self._fg_at_show = _foreground_window()
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Button-3>", self._on_menu)
-        self.canvas.bind("<Enter>", lambda _e: self._set_alpha(1.0))
-        self.canvas.bind("<Leave>", lambda _e: self._set_alpha(0.96))
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Enter>", self._on_enter)
+        self.canvas.bind("<Leave>", self._on_leave)
 
         self._place(prefs.get("x"), prefs.get("y"))
         if self.hidden:
@@ -243,60 +294,62 @@ class _TimerWidget:
             hwnd = self.win.winfo_id()
             user32 = ctypes.windll.user32
             parent = user32.GetParent(hwnd)   # Tk may wrap the toplevel
-            ctypes.windll.user32.SetWindowPos(
-                parent or hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
+            user32.SetWindowPos(parent or hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE)
         except Exception:
             try:
                 self.win.attributes("-topmost", True)
             except Exception:
                 pass
 
-    def _size(self):
-        """Outer window size for the current form and docked edge."""
-        if not self.collapsed:
+    def _size_for(self, collapsed: bool, side: str) -> Tuple[int, int]:
+        if not collapsed:
             return self.card_w + 2 * self.margin, self.card_h + 2 * self.margin
-        if self.side in ("left", "right"):
+        if side in ("left", "right"):
             return self.thick + self.margin, self.long + 2 * self.margin
         return self.long + 2 * self.margin, self.thick + self.margin
+
+    def _size(self):
+        return self._size_for(self.collapsed, self.side)
+
+    def _geometry_for(self, collapsed: bool, side: str, x, y) -> Tuple[int, int, int, int]:
+        """Where a form would sit: pinned to its edge and inside the work area."""
+        wl, wt, wr, wb = self._work_area()
+        w, h = self._size_for(collapsed, side)
+        if x is None or y is None:
+            x, y = wr - w - self._px(18), wt + self._px(90)
+        x, y = int(x), int(y)
+        if collapsed:
+            # A tab belongs against its edge: pin the crossing axis, and let
+            # the drag decide only how far along the edge it sits.
+            if side == "left":
+                x = wl
+            elif side == "right":
+                x = wr - w
+            elif side == "top":
+                y = wt
+            else:
+                y = wb - h
+        x = max(wl, min(x, wr - w))
+        y = max(wt, min(y, wb - h))
+        return x, y, w, h
+
+    def _apply_geometry(self, x, y, w, h) -> None:
+        self.win.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
+        self.canvas.configure(width=int(w), height=int(h))
+        self._x, self._y = int(x), int(y)
 
     def _nearest_side(self, x: int, y: int) -> str:
         """Which working edge is this window closest to?"""
         wl, wt, wr, wb = self._work_area()
         w, h = self._size()
-        gaps = {
-            "left": x - wl,
-            "right": wr - (x + w),
-            "top": y - wt,
-            "bottom": wb - (y + h),
-        }
+        gaps = {"left": x - wl, "right": wr - (x + w),
+                "top": y - wt, "bottom": wb - (y + h)}
         return min(gaps, key=gaps.get)
 
     def _place(self, x=None, y=None) -> None:
         """Position the window, clamped to the work area (never under the taskbar)."""
-        wl, wt, wr, wb = self._work_area()
-        w, h = self._size()
-        if x is None or y is None:
-            x, y = wr - w - self._px(18), wt + self._px(90)
-        x, y = int(x), int(y)
-
-        if self.collapsed:
-            # A tab belongs against its edge: pin the crossing axis, and let
-            # the drag decide only how far along the edge it sits.
-            if self.side == "left":
-                x = wl
-            elif self.side == "right":
-                x = wr - w
-            elif self.side == "top":
-                y = wt
-            else:
-                y = wb - h
-
-        x = max(wl, min(x, wr - w))
-        y = max(wt, min(y, wb - h))
-        self.win.geometry(f"{w}x{h}+{x}+{y}")
-        self.canvas.configure(width=w, height=h)
-        self._x, self._y = x, y
+        self._apply_geometry(*self._geometry_for(self.collapsed, self.side, x, y))
         self._keep_on_top()
 
     def _set_alpha(self, value: float) -> None:
@@ -326,13 +379,37 @@ class _TimerWidget:
             print(f"[timer] {msg}")
             self._last_error = (msg, now)
 
+    def _busy(self) -> bool:
+        """Is the user visibly in the middle of using the card?"""
+        return bool(self._drag) or self._menu_open or self._pointer_in
+
+    def _maybe_auto_collapse(self) -> None:
+        """Put an ignored card away.
+
+        Two triggers, both meaning "you're done looking at this": the user has
+        gone back to some other window, or the card has simply sat there. A
+        pointer resting on it, a drag, or an open menu all count as still in
+        use and hold it open — collapsing under the cursor would send the next
+        click through to whatever is behind.
+        """
+        if self.collapsed or self.hidden or self._anim or self._busy():
+            if self._busy():
+                self._shown_at = time.time()   # still in use; restart the clock
+            return
+        fg = _foreground_window()
+        switched = bool(fg) and bool(self._fg_at_show) and fg != self._fg_at_show
+        if switched or (time.time() - self._shown_at) >= AUTO_COLLAPSE_SEC:
+            self.toggle_collapsed(animate=True, remember=False)
+
     def _tick(self) -> None:
         try:
             self._ticks += 1
             if self._ticks % REFRESH_EVERY_TICKS == 0:
                 self._snapshot = status.full_snapshot()
             if not self.hidden:
-                self._render()
+                self._maybe_auto_collapse()
+                if not self._anim:
+                    self._render()
                 if self._ticks % TOPMOST_EVERY_TICKS == 0:
                     self._keep_on_top()
         except Exception as e:
@@ -346,6 +423,83 @@ class _TimerWidget:
                 self.win.after(TICK_MS, self._tick)
             except Exception:
                 pass
+
+    # ---------- animation ----------
+
+    def toggle_collapsed(self, animate: bool = True, remember: bool = True) -> None:
+        """Slide between the card and the tab.
+
+        `remember` is False for automatic collapses: putting itself away is a
+        transient courtesy, and shouldn't overwrite the form you last chose.
+        """
+        target = not self.collapsed
+        if remember:
+            _save_prefs(collapsed=target)
+        if not animate:
+            self.collapsed = target
+            self._place(self._x, self._y)
+            self._render()
+            self._note_shown()
+            return
+
+        start = self._geometry_for(self.collapsed, self.side, self._x, self._y)
+        end = self._geometry_for(target, self.side, self._x, self._y)
+        self._anim = {"t0": time.time(), "from": start, "to": end, "target": target}
+        self._animate()
+
+    def _animate(self) -> None:
+        """One frame of the open/close slide."""
+        anim = self._anim
+        if anim is None:
+            return
+        try:
+            p = _ease((time.time() - anim["t0"]) / (ANIM_MS / 1000.0))
+            rect = [_lerp(a, b, p) for a, b in zip(anim["from"], anim["to"])]
+            self._apply_geometry(*rect)
+            self._render_morph(p if anim["target"] else 1.0 - p)
+
+            if p >= 1.0:
+                self._anim = None
+                self.collapsed = anim["target"]
+                self._place(self._x, self._y)
+                self._render()
+                self._note_shown()
+                return
+        except Exception as e:
+            # Never strand the widget mid-slide at some interpolated size.
+            self._anim = None
+            self.collapsed = anim["target"]
+            self._log_once(f"animation failed ({type(e).__name__}: {e})")
+            try:
+                self._place(self._x, self._y)
+                self._render()
+            except Exception:
+                pass
+            return
+        self.win.after(ANIM_FRAME_MS, self._animate)
+
+    def _render_morph(self, toward_tab: float) -> None:
+        """The in-between frame: just the shape, morphing card -> tab.
+
+        No text during the slide. Interpolating a layout of glyphs at 60fps
+        looks like a squash; a shape that shrinks into the edge reads as the
+        card tucking itself away.
+        """
+        accent, bg, border = self._colors()
+        self.canvas.delete("all")
+        w = int(self.canvas.cget("width") or 0)
+        h = int(self.canvas.cget("height") or 0)
+        m = self.margin
+        fill = _lerp_color(bg, accent, toward_tab)
+        edge = _lerp_color(border, accent, toward_tab)
+        radius = _lerp(self._px(16), self._px(6), toward_tab)
+        self._round_rect(m, m, max(m + 1, w - m), max(m + 1, h - m),
+                         radius, fill=fill, outline=edge)
+
+    def _note_shown(self) -> None:
+        """Restart the auto-collapse clock and remember the window in front."""
+        self._shown_at = time.time()
+        self._fg_at_show = _foreground_window()
 
     # ---------- drawing ----------
 
@@ -425,27 +579,57 @@ class _TimerWidget:
                                 fill=GRIP_ON_ACCENT, font=self.f_tab,
                                 anchor="center", angle=90 if vertical else 0)
 
+    def _chevron_zone(self) -> Tuple[float, float]:
+        """(x1, x2) of the collapse button, in canvas coordinates."""
+        x1, x2 = self.margin, self.margin + self.card_w
+        if self.side == "left":
+            return x1, x1 + self.gutter
+        return x2 - self.gutter, x2
+
     def _render_card(self) -> None:
         accent, bg, border = self._colors()
         m = self.margin
         x1, y1 = m, m
         x2, y2 = m + self.card_w, m + self.card_h
-        self._round_rect(x1, y1, x2, y2, self._px(16), fill=bg, outline=border)
-
         mid = (y1 + y2) / 2
-        # The chevron sits at the end of the card nearest the edge it collapses
-        # into, so the content slides over to make room on that side.
-        gutter = self._px(32)
-        if self.side == "left":
-            chevron_x = x1 + self._px(16)
-            content_x1, text_right = x1 + gutter, x2 - self._px(14)
+        r = self._px(16)
+        self._round_rect(x1, y1, x2, y2, r, fill=bg, outline="")
+
+        # The collapse button, drawn as its own region so the boundary between
+        # "put this away" and "open the session page" is visible rather than
+        # something you discover by clicking the wrong half. Painted on the
+        # card's exact rect and BEFORE its outline, so the rounded corners line
+        # up with the card's instead of leaving a notch.
+        gx1, gx2 = self._chevron_zone()
+        on_left = self.side == "left"
+        # Rest is a quiet panel that merely marks the boundary; hover is
+        # unmistakably the accent, confirming the click will put the card away
+        # rather than open the session page.
+        zone_fill = (_lerp_color(bg, accent, 0.55) if self._hover_chevron
+                     else _lerp_color(bg, border, 0.45))
+        self._round_rect(gx1, y1, gx2, y2, r, fill=zone_fill, outline="")
+        # Square off the inner side so it reads as a slice of the card rather
+        # than a pill floating on it.
+        inner = gx1 if on_left else gx2
+        self.canvas.create_rectangle(inner - (r if on_left else 0), y1,
+                                     inner + (0 if on_left else r), y2,
+                                     fill=zone_fill, outline="")
+        divider = gx2 if on_left else gx1
+        self.canvas.create_line(divider, y1 + self._px(10), divider, y2 - self._px(10),
+                                fill=_lerp_color(bg, accent, 0.38),
+                                width=max(1, self._px(1)))
+        # The card's border last, so it runs unbroken over the button.
+        self._round_rect(x1, y1, x2, y2, r, fill="", outline=border)
+
+        chevron_x = (gx1 + gx2) / 2
+        if on_left:
+            content_x1, text_right = x1 + self.gutter, x2 - self._px(14)
         else:
-            chevron_x = x2 - self._px(16)
-            content_x1, text_right = x1, chevron_x - self._px(12)
+            content_x1, text_right = x1, gx1 - self._px(12)
 
         dot_x = content_x1 + self._px(18)
-        r = self._px(5)
-        self.canvas.create_oval(dot_x - r, mid - r, dot_x + r, mid + r,
+        dr = self._px(5)
+        self.canvas.create_oval(dot_x - dr, mid - dr, dot_x + dr, mid + dr,
                                 fill=accent, outline="")
 
         text_x = content_x1 + self._px(34)
@@ -477,7 +661,8 @@ class _TimerWidget:
             self._render_progress(text_x, y2 - self._px(9), text_right)
 
         self.canvas.create_text(chevron_x, mid, text=CHEVRON.get(self.side, "▸"),
-                                fill=MUTED, font=self.f_word, anchor="center")
+                                fill=INK if self._hover_chevron else MUTED,
+                                font=self.f_word, anchor="center")
 
     def _render_progress(self, x1: float, y: float, x2: float) -> None:
         """Thin bar: how much of the session or break has been used up."""
@@ -502,12 +687,37 @@ class _TimerWidget:
 
     # ---------- interaction ----------
 
+    def _over_chevron(self, x: float) -> bool:
+        if self.collapsed:
+            return False
+        gx1, gx2 = self._chevron_zone()
+        return gx1 <= x <= gx2
+
+    def _on_motion(self, event) -> None:
+        hover = self._over_chevron(event.x)
+        if hover != self._hover_chevron:
+            self._hover_chevron = hover
+            if not self._anim:
+                self._render()
+
+    def _on_enter(self, _event) -> None:
+        self._pointer_in = True
+        self._set_alpha(1.0)
+
+    def _on_leave(self, _event) -> None:
+        self._pointer_in = False
+        self._hover_chevron = False
+        self._set_alpha(0.96)
+        self._note_shown()   # the countdown to putting itself away starts here
+        if not self._anim:
+            self._render()
+
     def _on_press(self, event) -> None:
         self._drag = {"x": event.x_root, "y": event.y_root,
                       "wx": self._x, "wy": self._y, "moved": False}
 
     def _on_drag(self, event) -> None:
-        if self._drag is None:
+        if self._drag is None or self._anim:
             return
         dx = event.x_root - self._drag["x"]
         dy = event.y_root - self._drag["y"]
@@ -532,29 +742,15 @@ class _TimerWidget:
             return
         if drag["moved"]:
             _save_prefs(x=self._x, y=self._y, side=self.side)
+            self._note_shown()
             self._render()  # the tab's rounded end may have swapped sides
             return
         # A click, not a drag. The chevron collapses; the body opens the page
-        # where you actually set a session. The hit zone tracks the chevron,
-        # which moves to the left end when the card docks left.
-        if self.collapsed:
-            self.toggle_collapsed()
-            return
-        gutter = self._px(32)
-        if self.side == "left":
-            on_chevron = event.x < self.margin + gutter
-        else:
-            on_chevron = event.x > self.margin + self.card_w - gutter
-        if on_chevron:
+        # where you actually set a session.
+        if self.collapsed or self._over_chevron(event.x):
             self.toggle_collapsed()
         else:
             self._open_intention()
-
-    def toggle_collapsed(self) -> None:
-        self.collapsed = not self.collapsed
-        _save_prefs(collapsed=self.collapsed)
-        self._place(self._x, self._y)
-        self._render()
 
     def reset_position(self) -> None:
         """Bring the timer back to a known-good spot.
@@ -562,12 +758,14 @@ class _TimerWidget:
         The escape hatch for "I can't find it any more" — un-hides, expands,
         and drops it at the default corner of the work area.
         """
+        self._anim = None
         self.hidden = False
         self.collapsed = False
         self.side = "right"
         self.win.deiconify()
         self._place(None, None)
         self._render()
+        self._note_shown()
         _save_prefs(hidden=False, collapsed=False, side="right",
                     x=self._x, y=self._y)
 
@@ -579,6 +777,7 @@ class _TimerWidget:
         else:
             self.win.deiconify()
             self.win.attributes("-topmost", True)
+            self._note_shown()
             self._render()
 
     def _open_dashboard(self) -> None:
@@ -592,14 +791,19 @@ class _TimerWidget:
             print(f"[timer] could not open dashboard ({e})")
 
     def _open_intention(self) -> None:
-        url = self.intention_url or self.dashboard_url
-        if not url:
-            return
-        if url == self.dashboard_url:
+        """Open wherever sessions actually get set.
+
+        The hosted dashboard when one is configured — that is the page with
+        the session card on it, and going through open_dashboard reuses a tab
+        that is already open. The monitor's own localhost /intention page is
+        the fallback for setups with no DASHBOARD_URL.
+        """
+        if self.dashboard_url:
             self._open_dashboard()
             return
-        import webbrowser
-        webbrowser.open(url)
+        if self.intention_url:
+            import webbrowser
+            webbrowser.open(self.intention_url)
 
     def _on_menu(self, event) -> None:
         snap = self._snapshot
@@ -623,10 +827,15 @@ class _TimerWidget:
         menu.add_command(label="Reset position", command=self.reset_position)
         menu.add_command(label="Open dashboard", command=self._open_dashboard)
         menu.add_command(label="Hide timer", command=lambda: self.set_hidden(True))
+        # An open menu counts as using the card, so it can't fold up underneath
+        # the menu the user is reading.
+        self._menu_open = True
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+            self._menu_open = False
+            self._note_shown()
 
     def _refresh_now(self) -> None:
         try:
