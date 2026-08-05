@@ -608,12 +608,17 @@ class _TimerWidget:
         zone_fill = (_lerp_color(bg, accent, 0.55) if self._hover_chevron
                      else _lerp_color(bg, border, 0.45))
         self._round_rect(gx1, y1, gx2, y2, r, fill=zone_fill, outline="")
-        # Square off the inner side so it reads as a slice of the card rather
-        # than a pill floating on it.
-        inner = gx1 if on_left else gx2
-        self.canvas.create_rectangle(inner - (r if on_left else 0), y1,
-                                     inner + (0 if on_left else r), y2,
-                                     fill=zone_fill, outline="")
+        # Square off the side facing the card body, so the zone reads as a
+        # slice of the card rather than a pill floating on it. This must fill
+        # INWARD from the inner edge: filling outward from the outer edge puts
+        # an opaque rectangle in the transparent margin, where it shows up as
+        # a stray bar sticking out past the card's rounded corner.
+        if on_left:
+            self.canvas.create_rectangle(gx2 - r, y1, gx2, y2,
+                                         fill=zone_fill, outline="")
+        else:
+            self.canvas.create_rectangle(gx1, y1, gx1 + r, y2,
+                                         fill=zone_fill, outline="")
         divider = gx2 if on_left else gx1
         self.canvas.create_line(divider, y1 + self._px(10), divider, y2 - self._px(10),
                                 fill=_lerp_color(bg, accent, 0.38),
