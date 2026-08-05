@@ -444,7 +444,19 @@ class _TimerWidget:
 
         start = self._geometry_for(self.collapsed, self.side, self._x, self._y)
         end = self._geometry_for(target, self.side, self._x, self._y)
-        self._anim = {"t0": time.time(), "from": start, "to": end, "target": target}
+        # Hold the window still at the union of both rects for the whole
+        # slide and move only what is painted inside it. Resizing a layered
+        # (-transparentcolor) window every frame leaves the newly exposed
+        # strips un-invalidated, and the stale pixels read as lines and boxes
+        # around the card.
+        ux1, uy1 = min(start[0], end[0]), min(start[1], end[1])
+        ux2 = max(start[0] + start[2], end[0] + end[2])
+        uy2 = max(start[1] + start[3], end[1] + end[3])
+        union = (ux1, uy1, ux2 - ux1, uy2 - uy1)
+
+        self._anim = {"t0": time.time(), "from": start, "to": end,
+                      "union": union, "target": target}
+        self._apply_geometry(*union)
         self._animate()
 
     def _animate(self) -> None:
@@ -454,32 +466,39 @@ class _TimerWidget:
             return
         try:
             p = _ease((time.time() - anim["t0"]) / (ANIM_MS / 1000.0))
-            rect = [_lerp(a, b, p) for a, b in zip(anim["from"], anim["to"])]
-            self._apply_geometry(*rect)
-            self._render_morph(p if anim["target"] else 1.0 - p)
+            x, y, w, h = (_lerp(a, b, p) for a, b in zip(anim["from"], anim["to"]))
+            ux, uy = anim["union"][0], anim["union"][1]
+            self._render_morph(x - ux, y - uy, w, h,
+                               p if anim["target"] else 1.0 - p)
 
             if p >= 1.0:
-                self._anim = None
-                self.collapsed = anim["target"]
-                self._place(self._x, self._y)
-                self._render()
-                self._note_shown()
+                self._finish_anim(anim)
                 return
         except Exception as e:
-            # Never strand the widget mid-slide at some interpolated size.
-            self._anim = None
-            self.collapsed = anim["target"]
+            # Never strand the widget mid-slide at the union size.
             self._log_once(f"animation failed ({type(e).__name__}: {e})")
             try:
-                self._place(self._x, self._y)
-                self._render()
+                self._finish_anim(anim)
             except Exception:
                 pass
             return
         self.win.after(ANIM_FRAME_MS, self._animate)
 
-    def _render_morph(self, toward_tab: float) -> None:
+    def _finish_anim(self, anim: Dict) -> None:
+        """Land on the real geometry and repaint the real content."""
+        self._anim = None
+        self.collapsed = anim["target"]
+        self._apply_geometry(*anim["to"])
+        self._keep_on_top()
+        self._render()
+        self._note_shown()
+
+    def _render_morph(self, x: float, y: float, w: float, h: float,
+                      toward_tab: float) -> None:
         """The in-between frame: just the shape, morphing card -> tab.
+
+        Coordinates are canvas-local, since the window stays put at the union
+        rect while the shape travels inside it.
 
         No text during the slide. Interpolating a layout of glyphs at 60fps
         looks like a squash; a shape that shrinks into the edge reads as the
@@ -487,13 +506,12 @@ class _TimerWidget:
         """
         accent, bg, border = self._colors()
         self.canvas.delete("all")
-        w = int(self.canvas.cget("width") or 0)
-        h = int(self.canvas.cget("height") or 0)
         m = self.margin
         fill = _lerp_color(bg, accent, toward_tab)
         edge = _lerp_color(border, accent, toward_tab)
         radius = _lerp(self._px(16), self._px(6), toward_tab)
-        self._round_rect(m, m, max(m + 1, w - m), max(m + 1, h - m),
+        self._round_rect(x + m, y + m,
+                         max(x + m + 1, x + w - m), max(y + m + 1, y + h - m),
                          radius, fill=fill, outline=edge)
 
     def _note_shown(self) -> None:
