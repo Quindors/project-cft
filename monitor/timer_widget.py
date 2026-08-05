@@ -16,17 +16,18 @@ break, slate when nothing is declared. That is the same state the tray icon
 and the dashboard read, resolved once in monitor/status.py so the three can
 never disagree.
 
-Drag it anywhere; click the chevron and it collapses into a thin colored bump
-flush against the nearest screen edge, which is still a live drift indicator
-but takes up almost nothing. Right-click for session and break actions.
+Drag it anywhere; click the chevron and it collapses into a thin colored tab
+that docks to whichever screen edge you drag it near, turning sideways on the
+top and bottom edges so it always lies flat along the edge.
 
-All Tk work happens on the shared UI thread (monitor/tk_host.py). Position
-and collapsed/hidden state persist in app_state so the widget comes back where
-you left it.
+All Tk work happens on the shared UI thread (monitor/tk_host.py). Position,
+edge and collapsed/hidden state persist in app_state so the widget comes back
+where you left it.
 """
 from __future__ import annotations
 
 import json
+import time
 from typing import Dict, Optional
 
 from monitor import app_state, breaks, status, tk_host
@@ -34,13 +35,14 @@ from monitor.window_capture import PLATFORM
 
 _STATE_KEY = "widget"
 
-# Geometry. The toplevel is bigger than the visible card: the margin is
-# chroma-keyed away on Windows, which is what gives the card round corners.
-MARGIN = 6
+# --- Geometry, in reference pixels at 100% scaling ---------------------------
+# Everything here is multiplied by the display's DPI scale at build time (see
+# _px), so the widget is the same physical size on a 100% and a 150% display
+# but is rendered at the panel's real resolution rather than bitmap-stretched.
+MARGIN = 6            # chroma-keyed gutter that lets the card have round corners
 CARD_W, CARD_H = 274, 62
-WIN_W, WIN_H = CARD_W + 2 * MARGIN, CARD_H + 2 * MARGIN
-BUMP_W, BUMP_H = 24, 78
-BUMP_WIN_W, BUMP_WIN_H = BUMP_W + MARGIN, BUMP_H + 2 * MARGIN
+BUMP_THICK = 13       # the collapsed tab's thin dimension
+BUMP_LONG = 78        # ... and its long one
 
 # The magenta that -transparentcolor knocks out. Nothing in the design uses it.
 CHROMA = "#ff00fe"
@@ -49,6 +51,9 @@ TICK_MS = 1000
 # Hitting sqlite once a second for three tiny reads is wasteful; the countdown
 # is computed locally between refreshes.
 REFRESH_EVERY_TICKS = 2
+
+# How close to an edge (reference px) a drag has to end to dock there.
+SIDES = ("left", "right", "top", "bottom")
 
 INK = "#f8fafc"
 MUTED = "#94a3b8"
@@ -64,6 +69,10 @@ PALETTE = {
     status.STATE_IDLE:     ("#94a3b8", "#111827", "#1e293b"),
 }
 _FALLBACK = PALETTE[status.STATE_IDLE]
+
+# Tk canvas colors are opaque — "#rrggbbaa" raises TclError. Grip marks are a
+# hand-picked solid instead of black-at-33%.
+GRIP_ON_ACCENT = "#0f172a"
 
 _widget: Optional["_TimerWidget"] = None
 
@@ -100,7 +109,7 @@ def _fmt_countdown(seconds: Optional[int]) -> str:
 
 
 def _fmt_compact(seconds: Optional[int]) -> str:
-    """The collapsed bump has room for about three characters."""
+    """The collapsed tab has room for about three characters."""
     if seconds is None:
         return ""
     mins = max(0, int(seconds)) // 60
@@ -121,6 +130,7 @@ class _TimerWidget:
         prefs = _load_prefs()
         self.collapsed = bool(prefs.get("collapsed"))
         self.hidden = bool(prefs.get("hidden"))
+        self.side = prefs.get("side") if prefs.get("side") in SIDES else "right"
 
         self.win = tk.Toplevel(tk_host.root())
         self.win.overrideredirect(True)
@@ -137,18 +147,29 @@ class _TimerWidget:
         except Exception:
             pass
 
+        # Render at the panel's real pixel density. The process is marked
+        # DPI-aware (tk_host), so without scaling these constants the widget
+        # would come out physically smaller on a scaled display.
+        self.scale = tk_host.ui_scale(self.win)
+        self.margin = self._px(MARGIN)
+        self.card_w, self.card_h = self._px(CARD_W), self._px(CARD_H)
+        self.thick, self.long = self._px(BUMP_THICK), self._px(BUMP_LONG)
+
         self.canvas = tk.Canvas(self.win, highlightthickness=0, bd=0, bg=CHROMA)
         self.canvas.pack(fill="both", expand=True)
 
         family = "Segoe UI" if PLATFORM == "Windows" else "TkDefaultFont"
-        self.f_time = tkfont.Font(family=family, size=22, weight="bold")
-        self.f_word = tkfont.Font(family=family, size=15, weight="bold")
-        self.f_label = tkfont.Font(family=family, size=8)
-        self.f_bump = tkfont.Font(family=family, size=8, weight="bold")
+        # Negative size means pixels, which is what the scaled layout above is
+        # in; point sizes would be scaled a second time by Tk.
+        self.f_time = tkfont.Font(family=family, size=-self._px(29), weight="bold")
+        self.f_word = tkfont.Font(family=family, size=-self._px(20), weight="bold")
+        self.f_label = tkfont.Font(family=family, size=-self._px(11))
+        self.f_tab = tkfont.Font(family=family, size=-self._px(10), weight="bold")
 
         self._snapshot: Dict = status.full_snapshot()
         self._ticks = 0
         self._drag: Optional[Dict] = None
+        self._last_error = (None, 0.0)
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -163,24 +184,54 @@ class _TimerWidget:
         self._render()
         self.win.after(TICK_MS, self._tick)
 
+    def _px(self, n: float) -> int:
+        return max(1, int(round(n * self.scale)))
+
     # ---------- placement ----------
 
     def _screen(self):
         return self.win.winfo_screenwidth(), self.win.winfo_screenheight()
 
     def _size(self):
-        return (BUMP_WIN_W, BUMP_WIN_H) if self.collapsed else (WIN_W, WIN_H)
+        """Outer window size for the current form and docked edge."""
+        if not self.collapsed:
+            return self.card_w + 2 * self.margin, self.card_h + 2 * self.margin
+        if self.side in ("left", "right"):
+            return self.thick + self.margin, self.long + 2 * self.margin
+        return self.long + 2 * self.margin, self.thick + self.margin
+
+    def _nearest_side(self, x: int, y: int) -> str:
+        """Which screen edge is this window closest to?"""
+        sw, sh = self._screen()
+        w, h = self._size()
+        gaps = {
+            "left": x,
+            "right": sw - (x + w),
+            "top": y,
+            "bottom": sh - (y + h),
+        }
+        return min(gaps, key=gaps.get)
 
     def _place(self, x=None, y=None) -> None:
-        """Position the window, clamped on screen (and edge-flush when collapsed)."""
+        """Position the window, clamped on screen and edge-flush when collapsed."""
         sw, sh = self._screen()
         w, h = self._size()
         if x is None or y is None:
-            x, y = sw - w - 18, 90
+            x, y = sw - w - self._px(18), self._px(90)
         x, y = int(x), int(y)
+
         if self.collapsed:
-            # A bump belongs against an edge — snap to whichever is nearer.
-            x = sw - w if (x + w // 2) >= sw // 2 else 0
+            # A tab belongs against its edge: pin the crossing axis, and let
+            # the drag decide only how far along the edge it sits.
+            if self.side == "left":
+                x = 0
+            elif self.side == "right":
+                x = sw - w
+            elif self.side == "top":
+                y = 0
+            else:
+                y = sh - h
+
         x = max(0, min(x, sw - w))
         y = max(0, min(y, sh - h))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
@@ -202,16 +253,36 @@ class _TimerWidget:
     def _colors(self):
         return PALETTE.get(self._snapshot.get("state"), _FALLBACK)
 
+    def _log_once(self, msg: str) -> None:
+        """Log a repeating failure at most once a minute.
+
+        This runs once a second; an unthrottled error here filled megabytes of
+        cft.log the last time something in here threw.
+        """
+        last, when = self._last_error
+        now = time.time()
+        if msg != last or (now - when) > 60:
+            print(f"[timer] {msg}")
+            self._last_error = (msg, now)
+
     def _tick(self) -> None:
-        self._ticks += 1
-        if self._ticks % REFRESH_EVERY_TICKS == 0:
-            try:
+        try:
+            self._ticks += 1
+            if self._ticks % REFRESH_EVERY_TICKS == 0:
                 self._snapshot = status.full_snapshot()
-            except Exception as e:
-                print(f"[timer] status refresh failed ({e})")
-        if not self.hidden:
-            self._render()
-        self.win.after(TICK_MS, self._tick)
+            if not self.hidden:
+                self._render()
+        except Exception as e:
+            self._log_once(f"tick failed ({type(e).__name__}: {e})")
+        finally:
+            # Re-arm no matter what. Without this a single bad frame means
+            # `after` is never scheduled again and the widget is frozen on a
+            # stale reading for the rest of the session — which is exactly
+            # what an alpha-hex canvas color once did to it.
+            try:
+                self.win.after(TICK_MS, self._tick)
+            except Exception:
+                pass
 
     # ---------- drawing ----------
 
@@ -229,56 +300,83 @@ class _TimerWidget:
         return text + "…"
 
     def _render(self) -> None:
-        self.canvas.delete("all")
-        if self.collapsed:
-            self._render_bump()
-        else:
-            self._render_card()
+        """Repaint. Never raises: a bad frame is not worth a dead clock."""
+        try:
+            self.canvas.delete("all")
+            if self.collapsed:
+                self._render_tab()
+            else:
+                self._render_card()
+        except Exception as e:
+            self._log_once(f"render failed ({type(e).__name__}: {e})")
 
-    def _render_bump(self) -> None:
-        """The collapsed form: a thin tab, rounded on the side facing inward.
+    def _render_tab(self) -> None:
+        """The collapsed form: a thin tab lying flat along its screen edge.
 
-        The rounded rect is drawn wider than the window on purpose — the half
-        hanging off the screen edge is clipped, which leaves the tab flush
-        against the edge with only its inner corners rounded.
+        The rounded rect is drawn overhanging the edge on purpose — the half
+        off-screen is clipped, leaving the tab flush against the edge with
+        only its inner corners rounded. On the top and bottom edges the whole
+        thing turns sideways, including the label, so it never sticks out.
         """
         accent, _bg, _border = self._colors()
-        sw, _ = self._screen()
-        on_right = self._x + BUMP_WIN_W // 2 >= sw // 2
-        if on_right:
-            x1, x2 = MARGIN, MARGIN + 2 * BUMP_W
-        else:
-            x1, x2 = -BUMP_W, BUMP_W
-        y1, y2 = MARGIN, MARGIN + BUMP_H
+        m, t, ln = self.margin, self.thick, self.long
+        vertical = self.side in ("left", "right")
+
+        if self.side == "right":
+            x1, x2, y1, y2 = m, m + 2 * t, m, m + ln
+        elif self.side == "left":
+            x1, x2, y1, y2 = -t, t, m, m + ln
+        elif self.side == "top":
+            x1, x2, y1, y2 = m, m + ln, -t, t
+        else:  # bottom
+            x1, x2, y1, y2 = m, m + ln, m, m + 2 * t
 
         # Filled with the state color rather than outlined in it: at this size
         # a thin accent line just reads as a scratch on the desktop, while a
         # solid tab is legible as a status from across the room.
-        self._round_rect(x1, y1, x2, y2, 11, fill=accent, outline="")
-        grip_x = (MARGIN + BUMP_W / 2) if on_right else (BUMP_W / 2)
+        self._round_rect(x1, y1, x2, y2, self._px(6), fill=accent, outline="")
+
+        if vertical:
+            cx = (m + t / 2) if self.side == "right" else (t / 2)
+            cy = m + ln / 2
+        else:
+            cx = m + ln / 2
+            cy = (t / 2) if self.side == "top" else (m + t / 2)
 
         left = self._remaining()
         if left is None:
-            # No countdown to show: a grip mark, so the tab still looks grabbable.
-            self._round_rect(grip_x - 1.5, y1 + 26, grip_x + 1.5, y2 - 26, 1.5,
-                             fill="#00000055", outline="")
+            # Nothing to count down: a grip mark, so the tab still reads as
+            # something you can grab rather than a stray colored bar.
+            half = self._px(12)
+            if vertical:
+                self._round_rect(cx - self._px(1.5), cy - half,
+                                 cx + self._px(1.5), cy + half,
+                                 self._px(1.5), fill=GRIP_ON_ACCENT, outline="")
+            else:
+                self._round_rect(cx - half, cy - self._px(1.5),
+                                 cx + half, cy + self._px(1.5),
+                                 self._px(1.5), fill=GRIP_ON_ACCENT, outline="")
             return
-        self.canvas.create_text(grip_x, (y1 + y2) / 2, text=_fmt_compact(left),
-                                fill="#0b1220", font=self.f_bump, anchor="center")
+
+        self.canvas.create_text(cx, cy, text=_fmt_compact(left),
+                                fill=GRIP_ON_ACCENT, font=self.f_tab,
+                                anchor="center", angle=90 if vertical else 0)
 
     def _render_card(self) -> None:
         accent, bg, border = self._colors()
-        x1, y1 = MARGIN, MARGIN
-        x2, y2 = MARGIN + CARD_W, MARGIN + CARD_H
-        self._round_rect(x1, y1, x2, y2, 16, fill=bg, outline=border)
+        m = self.margin
+        x1, y1 = m, m
+        x2, y2 = m + self.card_w, m + self.card_h
+        self._round_rect(x1, y1, x2, y2, self._px(16), fill=bg, outline=border)
 
-        dot_x, mid = x1 + 18, (y1 + y2) / 2
-        self.canvas.create_oval(dot_x - 5, mid - 5, dot_x + 5, mid + 5,
+        dot_x, mid = x1 + self._px(18), (y1 + y2) / 2
+        r = self._px(5)
+        self.canvas.create_oval(dot_x - r, mid - r, dot_x + r, mid + r,
                                 fill=accent, outline="")
 
-        text_x = x1 + 34
-        chevron_x = x2 - 16
-        text_right = chevron_x - 12
+        text_x = x1 + self._px(34)
+        chevron_x = x2 - self._px(16)
+        text_right = chevron_x - self._px(12)
         text_w = text_right - text_x
         snap = self._snapshot
         left = self._remaining()
@@ -286,23 +384,25 @@ class _TimerWidget:
         if left is None:
             # No session, no break: the state word IS the readout. There is
             # nothing to count down to, so no digits are shown at all.
-            self.canvas.create_text(text_x, mid - 8, text=snap.get("label", "Focus"),
+            self.canvas.create_text(text_x, mid - self._px(8),
+                                    text=snap.get("label", "Focus"),
                                     fill=INK, font=self.f_word, anchor="w")
             # The category if the monitor has classified anything yet. No
             # "stale" wording here: before the first decision of a run there
             # simply is no reading, and saying so alarms for no reason.
             sub = snap.get("category") or "no session set"
-            self.canvas.create_text(text_x, mid + 13,
+            self.canvas.create_text(text_x, mid + self._px(13),
                                     text=self._ellipsize(sub, self.f_label, text_w),
                                     fill=MUTED, font=self.f_label, anchor="w")
         else:
-            self.canvas.create_text(text_x, y1 + 21, text=_fmt_countdown(left),
+            self.canvas.create_text(text_x, y1 + self._px(21),
+                                    text=_fmt_countdown(left),
                                     fill=INK, font=self.f_time, anchor="w")
             self.canvas.create_text(
-                text_x, y1 + 41,
+                text_x, y1 + self._px(41),
                 text=self._ellipsize(snap.get("label", ""), self.f_label, text_w),
                 fill=MUTED, font=self.f_label, anchor="w")
-            self._render_progress(text_x, y2 - 9, text_right)
+            self._render_progress(text_x, y2 - self._px(9), text_right)
 
         self.canvas.create_text(chevron_x, mid, text="›", fill=MUTED,
                                 font=self.f_word, anchor="center")
@@ -322,9 +422,10 @@ class _TimerWidget:
             except ValueError:
                 pass
         accent = self._colors()[0]
-        self._round_rect(x1, y, x2, y + 3, 1.5, fill="#1e293b", outline="")
+        h, r = self._px(3), self._px(1.5)
+        self._round_rect(x1, y, x2, y + h, r, fill="#1e293b", outline="")
         if used > 0:
-            self._round_rect(x1, y, x1 + (x2 - x1) * used, y + 3, 1.5,
+            self._round_rect(x1, y, x1 + (x2 - x1) * used, y + h, r,
                              fill=accent, outline="")
 
     # ---------- interaction ----------
@@ -338,9 +439,20 @@ class _TimerWidget:
             return
         dx = event.x_root - self._drag["x"]
         dy = event.y_root - self._drag["y"]
-        if abs(dx) > 3 or abs(dy) > 3:
+        if abs(dx) > self._px(3) or abs(dy) > self._px(3):
             self._drag["moved"] = True
-        self._place(self._drag["wx"] + dx, self._drag["wy"] + dy)
+
+        nx, ny = self._drag["wx"] + dx, self._drag["wy"] + dy
+        if self.collapsed:
+            # Re-dock live, so the tab visibly turns sideways as you drag it
+            # onto the top or bottom edge instead of snapping at the end.
+            side = self._nearest_side(nx, ny)
+            if side != self.side:
+                self.side = side
+                self._place(nx, ny)
+                self._render()
+                return
+        self._place(nx, ny)
 
     def _on_release(self, event) -> None:
         drag = self._drag
@@ -348,12 +460,12 @@ class _TimerWidget:
         if drag is None:
             return
         if drag["moved"]:
-            _save_prefs(x=self._x, y=self._y)
-            self._render()  # the bump's rounded end may have swapped sides
+            _save_prefs(x=self._x, y=self._y, side=self.side)
+            self._render()  # the tab's rounded end may have swapped sides
             return
         # A click, not a drag. The chevron collapses; the body opens the page
         # where you actually set a session.
-        if not self.collapsed and event.x < MARGIN + CARD_W - 30:
+        if not self.collapsed and event.x < self.margin + self.card_w - self._px(30):
             self._open_intention()
         else:
             self.toggle_collapsed()
@@ -423,8 +535,8 @@ class _TimerWidget:
     def _refresh_now(self) -> None:
         try:
             self._snapshot = status.full_snapshot()
-        except Exception:
-            pass
+        except Exception as e:
+            self._log_once(f"refresh failed ({type(e).__name__}: {e})")
         self._render()
 
     def _start_break(self) -> None:

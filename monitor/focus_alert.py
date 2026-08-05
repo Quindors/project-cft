@@ -70,15 +70,20 @@ class _AlertWindow:
             pass
 
         # --- the card, fully opaque ---
-        family = "Segoe UI" if PLATFORM == "Windows" else "TkDefaultFont"
-        f_title = tkfont.Font(family=family, size=34, weight="bold")
-        f_body = tkfont.Font(family=family, size=16)
-        f_btn = tkfont.Font(family=family, size=13, weight="bold")
-        f_hint = tkfont.Font(family=family, size=10)
+        # The process is DPI-aware (tk_host), so this pixel layout is scaled
+        # to keep its physical size while being drawn at full resolution.
+        s = tk_host.ui_scale(self.backdrop)
+        px = lambda n: max(1, int(round(n * s)))
 
-        pad = 8
-        card_w = max(520, min(860, int(sw * 0.66)))
-        card_h = 380
+        family = "Segoe UI" if PLATFORM == "Windows" else "TkDefaultFont"
+        f_title = tkfont.Font(family=family, size=-px(45), weight="bold")
+        f_body = tkfont.Font(family=family, size=-px(21))
+        f_btn = tkfont.Font(family=family, size=-px(17), weight="bold")
+        f_hint = tkfont.Font(family=family, size=-px(13))
+
+        pad = px(8)
+        card_w = max(px(520), min(px(860), int(sw * 0.66)))
+        card_h = px(380)
         win_w, win_h = card_w + 2 * pad, card_h + 2 * pad
 
         self.win = tk.Toplevel(root)
@@ -99,26 +104,26 @@ class _AlertWindow:
         x1, y1 = pad, pad
         x2, y2 = pad + card_w, pad + card_h
         cx = win_w / 2
-        self._round_rect(canvas, x1, y1, x2, y2, 24, fill=CARD_BG, outline=CARD_BORDER)
+        self._round_rect(canvas, x1, y1, x2, y2, px(24), fill=CARD_BG, outline=CARD_BORDER)
         # A bar of the alert color across the top, clipped to the rounded head.
-        self._round_rect(canvas, x1, y1, x2, y1 + 26, 24, fill=ACCENT, outline="")
-        canvas.create_rectangle(x1, y1 + 14, x2, y1 + 26, fill=ACCENT, outline="")
+        self._round_rect(canvas, x1, y1, x2, y1 + px(26), px(24), fill=ACCENT, outline="")
+        canvas.create_rectangle(x1, y1 + px(14), x2, y1 + px(26), fill=ACCENT, outline="")
 
-        canvas.create_text(cx, y1 + 96, text=title, fill=INK,
+        canvas.create_text(cx, y1 + px(96), text=title, fill=INK,
                            font=f_title, anchor="center")
 
         # The message arrives as "<headline>\n<detail>" from the runner.
         lines = [ln for ln in (message or "").split("\n") if ln.strip()]
-        y = y1 + 158
+        y = y1 + px(158)
         for line in lines[:4]:
             canvas.create_text(cx, y, text=line, fill=MUTED, font=f_body,
-                               anchor="center", width=card_w - 100)
-            y += 38
+                               anchor="center", width=card_w - px(100))
+            y += px(38)
 
-        btn_w, btn_h = 240, 52
-        bx1, by1 = cx - btn_w / 2, y2 - 104
+        btn_w, btn_h = px(240), px(52)
+        bx1, by1 = cx - btn_w / 2, y2 - px(104)
         bx2, by2 = cx + btn_w / 2, by1 + btn_h
-        btn = self._round_rect(canvas, bx1, by1, bx2, by2, 14,
+        btn = self._round_rect(canvas, bx1, by1, bx2, by2, px(14),
                                fill=ACCENT, outline="")
         label = canvas.create_text((bx1 + bx2) / 2, (by1 + by2) / 2,
                                    text="Back to it", fill="#ffffff",
@@ -126,7 +131,7 @@ class _AlertWindow:
         for item in (btn, label):
             canvas.tag_bind(item, "<Button-1>", lambda _e: self.close())
 
-        canvas.create_text(cx, y2 - 32, text="Esc to dismiss",
+        canvas.create_text(cx, y2 - px(32), text="Esc to dismiss",
                            fill="#64748b", font=f_hint, anchor="center")
 
         # Only the button and the keyboard dismiss it. Clicking the backdrop
