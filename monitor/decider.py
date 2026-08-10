@@ -720,6 +720,24 @@ def decide(
     final_conf, final_reason, final_align, vision_ran, primary, vision.
     """
     intention_id = intention["id"] if intention else None
+
+    # --- 0. Has the user already ruled on this window for this intention? ---
+    # An ALIGN correction is human ground truth about alignment, the way a
+    # category correction is about category: it outranks whatever the models
+    # decide below, on every return path (see mk_ret and the shortcut paths).
+    forced_align: Optional[float] = None
+    if intention and events_context:
+        try:
+            from monitor import intent_corrections
+            ruled = intent_corrections.lookup(intention["text"], events_context[-1][1])
+        except Exception as e:
+            print(f"[intent] correction lookup skipped ({e})")
+            ruled = None
+        if ruled is not None:
+            forced_align = 1.0 if ruled else 0.0
+            print(f"[intent] user ruled this window "
+                  f"{'ON' if ruled else 'OFF'}-intent for \"{intention['text'][:40]}\"")
+
     # --- 1. User correction exact-match ---
     # A correction pins the CATEGORY (human ground truth), but ALIGN is
     # intention-relative and a category label says nothing about it. With no
@@ -773,6 +791,9 @@ def decide(
             print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
             result = dict(cached)
             result["final_reason"] = f"[cache] {cached.get('final_reason', '')}"
+            # A ruling made after this was cached still wins.
+            if forced_align is not None:
+                result["final_align"] = forced_align
             return result
 
     # --- 3. Primary text-LLM call ---
@@ -803,6 +824,8 @@ def decide(
     current_window = events_context[-1][1] if events_context else ""
 
     def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None, align=None):
+        if forced_align is not None:
+            align = forced_align
         result = {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
@@ -834,7 +857,7 @@ def decide(
             "final_off": 0.0 if is_productive else 1.0,
             "final_conf": 1.0,
             "final_reason": reason,
-            "final_align": p1_align,
+            "final_align": p1_align if forced_align is None else forced_align,
             "vision_ran": False,
             # Report the human correction as the primary, not the LLM call we
             # made only to score ALIGN — sinks log primary conf/reason, and the

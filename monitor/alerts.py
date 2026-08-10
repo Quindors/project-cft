@@ -18,13 +18,15 @@ def _popup_messagebox(message: str, title: str) -> None:
     ctypes.windll.user32.MessageBoxW(0, message, title, flags)
 
 
-def _popup_windows(message: str, title: str) -> None:
+def _popup_windows(message: str, title: str, on_correct=None) -> None:
     try:
         from monitor import focus_alert
-        if focus_alert.show(message, title):
+        if focus_alert.show(message, title, on_correct=on_correct):
             return
     except Exception as e:
         print(f"[popup] full-screen alert unavailable ({e}); using MessageBox")
+    # The MessageBox fallback has no room for a correction button; the same
+    # ruling is always available from the dashboard.
     _popup_messagebox(message, title)
 
 
@@ -108,13 +110,17 @@ def _popup_macos(message: str, title: str) -> None:
         print(f"[popup] {title}: {message}")
 
 
-def show_popup(message: str, title: str = "Productivity Alert") -> None:
-    """Route to the correct platform popup."""
+def show_popup(message: str, title: str = "Productivity Alert", on_correct=None) -> None:
+    """Route to the correct platform popup.
+
+    on_correct is offered as a button on the full-screen Windows alert ("this
+    IS my session work"); the other platforms' popups ignore it.
+    """
     message = message.replace("'", "").replace('"', '')
     title = title.replace("'", "").replace('"', '')
 
     if PLATFORM == "Windows":
-        _popup_windows(message, title)
+        _popup_windows(message, title, on_correct)
     elif IS_WSL:
         _popup_wsl(message, title)
     elif PLATFORM == "Darwin":

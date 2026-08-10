@@ -311,6 +311,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/mode": self._post_mode,
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
+            "/api/intent-correct": self._post_intent_correct,
         }
         handlers = {
             "/api/correct": self._post_correct,
@@ -368,6 +369,37 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=400)
             return
         self._send_json({"ok": True, "mode": mode})
+
+    def _post_intent_correct(self, body) -> None:
+        """Rule a window on/off-intent for the active session's intention.
+
+        The same ruling the alert's button records, reachable from the
+        dashboard for windows you noticed after the fact.
+        """
+        from monitor import intent_corrections
+
+        window = (body.get("window") or "").strip()
+        text = (body.get("intention") or "").strip()
+        if not text:
+            active = intentions.get_active()
+            if active is None:
+                self._send_json({"error": "no active session to correct against"}, status=400)
+                return
+            text = active["text"]
+        if not window:
+            self._send_json({"error": "expected JSON body {window, aligned}"}, status=400)
+            return
+
+        if body.get("aligned") is None:
+            removed = intent_corrections.clear(text, window)
+            self._send_json({"ok": True, "cleared": removed, "window": window})
+            return
+        try:
+            saved = intent_corrections.save(text, window, bool(body.get("aligned")))
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, **saved})
 
     def _post_intention_end(self, body) -> None:
         status = (body.get("status") or "completed").strip().lower()

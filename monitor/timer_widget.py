@@ -228,6 +228,9 @@ class _TimerWidget:
         # was working in at that moment.
         self._shown_at = time.time()
         self._fg_at_show = _foreground_window()
+        # Last state we reacted to, so the drift peek fires on the transition
+        # into off-intent rather than every tick it stays there.
+        self._last_state: Optional[str] = self._snapshot.get("state")
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -401,11 +404,36 @@ class _TimerWidget:
         if switched or (time.time() - self._shown_at) >= AUTO_COLLAPSE_SEC:
             self.toggle_collapsed(animate=True, remember=False)
 
+    def _peek_on_drift(self) -> None:
+        """Slide the card out the moment a decision lands off-intent.
+
+        The tab already turns red, but a 6px stripe at the edge of the screen
+        is exactly the kind of thing you stop seeing. This is the smallest
+        interruption that still registers: the card comes out, says what it
+        caught, and the existing auto-collapse puts it away a few seconds
+        later. The full-screen alert still waits for sustained drift — this is
+        the early word, not the intervention.
+        """
+        state = (self._snapshot or {}).get("state")
+        previous, self._last_state = self._last_state, state
+        if state != status.STATE_OFF or previous == status.STATE_OFF:
+            return  # not a fresh drift
+        # Hidden means the user does not want to see it, and mid-drag or
+        # mid-menu means they are already busy with the card.
+        if self.hidden or self._anim or self._busy():
+            return
+        if self.collapsed:
+            # remember=False: a peek must not change the resting shape the
+            # user chose, so it collapses back to a tab afterwards.
+            self.toggle_collapsed(animate=True, remember=False)
+        self._note_shown()
+
     def _tick(self) -> None:
         try:
             self._ticks += 1
             if self._ticks % REFRESH_EVERY_TICKS == 0:
                 self._snapshot = status.full_snapshot()
+                self._peek_on_drift()
             if not self.hidden:
                 self._maybe_auto_collapse()
                 if not self._anim:

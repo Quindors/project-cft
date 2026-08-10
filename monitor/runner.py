@@ -302,7 +302,9 @@ def _run_live_loop(
                                     else "Only loosely related to your session")
                             msg = (f"{lead} for {int(dwell // 60)}m ({cat_name})\n"
                                    f"Session: {intention['text']}")
-                            show_popup(msg, "Focus Alert")
+                            window_now = events_buffer[-1][1] if events_buffer else ""
+                            show_popup(msg, "Focus Alert",
+                                       on_correct=_intent_correction_hook(intention, window_now))
                             last_drift_alert = now_t
                 elif decision.get("final_is_productive") is False and settings.popup.enabled:
                     cat_name = decision.get("final_category_name", "Unknown")
@@ -563,6 +565,24 @@ def _dwell_for(tier: str, settings: Settings) -> float:
     """Seconds of continuous drift in `tier` before it earns an alert."""
     return (settings.intention.partial_dwell_sec if tier == INTENT_PARTIAL
             else settings.intention.dwell_sec)
+
+
+def _intent_correction_hook(intention: Dict, window_title: str):
+    """Build the "this IS my session work" action offered on the alert.
+
+    Returns None when there is nothing to record against, so the alert simply
+    doesn't draw the button.
+    """
+    if not intention or not window_title:
+        return None
+
+    def _record() -> None:
+        from monitor import intent_corrections
+        intent_corrections.save(intention["text"], window_title, aligned=True)
+        print(f"[intent] user ruled '{window_title[:50]}' ON-intent for "
+              f"\"{intention['text'][:40]}\"")
+
+    return _record
 
 
 def _update_drift(tier: str, drift_tier, drift_since, now: float):
