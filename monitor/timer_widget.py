@@ -88,8 +88,10 @@ _FALLBACK = PALETTE[status.STATE_IDLE]
 GRIP_ON_ACCENT = "#0f172a"
 
 # The collapse affordance points at the edge the card will fly to, so it
-# doubles as a reminder of where the tab is about to appear.
-CHEVRON = {"left": "◂", "right": "▸", "top": "▴", "bottom": "▾"}
+# doubles as a reminder of where the tab is about to appear. It is drawn as a
+# polygon rather than set as a glyph — see _draw_chevron.
+CHEVRON_HALF_W = 5     # extent across the direction it points
+CHEVRON_HALF_H = 6     # ... and along it
 
 _widget: Optional["_TimerWidget"] = None
 
@@ -711,9 +713,30 @@ class _TimerWidget:
                 fill=MUTED, font=self.f_label, anchor="w")
             self._render_progress(text_x, y2 - self._px(9), text_right)
 
-        self.canvas.create_text(chevron_x, mid, text=CHEVRON.get(self.side, "▸"),
-                                fill=INK if self._hover_chevron else MUTED,
-                                font=self.f_word, anchor="center")
+        self._draw_chevron(chevron_x, mid,
+                           INK if self._hover_chevron else MUTED)
+
+    def _draw_chevron(self, cx: float, cy: float, color: str) -> None:
+        """The collapse arrow, as a triangle centred exactly on (cx, cy).
+
+        It used to be a text glyph, which Tk positions by the font's LINE BOX
+        (ascent + descent) rather than by the mark actually drawn. A small
+        triangle fills very little of that box, so its ink landed measurably
+        below centre — 2px at this size in Segoe UI, uniformly across all four
+        directions. A polygon has no metrics to disagree with: it is centred
+        where we put it, at any DPI, in any font.
+        """
+        a, b = self._px(CHEVRON_HALF_W), self._px(CHEVRON_HALF_H)
+        if self.side == "left":
+            pts = [cx + a, cy - b, cx + a, cy + b, cx - a, cy]
+        elif self.side == "top":
+            pts = [cx - b, cy + a, cx + b, cy + a, cx, cy - a]
+        elif self.side == "bottom":
+            pts = [cx - b, cy - a, cx + b, cy - a, cx, cy + a]
+        else:  # right
+            pts = [cx - a, cy - b, cx - a, cy + b, cx + a, cy]
+        return self.canvas.create_polygon(pts, fill=color, outline="",
+                                          tags="chevron")
 
     def _render_progress(self, x1: float, y: float, x2: float) -> None:
         """Thin bar: how much of the session or break has been used up."""
