@@ -128,7 +128,7 @@ def _fmt_countdown(seconds: Optional[int]) -> str:
 
 
 def _fmt_compact(seconds: Optional[int]) -> str:
-    """The collapsed tab has room for about three characters."""
+    """Fallback for a tab too short for the full clock: whole minutes only."""
     if seconds is None:
         return ""
     mins = max(0, int(seconds)) // 60
@@ -623,7 +623,15 @@ class _TimerWidget:
                                  self._px(1.5), fill=GRIP_ON_ACCENT, outline="")
             return
 
-        self.canvas.create_text(cx, cy, text=_fmt_compact(left),
+        # The full clock, seconds and all. The text runs along the tab's long
+        # axis in both orientations (rotated on the vertical edges), so that
+        # is the dimension it has to fit; if it ever doesn't — a very long
+        # session, a coarse display — fall back to whole minutes rather than
+        # letting it run off the end.
+        label = _fmt_countdown(left)
+        if self.f_tab.measure(label) > ln - self._px(8):
+            label = _fmt_compact(left)
+        self.canvas.create_text(cx, cy, text=label,
                                 fill=GRIP_ON_ACCENT, font=self.f_tab,
                                 anchor="center", angle=90 if vertical else 0)
 
