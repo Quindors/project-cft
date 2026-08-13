@@ -628,7 +628,16 @@ CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0
 
 # ==================== SYSTEM WINDOW DETECTION ====================
 
-# Known system/utility windows (lowercase substrings for matching)
+# Known system/utility windows. Matched against the WHOLE title or the app
+# name at its end — never as a substring anywhere.
+#
+# A substring test let any window claim to be one. A tab named "command
+# prompt" (a known trick for slipping past blockers) took the shortcut below:
+# no LLM call, no vision, category System — which resolves to no-signal, so it
+# never counts as drift and never raises an alert. It also fired on innocent
+# titles: a video called "How to use Task Manager" was silently logged as
+# System. Real system windows carry bare titles; a browser appends its own
+# name ("... - Google Chrome"), so anchoring the match separates them.
 _SYSTEM_WINDOWS = [
     "snipping tool",
     "task switching",
@@ -642,14 +651,27 @@ _SYSTEM_WINDOWS = [
     "command prompt",
 ]
 
+# Distinctive enough that nothing else could plausibly contain them, so these
+# stay substring matches — a lock screen must be recognised whatever decoration
+# Windows hangs off the title.
+_ALWAYS_SYSTEM = [
+    "unlockingwindow",
+    "windows default lock screen",
+]
+
 
 def _is_system_window(title: str) -> bool:
     """Check if window title matches a known system/utility window."""
     clean = title.strip()
     if clean.upper().startswith("WIN:"):
         clean = clean[4:]
-    lower = clean.lower()
-    return any(pattern in lower for pattern in _SYSTEM_WINDOWS)
+    lower = " ".join(clean.split()).lower()
+    if any(pattern in lower for pattern in _ALWAYS_SYSTEM):
+        return True
+    if lower in _SYSTEM_WINDOWS:
+        return True
+    # The last " - " segment is where the owning app names itself.
+    return lower.rsplit(" - ", 1)[-1].strip() in _SYSTEM_WINDOWS
 
 
 # ==================== VISION TIEBREAKER LOGIC ====================
