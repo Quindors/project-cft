@@ -19,6 +19,9 @@ class PopupSettings:
     sound_enabled: bool = True
     repeat_while_offtask: bool = True
     cooldown_sec: float = 5.0   # re-alert every 5s while OFF-TASK
+    # Breathing room after an alert is dismissed before deciding again, so the
+    # verdict is about where the user went, not the moment they closed it.
+    resume_grace_sec: float = 2.0
 
 @dataclass(frozen=True)
 class IntentionSettings:

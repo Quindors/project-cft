@@ -19,6 +19,7 @@ from monitor import intentions as intentions_store
 from monitor import app_state
 from monitor import breaks as breaks_store
 from monitor import status as status_store
+from monitor import alerts as alerts_module
 
 
 def run_monitor_loop(
@@ -116,6 +117,11 @@ def _run_live_loop(
     # torn down once on the way in and rebuilt once on the way out.
     on_break = False
 
+    # Alert state: decisions stop while the sheet is up, and stay stopped for
+    # a moment after it closes so the verdict lands on where the user went.
+    alert_was_open = False
+    resume_at: Optional[float] = None
+
     # Corrections made in the dashboard while we run take effect within this
     # interval — no restart needed. decide() checks corrections before its
     # session cache, so a refreshed correction overrides cached classifications.
@@ -164,6 +170,37 @@ def _run_live_loop(
                 status_store.set_paused(False)
                 last_decision_time = time.time()
                 print("[runner] break over — monitoring resumed")
+
+            # --- an alert is on screen: decide nothing until it is gone ---
+            # The sheet covers the display, so a screenshot shows the alert
+            # rather than the user's work, and the window behind it hasn't
+            # changed yet anyway. Judging through it would log the seconds
+            # someone spends reading (or hesitating over) the alert as more of
+            # the drift it is complaining about. Capture keeps running; only
+            # the verdict waits.
+            if alerts_module.alert_is_open():
+                if not alert_was_open:
+                    alert_was_open = True
+                    print("[runner] alert on screen — decisions paused")
+                time.sleep(settings.poll_interval)
+                continue
+
+            if alert_was_open:
+                alert_was_open = False
+                resume_at = time.time() + settings.popup.resume_grace_sec
+                print(f"[runner] alert dismissed — resuming in "
+                      f"{settings.popup.resume_grace_sec:.0f}s")
+
+            if resume_at is not None:
+                if time.time() < resume_at:
+                    time.sleep(settings.poll_interval)
+                    continue
+                # Grace over. Judge where they went, not the click that closed
+                # the alert, so the buffer starts from what is in front now.
+                resume_at = None
+                events_buffer = []
+                event_src.reset()
+                print("[runner] monitoring resumed")
 
             now_dt = event_src.now_dt()
 
@@ -255,7 +292,12 @@ def _run_live_loop(
                     intention=intention,
                 )
                 llm_time = time.time() - t
-                print(f"[runner] LLM pipeline took {llm_time:.2f}s (vision_ran={decision.get('vision_ran', False)})")
+                # vision_ran is a property of the verdict, not of this pass:
+                # a cached hit replays it and reads as though vision just ran.
+                from_cache = str(decision.get("final_reason", "")).startswith("[cache]")
+                how = ("replayed from cache"
+                       if from_cache else f"vision_ran={decision.get('vision_ran', False)}")
+                print(f"[runner] LLM pipeline took {llm_time:.2f}s ({how})")
 
                 # Log to console
                 _log_decision(decision, settings)

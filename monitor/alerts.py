@@ -110,6 +110,22 @@ def _popup_macos(message: str, title: str) -> None:
         print(f"[popup] {title}: {message}")
 
 
+def alert_is_open() -> bool:
+    """Is a full-screen drift alert on screen right now?
+
+    The runner pauses on this: while the sheet is up the only thing to see is
+    the sheet, and a user who hasn't realised they can just switch windows
+    shouldn't have their hesitation logged as more drift.
+    """
+    if PLATFORM != "Windows":
+        return False
+    try:
+        from monitor import focus_alert
+        return focus_alert.is_open()
+    except Exception:
+        return False
+
+
 def show_popup(message: str, title: str = "Productivity Alert", on_correct=None) -> None:
     """Route to the correct platform popup.
 

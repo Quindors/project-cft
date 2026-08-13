@@ -35,7 +35,15 @@ IS_WSL = PLATFORM == "Linux" and _is_wsl()
 # ---------- Windows ----------
 
 def _get_active_window_windows() -> str:
-    """Get active window title using Win32 API."""
+    """Get active window title using Win32 API.
+
+    Our own windows (the timer widget titled "cft", the drift alert) are NOT
+    filtered out, deliberately. Their titles carry no evidence, so the primary
+    falls through to the vision tiebreaker, which reads the screen *behind*
+    the small widget and reports what the user was actually doing — a better
+    answer than the gap that skipping them would leave. The full-screen alert
+    is the exception, and the runner handles that by pausing outright.
+    """
     import ctypes
     user32 = ctypes.windll.user32
     hwnd = user32.GetForegroundWindow()
