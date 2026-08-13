@@ -19,7 +19,8 @@ never disagree.
 It is a peek, not a panel. The resting form is a thin colored tab docked to a
 screen edge; clicking it slides the card out, and the card puts itself away
 again — when you go back to another window, or after a few seconds of being
-ignored. Anything that looks like you are still using it (the pointer resting
+ignored. It slides open once by itself at startup, so the monitor coming up
+is something you see rather than something you have to check. Anything that looks like you are still using it (the pointer resting
 on it, a drag, an open menu) holds it open. Drag it near any edge to re-dock,
 and it turns sideways on the top and bottom edges so it always lies flat.
 
@@ -72,6 +73,13 @@ DRAG_FOLLOW = 0.3
 SIDE_HYSTERESIS = 48
 # How long an ignored card stays out before putting itself away.
 AUTO_COLLAPSE_SEC = 10.0
+# The card slides open once at startup. Long enough after construction that
+# the window is really on screen, so the slide is seen rather than missed.
+STARTUP_OPEN_DELAY_MS = 700
+# ... and for that long, "you switched windows" does not count as a dismissal.
+# Logging in churns the foreground window constantly, which would otherwise
+# fold the card away a second after it appeared and defeat the whole point.
+STARTUP_GRACE_SEC = 12.0
 
 SIDES = ("left", "right", "top", "bottom")
 
@@ -186,9 +194,13 @@ class _TimerWidget:
         self.intention_url = intention_url
 
         prefs = _load_prefs()
-        self.collapsed = bool(prefs.get("collapsed"))
         self.hidden = bool(prefs.get("hidden"))
         self.side = prefs.get("side") if prefs.get("side") in SIDES else "right"
+        # Always come up as a tab and slide open, whatever form it was last
+        # left in: the card arriving on its own is how you know the monitor
+        # started. It goes back to minding its own business as soon as the
+        # auto-collapse timer runs out.
+        self.collapsed = True
 
         self.win = tk.Toplevel(tk_host.root())
         self.win.overrideredirect(True)
@@ -237,6 +249,7 @@ class _TimerWidget:
         # was working in at that moment.
         self._shown_at = time.time()
         self._fg_at_show = _foreground_window()
+        self._fg_grace_until = time.time() + STARTUP_GRACE_SEC
         # Last state we reacted to, so the drift peek fires on the transition
         # into off-intent rather than every tick it stays there.
         self._last_state: Optional[str] = self._snapshot.get("state")
@@ -254,6 +267,16 @@ class _TimerWidget:
             self.win.withdraw()
         self._render()
         self.win.after(TICK_MS, self._tick)
+        if not self.hidden:
+            self.win.after(STARTUP_OPEN_DELAY_MS, self._open_on_start)
+
+    def _open_on_start(self) -> None:
+        """Slide open once, unprompted, so the timer announces itself."""
+        if self.hidden or self._anim or not self.collapsed:
+            return
+        # remember=False: this is not a form the user chose, so it must not
+        # overwrite the one they did.
+        self.toggle_collapsed(animate=True, remember=False)
 
     def _px(self, n: float) -> int:
         return max(1, int(round(n * self.scale)))
@@ -447,7 +470,12 @@ class _TimerWidget:
                 self._shown_at = time.time()   # still in use; restart the clock
             return
         fg = _foreground_window()
-        switched = bool(fg) and bool(self._fg_at_show) and fg != self._fg_at_show
+        # The "you went back to another window" trigger is suppressed briefly
+        # after startup: logging in churns the foreground constantly, and the
+        # card would be gone before it had been seen. The idle timeout still
+        # applies, so it never outstays its welcome either way.
+        switched = (bool(fg) and bool(self._fg_at_show) and fg != self._fg_at_show
+                    and time.time() >= self._fg_grace_until)
         if switched or (time.time() - self._shown_at) >= AUTO_COLLAPSE_SEC:
             self.toggle_collapsed(animate=True, remember=False)
 
