@@ -63,6 +63,13 @@ TOPMOST_EVERY_TICKS = 4
 # Open/close animation. 500ms reads as deliberate rather than sluggish.
 ANIM_MS = 500.0
 ANIM_FRAME_MS = 16          # ~60fps
+# Dragging follows the pointer with a little weight instead of being nailed to
+# it: the window closes this fraction of the remaining distance each frame.
+DRAG_FOLLOW = 0.3
+# How much closer a different edge must be before a drag re-docks to it. Near a
+# corner two edges are within a pixel of each other, and without this the tab
+# flips between them on every jitter of the mouse.
+SIDE_HYSTERESIS = 48
 # How long an ignored card stays out before putting itself away.
 AUTO_COLLAPSE_SEC = 10.0
 
@@ -339,18 +346,56 @@ class _TimerWidget:
         y = max(wt, min(y, wb - h))
         return x, y, w, h
 
+    def _shape_rect(self, collapsed: bool, side: str,
+                    x: float, y: float, w: float, h: float):
+        """Absolute rect of the drawn shape for a window at (x, y, w, h).
+
+        The card is inset by the margin on every side. The tab deliberately
+        overhangs its screen edge so the overhang is clipped and it sits flush
+        — matching _render_tab. Animating between these two rects is what
+        makes the slide end flush instead of leaving a gap along the edge.
+        """
+        m, t, ln = self.margin, self.thick, self.long
+        if not collapsed:
+            return (x + m, y + m, x + w - m, y + h - m)
+        if side == "right":
+            return (x + m, y + m, x + m + 2 * t, y + m + ln)
+        if side == "left":
+            return (x - t, y + m, x + t, y + m + ln)
+        if side == "top":
+            return (x + m, y - t, x + m + ln, y + t)
+        return (x + m, y + m, x + m + ln, y + m + 2 * t)   # bottom
+
     def _apply_geometry(self, x, y, w, h) -> None:
         self.win.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
         self.canvas.configure(width=int(w), height=int(h))
         self._x, self._y = int(x), int(y)
 
-    def _nearest_side(self, x: int, y: int) -> str:
-        """Which working edge is this window closest to?"""
+    def _edge_gaps(self, x: float, y: float) -> Dict[str, float]:
         wl, wt, wr, wb = self._work_area()
         w, h = self._size()
-        gaps = {"left": x - wl, "right": wr - (x + w),
+        return {"left": x - wl, "right": wr - (x + w),
                 "top": y - wt, "bottom": wb - (y + h)}
+
+    def _nearest_side(self, x: float, y: float) -> str:
+        """Which working edge is this window closest to?"""
+        gaps = self._edge_gaps(x, y)
         return min(gaps, key=gaps.get)
+
+    def _pick_side(self, x: float, y: float, current: str) -> str:
+        """Nearest edge, but sticky — used while a drag is in flight.
+
+        Dead-on a corner the two adjoining edges are the same distance away,
+        so picking the nearest outright makes the tab flip back and forth on
+        sub-pixel movements. A challenger has to be clearly closer to win.
+        """
+        gaps = self._edge_gaps(x, y)
+        best = min(gaps, key=gaps.get)
+        if best == current:
+            return current
+        if gaps[best] < gaps.get(current, float("inf")) - self._px(SIDE_HYSTERESIS):
+            return best
+        return current
 
     def _place(self, x=None, y=None) -> None:
         """Position the window, clamped to the work area (never under the taskbar)."""
@@ -484,8 +529,18 @@ class _TimerWidget:
         uy2 = max(start[1] + start[3], end[1] + end[3])
         union = (ux1, uy1, ux2 - ux1, uy2 - uy1)
 
-        self._anim = {"t0": time.time(), "from": start, "to": end,
-                      "union": union, "target": target}
+        self._anim = {
+            "t0": time.time(), "union": union, "target": target, "to": end,
+            # Animate the SHAPES, not the window rects: the tab's shape
+            # overhangs its edge while the card's is inset, and interpolating
+            # window rects alone leaves a gap along the edge at the tab end.
+            "shape_from": self._shape_rect(self.collapsed, self.side, *start),
+            "shape_to": self._shape_rect(target, self.side, *end),
+        }
+        # Clear before resizing. The geometry change can trigger a repaint
+        # before the first animation frame is drawn, and whatever the canvas
+        # still holds — a whole card — flashes at the new size.
+        self.canvas.delete("all")
         self._apply_geometry(*union)
         self._animate()
 
@@ -496,9 +551,10 @@ class _TimerWidget:
             return
         try:
             p = _ease((time.time() - anim["t0"]) / (ANIM_MS / 1000.0))
-            x, y, w, h = (_lerp(a, b, p) for a, b in zip(anim["from"], anim["to"]))
             ux, uy = anim["union"][0], anim["union"][1]
-            self._render_morph(x - ux, y - uy, w, h,
+            x1, y1, x2, y2 = (_lerp(a, b, p)
+                              for a, b in zip(anim["shape_from"], anim["shape_to"]))
+            self._render_morph(x1 - ux, y1 - uy, x2 - ux, y2 - uy,
                                p if anim["target"] else 1.0 - p)
 
             if p >= 1.0:
@@ -518,17 +574,22 @@ class _TimerWidget:
         """Land on the real geometry and repaint the real content."""
         self._anim = None
         self.collapsed = anim["target"]
+        # Same reason as the start: clear first, or the last morph frame can
+        # be repainted at the final size before _render replaces it.
+        self.canvas.delete("all")
         self._apply_geometry(*anim["to"])
         self._keep_on_top()
         self._render()
         self._note_shown()
 
-    def _render_morph(self, x: float, y: float, w: float, h: float,
+    def _render_morph(self, x1: float, y1: float, x2: float, y2: float,
                       toward_tab: float) -> None:
         """The in-between frame: just the shape, morphing card -> tab.
 
-        Coordinates are canvas-local, since the window stays put at the union
-        rect while the shape travels inside it.
+        Coordinates are the shape itself in canvas-local space — the window
+        stays put at the union rect while the shape travels inside it, and at
+        the tab end the shape runs past the window edge exactly as the real
+        tab does, so it finishes flush with no seam along the edge.
 
         No text during the slide. Interpolating a layout of glyphs at 60fps
         looks like a squash; a shape that shrinks into the edge reads as the
@@ -536,12 +597,10 @@ class _TimerWidget:
         """
         accent, bg, border = self._colors()
         self.canvas.delete("all")
-        m = self.margin
         fill = _lerp_color(bg, accent, toward_tab)
         edge = _lerp_color(border, accent, toward_tab)
         radius = _lerp(self._px(16), self._px(6), toward_tab)
-        self._round_rect(x + m, y + m,
-                         max(x + m + 1, x + w - m), max(y + m + 1, y + h - m),
+        self._round_rect(x1, y1, max(x1 + 1, x2), max(y1 + 1, y2),
                          radius, fill=fill, outline=edge)
 
     def _note_shown(self) -> None:
@@ -795,38 +854,93 @@ class _TimerWidget:
             self._render()
 
     def _on_press(self, event) -> None:
-        self._drag = {"x": event.x_root, "y": event.y_root,
-                      "wx": self._x, "wy": self._y, "moved": False}
+        # Remember where in the widget you took hold of it, as a fraction of
+        # its size. Turning sideways changes those dimensions, and anchoring
+        # by fraction keeps the spot you grabbed under the cursor instead of
+        # letting the tab jump out from under it.
+        w0, h0 = self._size()
+        self._drag = {
+            "fx": min(1.0, max(0.0, (event.x_root - self._x) / max(1, w0))),
+            "fy": min(1.0, max(0.0, (event.y_root - self._y) / max(1, h0))),
+            "x": event.x_root, "y": event.y_root, "moved": False,
+        }
+        # Both are grab points in screen coordinates, not window origins.
+        self._drag_pos = (float(event.x_root), float(event.y_root))
+        self._drag_target = self._drag_pos
+        self.win.after(ANIM_FRAME_MS, self._drag_follow)
 
     def _on_drag(self, event) -> None:
+        """Record where the pointer is; _drag_follow catches up to it."""
         if self._drag is None or self._anim:
             return
-        dx = event.x_root - self._drag["x"]
-        dy = event.y_root - self._drag["y"]
-        if abs(dx) > self._px(3) or abs(dy) > self._px(3):
+        if (abs(event.x_root - self._drag["x"]) > self._px(3)
+                or abs(event.y_root - self._drag["y"]) > self._px(3)):
             self._drag["moved"] = True
+        self._drag_target = (float(event.x_root), float(event.y_root))
 
-        nx, ny = self._drag["wx"] + dx, self._drag["wy"] + dy
-        # Track the nearest edge whether collapsed or not: collapsed, the tab
-        # re-docks live so you can see it turn sideways mid-drag; expanded,
-        # the chevron flips to point at the edge it would collapse into.
-        side = self._nearest_side(nx, ny)
-        changed = side != self.side
-        self.side = side
-        self._place(nx, ny)
-        if changed:
-            self._render()
+    def _origin_for(self, grab_x: float, grab_y: float, side: str):
+        """Window origin that puts the grabbed fraction under (grab_x, grab_y)."""
+        w, h = self._size_for(self.collapsed, side)
+        return grab_x - self._drag["fx"] * w, grab_y - self._drag["fy"] * h
+
+    def _drag_follow(self) -> None:
+        """Ease the window toward the pointer instead of pinning it there.
+
+        Following the cursor exactly makes every hand tremor a re-dock
+        decision, which is what made the tab strobe between two edges near a
+        corner. A little weight also just feels better to drag.
+        """
+        if self._drag is None or self._anim:
+            return
+        try:
+            tx, ty = self._drag_target
+            gx, gy = self._drag_pos
+            gx, gy = gx + (tx - gx) * DRAG_FOLLOW, gy + (ty - gy) * DRAG_FOLLOW
+            self._drag_pos = (gx, gy)
+
+            ox, oy = self._origin_for(gx, gy, self.side)
+            # Only the tab re-docks mid-drag — it has to, since it is pinned
+            # to an edge. The card keeps the orientation it started with and
+            # settles on a new one when dropped, so its chevron does not
+            # twitch from side to side while you move it.
+            changed = False
+            if self.collapsed:
+                side = self._pick_side(ox, oy, self.side)
+                if side != self.side:
+                    self.side = side
+                    changed = True
+                    # Re-derive: turning sideways swapped width and height.
+                    ox, oy = self._origin_for(gx, gy, side)
+                    # Drop the old orientation's drawing before the window
+                    # changes shape, so it can't be repainted at the new size
+                    # for a frame.
+                    self.canvas.delete("all")
+            self._apply_geometry(*self._geometry_for(self.collapsed, self.side, ox, oy))
+            if changed:
+                self._render()
+        except Exception as e:
+            self._log_once(f"drag failed ({type(e).__name__}: {e})")
+        self.win.after(ANIM_FRAME_MS, self._drag_follow)
 
     def _on_release(self, event) -> None:
         drag = self._drag
-        self._drag = None
         if drag is None:
             return
         if drag["moved"]:
+            # Land where the pointer actually left off rather than wherever
+            # the eased follow had got to, then commit the edge — this is the
+            # drop, so the arrow is allowed to move now. _origin_for still
+            # needs self._drag, so it is cleared only once we are done.
+            gx, gy = self._drag_target
+            self.side = self._nearest_side(*self._origin_for(gx, gy, self.side))
+            ox, oy = self._origin_for(gx, gy, self.side)
+            self._drag = None
+            self._place(ox, oy)
             _save_prefs(x=self._x, y=self._y, side=self.side)
             self._note_shown()
-            self._render()  # the tab's rounded end may have swapped sides
+            self._render()
             return
+        self._drag = None
         # A click, not a drag. The chevron collapses; the body opens the page
         # where you actually set a session.
         if self.collapsed or self._over_chevron(event.x):
