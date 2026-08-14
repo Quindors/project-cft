@@ -102,8 +102,8 @@ class _AlertWindow:
 
         pad = px(8)
         card_w = max(px(520), min(px(860), int(sw * 0.66)))
-        card_h = px(380)
-        win_w, win_h = card_w + 2 * pad, card_h + 2 * pad
+        wrap_w = card_w - px(100)
+        cx = card_w / 2 + pad
 
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
@@ -113,16 +113,38 @@ class _AlertWindow:
             self.win.attributes("-transparentcolor", CHROMA)
         except Exception:
             self.win.configure(bg=CARD_BG)
+
+        canvas = tk.Canvas(self.win, bg=CHROMA, highlightthickness=0, bd=0)
+        canvas.pack(fill="both", expand=True)
+        self.canvas = canvas
+
+        # The message arrives as "<headline>\n<detail>" from the runner, and
+        # the detail is a model's sentence of unknown length. Measure what it
+        # actually occupies once wrapped and size the card to it, rather than
+        # clipping it to a fixed box — a reason cut off mid-thought is worse
+        # than no reason, since the whole point is to tell you what it saw.
+        lines = [ln for ln in (message or "").split("\n") if ln.strip()]
+        line_heights = [self._text_height(canvas, ln, f_body, wrap_w) for ln in lines]
+        gap = px(12)
+        msg_h = sum(line_heights) + gap * max(0, len(line_heights) - 1)
+
+        top_block = px(134)                       # accent bar + title
+        after_msg = px(34)
+        btn_h = px(52)
+        corr_block = (px(14) + px(38)) if self.on_correct is not None else 0
+        bottom_block = px(26) + px(18) + px(26)   # hint gap, hint, padding
+        card_h = top_block + msg_h + after_msg + btn_h + corr_block + bottom_block
+        card_h = max(card_h, px(300))
+        # Backstop only: a reason long enough to hit this would be pathological.
+        card_h = min(card_h, int(sh * 0.88))
+
+        win_w, win_h = card_w + 2 * pad, card_h + 2 * pad
         self.win.geometry(
             f"{win_w}x{win_h}+{int((sw - win_w) / 2)}+{int((sh - win_h) / 2)}")
-
-        canvas = tk.Canvas(self.win, width=win_w, height=win_h, bg=CHROMA,
-                           highlightthickness=0, bd=0)
-        canvas.pack(fill="both", expand=True)
+        canvas.configure(width=win_w, height=win_h)
 
         x1, y1 = pad, pad
         x2, y2 = pad + card_w, pad + card_h
-        cx = win_w / 2
         self._round_rect(canvas, x1, y1, x2, y2, px(24), fill=CARD_BG, outline=CARD_BORDER)
         # A bar of the alert color across the top, clipped to the rounded head.
         self._round_rect(canvas, x1, y1, x2, y1 + px(26), px(24), fill=ACCENT, outline="")
@@ -131,17 +153,16 @@ class _AlertWindow:
         canvas.create_text(cx, y1 + px(96), text=title, fill=INK,
                            font=f_title, anchor="center")
 
-        # The message arrives as "<headline>\n<detail>" from the runner.
-        lines = [ln for ln in (message or "").split("\n") if ln.strip()]
-        y = y1 + px(158)
-        for line in lines[:4]:
+        # Anchored "n" (north): each block starts where the last one ended, so
+        # a wrapped line pushes what follows down instead of overlapping it.
+        y = y1 + top_block
+        for line, height in zip(lines, line_heights):
             canvas.create_text(cx, y, text=line, fill=MUTED, font=f_body,
-                               anchor="center", width=card_w - px(100))
-            y += px(38)
+                               anchor="n", width=wrap_w, justify="center")
+            y += height + gap
 
-        self.canvas = canvas
-        btn_w, btn_h = px(240), px(52)
-        bx1, by1 = cx - btn_w / 2, y2 - px(104)
+        btn_w = px(240)
+        bx1, by1 = cx - btn_w / 2, y1 + top_block + msg_h + after_msg
         bx2, by2 = cx + btn_w / 2, by1 + btn_h
         self._btn = self._round_rect(canvas, bx1, by1, bx2, by2, px(14),
                                      fill=ACCENT, outline="")
@@ -183,6 +204,20 @@ class _AlertWindow:
             self.win.focus_force()
         except Exception:
             pass
+
+    @staticmethod
+    def _text_height(canvas, text, font, width) -> int:
+        """How tall this text is once Tk has wrapped it to `width`.
+
+        Measured by laying the item out and reading its bounding box, then
+        throwing it away — the alternative is counting characters and guessing
+        where the wraps land, which is wrong the moment a long word appears.
+        """
+        item = canvas.create_text(0, 0, text=text, font=font,
+                                  width=width, anchor="n")
+        bbox = canvas.bbox(item)
+        canvas.delete(item)
+        return (bbox[3] - bbox[1]) if bbox else 0
 
     @staticmethod
     def _round_rect(canvas, x1, y1, x2, y2, r, **kw):

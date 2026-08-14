@@ -6,9 +6,27 @@ MessageBox is far too easy to dismiss without reading. The MessageBox is kept
 as the fallback for when there is no usable Tk display.
 """
 
+import re
 import subprocess
 
 from monitor.window_capture import PLATFORM, IS_WSL
+
+# Which pipeline stage produced a verdict is written into the reason as a
+# leading tag: "[cache] [Vision] The screen shows...". That is exactly right
+# in the log and noise on screen — the user is being interrupted, so every
+# word in front of them should be about their work, not about which stage
+# decided it.
+#
+# A whitelist, not a general "[...]" match: window titles and quoted text
+# contain brackets too, and eating those would mangle the very sentence the
+# alert exists to show.
+_STAGE_TAG_RE = re.compile(
+    r"\[(?:cache|vision|correction|intent|error|parse_error)\]\s*", re.IGNORECASE)
+
+
+def strip_stage_tags(text: str) -> str:
+    """Remove pipeline stage tags from text headed for a human."""
+    return " ".join(_STAGE_TAG_RE.sub(" ", text or "").split())
 
 
 def _popup_messagebox(message: str, title: str) -> None:
@@ -131,8 +149,11 @@ def show_popup(message: str, title: str = "Productivity Alert", on_correct=None)
 
     on_correct is offered as a button on the full-screen Windows alert ("this
     IS my session work"); the other platforms' popups ignore it.
+
+    Stage tags are stripped here rather than at each call site, so every
+    backend below shows the same human-readable text.
     """
-    message = message.replace("'", "").replace('"', '')
+    message = strip_stage_tags(message).replace("'", "").replace('"', '')
     title = title.replace("'", "").replace('"', '')
 
     if PLATFORM == "Windows":
