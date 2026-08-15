@@ -5,7 +5,9 @@
       "name": "intention-e2e",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "rm -rf /tmp/cft-e2e && cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 CFT_ALLOWED_ORIGINS=http://localhost:4173 venv/bin/python -u tests/e2e/serve.py"
       ],
       "port": 47997
@@ -14,7 +16,9 @@
       "name": "dashboard-preview",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && npm run preview -- --port 4173 --strictPort"
       ],
       "port": 4173
@@ -23,15 +27,22 @@
       "name": "cft-api",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "cd ~/projects/project-cft && CFT_OPEN_DASHBOARD=0 CFT_ALLOWED_ORIGINS=http://localhost:5173 venv/bin/python run.py --dashboard"
       ],
       "port": 47113
     },
     {
       "name": "focus-dashboard",
-      "runtimeExecutable": "cmd.exe",
-      "runtimeArgs": ["/c", "C:\\Users\\abl96\\AppData\\Local\\Temp\\claude\\--wsl-localhost-Ubuntu-home-abl96-projects-project-cft\\4c6dd7b2-ff48-4f62-8170-3421a14f85ae\\scratchpad\\start-vite.bat"],
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && npm run dev -- --mode test --port 5173 --strictPort"
+      ],
       "port": 5173
     }
   ]

@@ -31,6 +31,15 @@ Endpoints:
                                    alignment, null outside a focus session),
                                    for the dashboard's review (re-classify) tab
     GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null}
+    GET  /api/beeminder         -> {configured, user, focus_goal, sessions_goal,
+                                    dry_run, sync_running} — never the token
+    POST /api/beeminder         -> {user, token, focus_goal, sessions_goal?,
+                                    create_goal?, hours_per_day?}
+                                   verifies against Beeminder (or, with
+                                   create_goal, creates the Do More goal on
+                                   the user's account first), persists to the
+                                   .env and starts the sync; 400 with a reason
+                                   when the credentials don't check out
     POST /api/correct           -> {id, human_label} sets a human correction on a
                                    row (human_label of null/"" clears it)
     POST /api/category          -> {name, description, is_productive} adds a category
@@ -242,6 +251,16 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=500)
             return
 
+        # Beeminder setup state, so the dashboard's setup card knows whether
+        # to show itself. Never includes the token.
+        if u.path == "/api/beeminder":
+            try:
+                from monitor import beeminder
+                self._send_json(beeminder.status())
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+            return
+
         # The resolved everything-at-once view the timer widget renders from.
         if u.path == "/api/status":
             try:
@@ -312,6 +331,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
+            "/api/beeminder": self._post_beeminder,
         }
         handlers = {
             "/api/correct": self._post_correct,
@@ -400,6 +420,67 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=400)
             return
         self._send_json({"ok": True, **saved})
+
+    def _post_beeminder(self, body) -> None:
+        """One-time Beeminder setup from the dashboard card.
+
+        Two shapes, chosen by `create_goal`:
+          false (default) — connect an existing goal; verified against
+              Beeminder before anything is saved.
+          true — create a fresh Do More goal (units: hours) on the user's own
+              account at `hours_per_day`, then connect it. Creation succeeding
+              is the verification.
+
+        Either way a bad token or slug comes straight back as a 400 with the
+        reason, and nothing half-configured lands in the .env. On success the
+        values persist next to the exe (same file the LLM key setup writes)
+        and the sync starts immediately, no restart needed.
+        """
+        from monitor import beeminder
+        from monitor.creds import _persist_env_var
+
+        user = str(body.get("user") or "").strip().lstrip("@")
+        token = str(body.get("token") or "").strip()
+        focus_goal = str(body.get("focus_goal") or "").strip()
+        sessions_goal = str(body.get("sessions_goal") or "").strip()
+        if not user or not token or not focus_goal:
+            self._send_json({"error": "user, token and focus_goal are required"}, status=400)
+            return
+
+        if body.get("create_goal"):
+            problem = beeminder.create_goal(user, token, focus_goal,
+                                            body.get("hours_per_day"),
+                                            body.get("leeway_days") or 0)
+            if problem:
+                self._send_json({"error": problem}, status=400)
+                return
+            if sessions_goal:  # the card never sends this, but keep the API honest
+                problem = beeminder.verify(user, token, sessions_goal)
+                if problem:
+                    self._send_json({"error": problem}, status=400)
+                    return
+        else:
+            for goal in (focus_goal, sessions_goal):
+                if not goal:
+                    continue
+                problem = beeminder.verify(user, token, goal)
+                if problem:
+                    self._send_json({"error": problem}, status=400)
+                    return
+
+        saves = {
+            "BEEMINDER_USER": user,
+            "BEEMINDER_TOKEN": token,
+            "BEEMINDER_FOCUS_GOAL": focus_goal,
+        }
+        if sessions_goal:
+            saves["BEEMINDER_SESSIONS_GOAL"] = sessions_goal
+        for name, value in saves.items():
+            os.environ[name] = value
+            _persist_env_var(name, value)
+
+        beeminder.start_background_sync()
+        self._send_json({"ok": True, **beeminder.status()})
 
     def _post_intention_end(self, body) -> None:
         status = (body.get("status") or "completed").strip().lower()
@@ -600,6 +681,7 @@ _INTENTION_PAGE_SRC = """<!doctype html>
   [data-state="partial"] { --accent: #f59e0b; --accent-soft: #f59e0b22; }
   [data-state="off"]     { --accent: #ef4444; --accent-soft: #ef444422; }
   [data-state="break"]   { --accent: #38bdf8; --accent-soft: #38bdf822; }
+  [data-state="away"]    { --accent: #64748b; --accent-soft: #64748b22; }
 
   * { box-sizing: border-box; }
   body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
@@ -712,7 +794,8 @@ function ring() {
 }
 const CHIP = {on: 'On intention', partial: 'Drifting', off: 'Off intention',
               session: 'Session running', break: 'On a break',
-              tracking: 'Tracking only', idle: 'No session'};
+              tracking: 'Tracking only', idle: 'No session',
+              away: 'Away — not logging'};
 
 async function refresh() {
   try {

@@ -132,6 +132,19 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
         return None
 
 
+def _start_beeminder(shutdown: threading.Event) -> None:
+    """Begin pushing focus hours to Beeminder, if the .env configures it.
+
+    Started in dashboard-only mode too: reviewing rows there changes what the
+    day's hours add up to, and re-pushing corrects the datapoint in place.
+    """
+    try:
+        from monitor import beeminder
+        beeminder.start_background_sync(shutdown)
+    except Exception as e:
+        print(f"[boot] beeminder sync not started ({e})")
+
+
 def _stop_ui() -> None:
     """Tear down the Tk thread (timer widget, focus alerts) on shutdown."""
     try:
@@ -155,6 +168,7 @@ def run_dashboard_only() -> None:
 
     shutdown = threading.Event()
     icon = _start_tray(None, shutdown)
+    _start_beeminder(shutdown)
     print("[boot] dashboard-only mode ready — quit from the tray icon")
     try:
         while not shutdown.wait(timeout=1.0):
@@ -226,6 +240,7 @@ def run(settings: Settings | None = None) -> None:
     tray_icon = None
     if not testing_mode:
         tray_icon = _start_tray(settings, shutdown)
+        _start_beeminder(shutdown)
 
     print(f"\n[boot] === INIT COMPLETE in {time.time() - boot_start:.2f}s ===\n")
 

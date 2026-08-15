@@ -38,16 +38,24 @@ MAX_DURATION_MIN = 8 * 60
 
 
 def _finished(intention: Dict, status: str) -> None:
-    """A session just ended for good — roll into the post-session break.
+    """A session just ended for good — roll into the post-session break, and
+    record it on Beeminder if that is configured.
 
-    Imported lazily: breaks.py calls back into this module to close an active
-    session, so a module-level import would be circular.
+    breaks is imported lazily because it calls back into this module to close
+    an active session, so a module-level import would be circular. The two
+    hooks are kept independent: a Beeminder outage must not cost you a break.
     """
     try:
         from monitor import breaks
         breaks.after_session_end(intention, status)
     except Exception as e:
         print(f"[intention] post-session break skipped ({e})")
+
+    try:
+        from monitor import beeminder
+        beeminder.after_session_end(intention, status)
+    except Exception as e:
+        print(f"[intention] beeminder push skipped ({e})")
 
 
 def _now_str() -> str:

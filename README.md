@@ -183,3 +183,116 @@ Key settings:
 | `critic.enabled` | `True` | Run critic on ambiguous classifications |
 | `critic.vision_enabled` | `True` | Use screenshot tiebreaker on disagreements |
 | `popup.enabled` | `True` | Show popup alerts for non-productive categories |
+
+## Idle detection
+
+The ledger assumes the window in front of you is what you are doing; an empty
+chair breaks that. After **5 minutes without keyboard or mouse input** the
+monitor stands down — nothing is classified, nothing is logged, the widget and
+tray go grey ("Away") — and the first input starts it again from a clean
+slate. Without this, a productive window parked overnight logs hour after
+hour of "work", which any goal fed by those hours would happily pay out.
+
+The first idle minutes still log: below the threshold, stillness is
+indistinguishable from reading. The trade-off runs the other way for long
+videos — watching a lecture hands-off past the threshold reads as away, so
+raise `CFT_IDLE_SEC` if that is a real part of your day (the occasional
+scroll or seek already counts as input).
+
+Alerts are gated separately and more tightly: a popup only fires if there was
+input in the last 60 seconds, so the monitor never nags a chair its owner
+left three minutes ago.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CFT_IDLE_SEC` | `300` | Seconds without input before the monitor stands down. `0` disables idle detection |
+| `CFT_IDLE_WSL_PROBE` | off | WSL dev mode only: set `1` to probe the Windows host via PowerShell (cached, but heavy) |
+
+Idle time is read from `GetLastInputInfo` on Windows and `xprintidle` on
+Linux/X11. Where no probe exists the feature fails open — no signal means
+"present", never a monitor that silently stops logging forever.
+
+## Beeminder (optional)
+
+Push your daily focus hours to a [Beeminder](https://www.beeminder.com) goal,
+which charges you real money when your cumulative total ends a day on the wrong
+side of the line you committed to.
+
+This is per-user: Beeminder's account name is part of the API endpoint and the
+token belongs to that account, so **every person running the app needs their own
+Beeminder account, their own goals and their own token.** Nothing is shared, and
+the integration stays entirely off until the `.env` names all three.
+
+### Setup
+
+1. Make a Beeminder account, then log in and open
+   `https://www.beeminder.com/api/v1/auth_token.json` to get your personal
+   token.
+2. Fill in the **Connect Beeminder** card on the dashboard's Overview tab.
+   "Create a goal for me" makes the Do More goal (units: hours) on your
+   account with the daily commitment and starting leeway you choose — leeway
+   is safety buffer, days you could do nothing before a derail. Or pick
+   "I already have a goal" and give its slug (the last part of its URL:
+   `beeminder.com/alice/focus` → `focus`).
+3. Either way the card verifies everything against Beeminder, saves it to the
+   `.env` next to the exe and starts syncing immediately — no restart. The
+   card only shows while Beeminder is unconfigured (and "Not now" hides it on
+   that browser).
+
+Prefer a text editor? Add the same values to the `.env` by hand and restart:
+
+```
+BEEMINDER_USER=your-beeminder-username
+BEEMINDER_TOKEN=your-personal-auth-token
+BEEMINDER_FOCUS_GOAL=focus
+```
+
+Either way, the monitor pushes today's hours every five minutes, on shutdown,
+and once more for yesterday after midnight rolls over.
+
+### Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BEEMINDER_USER` | — | Your Beeminder username. Required. |
+| `BEEMINDER_TOKEN` | — | Personal auth token. Required. |
+| `BEEMINDER_FOCUS_GOAL` | — | Do More goal fed daily productive hours |
+| `BEEMINDER_SESSIONS_GOAL` | — | Optional goal fed one point per finished focus session |
+| `BEEMINDER_SYNC_SEC` | `300` | Seconds between pushes |
+| `BEEMINDER_SECONDS_PER_ROW` | `decision_interval` | Seconds of activity each logged row stands for |
+| `BEEMINDER_STRICT_INTENT` | on | Off-intent work during a focus session counts as off-task; set `0` to count any productive work |
+| `BEEMINDER_DRY_RUN` | off | Print what would be sent, send nothing |
+| `BEEMINDER_TIMEOUT_SEC` | `15` | Per-request timeout |
+
+### How the numbers are worked out
+
+Hours are inferred, not measured: each row in `focus_logs` stands for one
+`decision_interval` of activity, and a row counts as productive when its
+category is flagged productive. A row you have relabelled in the review tab
+counts as its *human* label, so correcting the classifier changes the total —
+and because every push reuses one request id per day, re-pushing simply updates
+that day's datapoint in place rather than adding a second one.
+
+During a focus session the goal measures the work you declared, not work in
+general: a productive-category row logged off-intent (ALIGN below
+`intention.off_intent_max`, the same line the drift alerts use) counts as
+off-task. Partially-aligned work still counts, and work done with no session
+active is judged by its category alone. Set `BEEMINDER_STRICT_INTENT=0` if you
+want any productive-category work to count regardless of the active session.
+
+### Before you put money on it
+
+- **Beemind focus hours, not distraction minutes.** A Do Less goal fed by a
+  monitor you can close is gameable in the wrong direction — quitting the exe
+  would report zero distraction. On a Do More goal, quitting it just stops the
+  credit.
+- **Uptime gaps cost more than misclassification.** A wrong category costs
+  minutes; the app not running costs the whole stretch. Disabling the autostart
+  task for a rebuild, a sleeping machine, or a crash all silently undercount.
+- **An empty chair earns nothing.** Idle detection (above) stops the hour
+  count five minutes after your last input, so parking a productive window
+  overnight doesn't feed the goal. The sessions goal is the one residual
+  soft spot: a session left to expire unattended still counts as finished.
+- **Start at a $0 pledge** and run `BEEMINDER_DRY_RUN=1` (or watch the goal
+  flat) for a week or two, comparing what gets pushed against the dashboard,
+  before letting a derail cost anything. Keep a week of safety buffer.
