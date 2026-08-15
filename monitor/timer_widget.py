@@ -95,6 +95,7 @@ PALETTE = {
     status.STATE_SESSION:  ("#34d399", "#0f1c19", "#14532d"),
     status.STATE_TRACKING: ("#64748b", "#111827", "#1e293b"),
     status.STATE_IDLE:     ("#94a3b8", "#111827", "#1e293b"),
+    status.STATE_AWAY:     ("#475569", "#0f141c", "#1e293b"),
 }
 _FALLBACK = PALETTE[status.STATE_IDLE]
 

@@ -20,6 +20,7 @@ from monitor import app_state
 from monitor import breaks as breaks_store
 from monitor import status as status_store
 from monitor import alerts as alerts_module
+from monitor import idle as idle_module
 
 
 def run_monitor_loop(
@@ -105,6 +106,18 @@ def _run_live_loop(
     drift_tier: Optional[str] = None
     drift_since: Optional[float] = None
     last_drift_alert: Optional[float] = None
+    # What earned the current streak. A drift alert may fire during a later
+    # no-signal hold (a System window keeps the streak alive), and when it
+    # does, the popup names this — never the System window in front.
+    drift_category: Optional[str] = None
+    drift_window: str = ""
+
+    # Idle (user-away) state. Past the threshold with no keyboard or mouse
+    # input, the chair is empty: nothing is judged and nothing is logged.
+    # Without this, a productive window parked overnight logs hour after hour
+    # of "work" — free credit on any Beeminder goal fed by those rows.
+    idle_threshold = settings.idle.threshold_sec
+    user_away = False
 
     # Monitor mode (dashboard toggle applies live). Tracking always runs;
     # alerts only fire in distraction-free mode.
@@ -132,6 +145,11 @@ def _run_live_loop(
     last_corrections_reload = time.time()
 
     print(f"\n[runner] Starting LIVE monitoring loop")
+    if idle_threshold > 0:
+        print(f"[runner] Idle detection: {idle_module.get_mode()} — "
+              f"away after {idle_threshold:.0f}s without input")
+    else:
+        print("[runner] Idle detection: OFF (CFT_IDLE_SEC <= 0)")
     print(f"[runner] Poll interval: {settings.poll_interval}s")
     print(f"[runner] Decision interval: {settings.decision_interval}s")
     print(f"[runner] Context window: {settings.context_window_size} events")
@@ -170,6 +188,36 @@ def _run_live_loop(
                 status_store.set_paused(False)
                 last_decision_time = time.time()
                 print("[runner] break over — monitoring resumed")
+
+            # --- idle: nobody at the desk means nothing to judge or log ---
+            # The first threshold minutes of an absence still log (they are
+            # indistinguishable from reading), but past it the loop stands
+            # down until the next keypress or mouse move.
+            idle_sec = idle_module.seconds_since_input() if idle_threshold > 0 else None
+            if idle_sec is not None and idle_sec >= idle_threshold:
+                if not user_away:
+                    user_away = True
+                    status_store.set_away(True)
+                    drift_tier, drift_since = None, None
+                    drift_category, drift_window = None, ""
+                    # Settle the queue now: Beeminder reads the database all
+                    # night, and rows buffered here would miss the day's total
+                    # until morning.
+                    sink.flush_if_needed()
+                    print(f"[runner] no input for {int(idle_sec // 60)}m — "
+                          f"away; nothing will be logged")
+                time.sleep(settings.poll_interval)
+                continue
+
+            if user_away:
+                # Input again. Judge what they do from here on — the titles
+                # that sat in front of an empty chair are not evidence.
+                user_away = False
+                events_buffer = []
+                event_src.reset()
+                status_store.set_away(False)
+                last_decision_time = time.time()
+                print("[runner] input resumed — monitoring resumed")
 
             # --- an alert is on screen: decide nothing until it is gone ---
             # The sheet covers the display, so a screenshot shows the alert
@@ -277,6 +325,7 @@ def _run_live_loop(
                     drift_tier = None
                     drift_since = None
                     last_drift_alert = None
+                    drift_category, drift_window = None, ""
                     if intention:
                         print(f"[runner] session intention active: \"{intention['text']}\" until {intention['ends_at']}")
                     else:
@@ -324,31 +373,45 @@ def _run_live_loop(
                 # Without: the original immediate off-task popup.
                 tier = _intent_tier(decision, settings) if intention is not None else None
 
+                # Popups need a reader. Below the away threshold activity
+                # still logs — reading produces no input either — but an
+                # alert only fires if someone touched the machine recently
+                # enough to plausibly be looking at the screen.
+                user_present = (idle_sec is None
+                                or idle_sec <= settings.idle.alert_recent_input_sec)
+
                 if not alerts_enabled:
                     drift_tier, drift_since = None, None
+                    drift_category, drift_window = None, ""
                 elif intention is not None:
                     now_t = time.time()
                     drift_tier, drift_since = _update_drift(tier, drift_tier, drift_since, now_t)
-                    # Alert only on a decision that is itself drift, so the
-                    # popup never names a System window as the culprit.
-                    if tier in (INTENT_OFF, INTENT_PARTIAL) and drift_since is not None:
+                    if tier in (INTENT_OFF, INTENT_PARTIAL):
+                        drift_category = decision.get("final_category_name", "Unknown")
+                        drift_window = events_buffer[-1][1] if events_buffer else ""
+                    # Alert whenever the *streak* is drift, not only when this
+                    # decision is: a no-signal window holds the streak, and
+                    # holding must not also silence an alert it already
+                    # earned. The popup names what earned the streak, so a
+                    # System window is never the culprit.
+                    if drift_tier in (INTENT_OFF, INTENT_PARTIAL) and drift_since is not None:
                         dwell = now_t - drift_since
                         due = (
                             dwell >= _dwell_for(drift_tier, settings)
                             and (last_drift_alert is None
                                  or (now_t - last_drift_alert) >= settings.intention.realert_sec)
                         )
-                        if due and settings.popup.enabled:
-                            cat_name = decision.get("final_category_name", "Unknown")
-                            lead = ("Off-intent" if tier == INTENT_OFF
+                        if due and settings.popup.enabled and user_present:
+                            lead = ("Off-intent" if drift_tier == INTENT_OFF
                                     else "Only loosely related to your session")
-                            msg = (f"{lead} for {int(dwell // 60)}m ({cat_name})\n"
+                            msg = (f"{lead} for {int(dwell // 60)}m "
+                                   f"({drift_category or 'Unknown'})\n"
                                    f"Session: {intention['text']}")
-                            window_now = events_buffer[-1][1] if events_buffer else ""
                             show_popup(msg, "Focus Alert",
-                                       on_correct=_intent_correction_hook(intention, window_now))
+                                       on_correct=_intent_correction_hook(intention, drift_window))
                             last_drift_alert = now_t
-                elif decision.get("final_is_productive") is False and settings.popup.enabled:
+                elif (decision.get("final_is_productive") is False
+                      and settings.popup.enabled and user_present):
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
                     msg = f"Off-task: {cat_name}" + (f"\n{reason}" if reason else "")

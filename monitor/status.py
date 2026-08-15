@@ -32,6 +32,7 @@ _state: Dict[str, Any] = {
     "at": None,            # time.time() of the decision
     "drift_since": None,   # time.time() the current drift streak started
     "paused": False,       # monitoring suspended (a break is running)
+    "away": False,         # no input past the idle threshold; nothing logs
 }
 
 
@@ -50,6 +51,15 @@ def set_paused(paused: bool) -> None:
     with _lock:
         _state["paused"] = paused
         if paused:
+            _state["tier"] = None
+            _state["drift_since"] = None
+
+
+def set_away(away: bool) -> None:
+    """Mark the user as away (no input past the idle threshold) or back."""
+    with _lock:
+        _state["away"] = away
+        if away:
             _state["tier"] = None
             _state["drift_since"] = None
 
@@ -91,6 +101,7 @@ STATE_OFF = "off"            # not doing it
 STATE_SESSION = "session"    # session running, no verdict yet
 STATE_TRACKING = "tracking"  # time-tracking mode, no session
 STATE_IDLE = "idle"          # distraction-free, no session
+STATE_AWAY = "away"          # no input at all; monitoring stood down
 
 
 def full_snapshot() -> Dict[str, Any]:
@@ -134,6 +145,7 @@ def full_snapshot() -> Dict[str, Any]:
         "is_productive": snap.get("is_productive"),
         "stale": snap.get("stale"),
         "paused": active_break is not None,
+        "away": bool(snap.get("away")),
     }
 
     if active_break is not None:
@@ -173,6 +185,14 @@ def full_snapshot() -> Dict[str, Any]:
             ends_at=None,
             remaining_sec=None,
         )
+
+    # Away recolors whatever is going on — a session keeps its countdown, but
+    # the widget goes grey and the reason is on the card. A break outranks it:
+    # monitoring is off either way, and the break says why better.
+    if out["away"] and active_break is None:
+        out["state"] = STATE_AWAY
+        if out["phase"] == PHASE_IDLE:
+            out["label"] = "Away"
     return out
 
 

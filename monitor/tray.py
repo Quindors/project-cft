@@ -27,6 +27,7 @@ _STATE_COLORS = {
     status.STATE_BREAK:    (56, 189, 248),
     status.STATE_TRACKING: (100, 116, 139),
     status.STATE_IDLE:     (148, 163, 184),
+    status.STATE_AWAY:     (71, 85, 105),
 }
 _ICON_REFRESH_SEC = 5.0
 _stop_icon_thread = threading.Event()

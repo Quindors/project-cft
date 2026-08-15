@@ -46,6 +46,22 @@ class IntentionSettings:
 
 
 @dataclass(frozen=True)
+class IdleSettings:
+    """User-absence detection (monitor/idle.py).
+
+    Past threshold_sec without keyboard/mouse input the runner treats the
+    chair as empty: no decisions, nothing logged, so a productive window left
+    open overnight earns nothing. threshold_sec <= 0 disables the feature.
+    Override with CFT_IDLE_SEC in the .env.
+    """
+    threshold_sec: float = 300.0
+    # Popups need a reader. Below the away threshold the user still gets the
+    # benefit of the doubt for *logging*, but an alert only fires if there was
+    # input this recently — never nag an empty chair.
+    alert_recent_input_sec: float = 60.0
+
+
+@dataclass(frozen=True)
 class CriticSettings:
     # Vision tiebreaker (the "critic" text-LLM step was removed; only vision remains).
     vision_enabled: bool = True
@@ -106,6 +122,7 @@ class Settings:
     trace: TraceSettings = field(default_factory=TraceSettings)
     popup: PopupSettings = field(default_factory=PopupSettings)
     intention: IntentionSettings = field(default_factory=IntentionSettings)
+    idle: IdleSettings = field(default_factory=IdleSettings)
 
 
 DEFAULT_SETTINGS = Settings(
@@ -126,8 +143,19 @@ def load_settings() -> Settings:
     provider = os.getenv("LLM_PROVIDER", "openrouter").lower()
     default_model = "openai/gpt-4o-mini" if provider == "openrouter" else "gpt-4o-mini"
     model = os.getenv("LLM_MODEL", default_model)
+
+    idle = DEFAULT_SETTINGS.idle
+    raw_idle = os.getenv("CFT_IDLE_SEC", "").strip()
+    if raw_idle:
+        try:
+            idle = replace(idle, threshold_sec=float(raw_idle))
+        except ValueError:
+            print(f"[config] CFT_IDLE_SEC={raw_idle!r} is not a number; "
+                  f"keeping {idle.threshold_sec:g}s")
+
     return replace(
         DEFAULT_SETTINGS,
         model=model,
         critic=replace(DEFAULT_SETTINGS.critic, vision_model=model),
+        idle=idle,
     )
