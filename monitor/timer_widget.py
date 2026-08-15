@@ -535,6 +535,12 @@ class _TimerWidget:
         `remember` is False for automatic collapses: putting itself away is a
         transient courtesy, and shouldn't overwrite the form you last chose.
         """
+        if self._anim is not None:
+            # Already sliding. A second toggle would compute its start from
+            # self.collapsed, which has not flipped yet, so the shape would
+            # jump back to the form it began in and animate from there. Half a
+            # second is short enough that dropping the click beats that.
+            return
         target = not self.collapsed
         if remember:
             _save_prefs(collapsed=target)
@@ -565,11 +571,17 @@ class _TimerWidget:
             "shape_from": self._shape_rect(self.collapsed, self.side, *start),
             "shape_to": self._shape_rect(target, self.side, *end),
         }
-        # Clear before resizing. The geometry change can trigger a repaint
-        # before the first animation frame is drawn, and whatever the canvas
-        # still holds — a whole card — flashes at the new size.
-        self.canvas.delete("all")
-        self._apply_geometry(*union)
+        # Grow to the union invisibly, with the first frame already painted
+        # when the window reappears — see _resize_cloaked for why.
+        ux, uy = union[0], union[1]
+        sf = self._anim["shape_from"]
+        # The first frame shows the form we are leaving: opening (currently a
+        # tab) starts fully tab-like, closing starts fully card-like.
+        first = 1.0 if self.collapsed else 0.0
+        self._resize_cloaked(
+            union,
+            lambda: self._render_morph(sf[0] - ux, sf[1] - uy,
+                                       sf[2] - ux, sf[3] - uy, first))
         self._animate()
 
     def _animate(self) -> None:
@@ -598,16 +610,39 @@ class _TimerWidget:
             return
         self.win.after(ANIM_FRAME_MS, self._animate)
 
+    def _resize_cloaked(self, rect, draw) -> None:
+        """Resize the window while it is invisible, then show it painted.
+
+        A layered (-transparentcolor) window's newly allocated region is
+        uninitialized until something paints it, and uninitialized layered
+        memory composites as opaque BLACK — the one-frame black box seen when
+        the card opened, since opening is the direction that grows the
+        window. So: alpha to 0, resize, flush the resize, paint the content,
+        flush the paint, alpha back. The window only ever reappears whole.
+        """
+        self.canvas.delete("all")
+        self._set_alpha(0.0)
+        self._apply_geometry(*rect)
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
+        try:
+            draw()
+        except Exception as e:
+            self._log_once(f"cloaked draw failed ({type(e).__name__}: {e})")
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
+        self._set_alpha(1.0 if self._pointer_in else 0.96)
+
     def _finish_anim(self, anim: Dict) -> None:
         """Land on the real geometry and repaint the real content."""
         self._anim = None
         self.collapsed = anim["target"]
-        # Same reason as the start: clear first, or the last morph frame can
-        # be repainted at the final size before _render replaces it.
-        self.canvas.delete("all")
-        self._apply_geometry(*anim["to"])
+        self._resize_cloaked(anim["to"], self._render)
         self._keep_on_top()
-        self._render()
         self._note_shown()
 
     def _render_morph(self, x1: float, y1: float, x2: float, y2: float,
@@ -939,13 +974,14 @@ class _TimerWidget:
                     changed = True
                     # Re-derive: turning sideways swapped width and height.
                     ox, oy = self._origin_for(gx, gy, side)
-                    # Drop the old orientation's drawing before the window
-                    # changes shape, so it can't be repainted at the new size
-                    # for a frame.
-                    self.canvas.delete("all")
-            self._apply_geometry(*self._geometry_for(self.collapsed, self.side, ox, oy))
             if changed:
-                self._render()
+                # Turning sideways grows one dimension — same uninitialized
+                # black-box risk as the open slide, same cloaked resize.
+                self._resize_cloaked(
+                    self._geometry_for(self.collapsed, self.side, ox, oy),
+                    self._render)
+            else:
+                self._apply_geometry(*self._geometry_for(self.collapsed, self.side, ox, oy))
         except Exception as e:
             self._log_once(f"drag failed ({type(e).__name__}: {e})")
         self.win.after(ANIM_FRAME_MS, self._drag_follow)
