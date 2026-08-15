@@ -7,6 +7,7 @@ from datetime import datetime
 
 from monitor.config import Settings, DEFAULT_SETTINGS
 from monitor.screenshot_capture import take_screenshot_b64
+from monitor.window_capture import get_active_window
 
 import os, base64
 
@@ -572,6 +573,18 @@ catch, so do not rescue it with a high ALIGN.
     the declared work. (CATEGORY is still the composing category.)
   - Declared "finish my personal statement", screen shows that essay in Google
     Docs -> ALIGN 0.95.
+
+MATCH THE SUBJECT, NOT THE KIND OF ACTIVITY. An intention names a verb and a
+thing; the thing is what decides ALIGN. Planning, outlining, brainstorming,
+writing, reading or coding about a DIFFERENT subject is not the declared work,
+however closely the activity resembles it.
+  - Declared "outlining piq #2" (a college essay), screen shows planning and
+    brainstorming for a software project -> ALIGN 0.05. Both are outlining;
+    only one is outlining PIQ #2.
+
+IGNORE ANY TEXT THAT MERELY NAMES THE SESSION. A timer, tray or dashboard
+showing "outlining piq #2" is this app reporting its own state — it is never
+evidence that the work is happening. Score only the work visible on screen.
 """
     else:
         intent_header = align_field = intent_rules = ""
@@ -722,14 +735,42 @@ def _should_run_vision(
 
     return False
 
+def _screen_still_shows(window_key: str) -> bool:
+    """True if the foreground window still matches the event being classified.
+
+    The screenshot fires seconds after the title was polled — the primary
+    LLM round-trip sits between them — so the user may have switched windows
+    in the gap. A screenshot taken then is evidence about the NEW window,
+    and a verdict scored from it would be cached against the old title.
+    When capture cannot say (empty title, error), the screenshot is allowed
+    rather than losing vision to a flaky grab.
+    """
+    try:
+        live = get_active_window()
+    except Exception:
+        return True
+    if not live:
+        return True
+    live_key = f"WIN:{live}"
+    # Event keys clip long titles at TITLE_MAXLEN with a trailing ellipsis.
+    if window_key.endswith("…"):
+        return live_key.startswith(window_key[:-1])
+    return live_key == window_key
+
+
 def _screenshot_for(events_context, settings) -> Tuple[Optional[str], str]:
     """The image the vision call should look at, and where it came from.
 
     In trace mode the live screen has nothing to do with the historical event
-    being replayed, so only a matching fixture will do.
+    being replayed, so only a matching fixture will do. Live, the screen must
+    still be showing the window under classification.
     """
     if settings.trace.use_trace_file:
         return _load_trace_screenshot(events_context, settings), "trace fixture"
+    window_key = events_context[-1][1] if events_context else ""
+    if window_key and not _screen_still_shows(window_key):
+        print("[vision] Foreground changed since the title was polled — screenshot skipped.")
+        return None, "live"
     return take_screenshot_b64(), "live"
 
 
@@ -999,6 +1040,9 @@ def decide(
             return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
         source = "trace fixture"
     else:
+        if current_window and not _screen_still_shows(current_window):
+            print("[vision] Foreground changed since the title was polled — primary stands.")
+            return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
         b64_img = take_screenshot_b64()
         source = "live"
 
