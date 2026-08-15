@@ -722,6 +722,61 @@ def _should_run_vision(
 
     return False
 
+def _screenshot_for(events_context, settings) -> Tuple[Optional[str], str]:
+    """The image the vision call should look at, and where it came from.
+
+    In trace mode the live screen has nothing to do with the historical event
+    being replayed, so only a matching fixture will do.
+    """
+    if settings.trace.use_trace_file:
+        return _load_trace_screenshot(events_context, settings), "trace fixture"
+    return take_screenshot_b64(), "live"
+
+
+def _align_from_screen(
+    events_context,
+    settings: Settings,
+    categories: Optional[List[Dict]],
+    intention: Dict,
+    *,
+    primary_category: str,
+    primary_off: float,
+    primary_conf: float,
+    primary_reason: str,
+) -> Tuple[Optional[float], Optional[Dict]]:
+    """Score ALIGN from the screen when the title cannot be trusted for it.
+
+    Used by the correction path, where the category is already settled by the
+    user and only alignment is in question. Returns (align, vision_record);
+    align is None whenever vision is off, unavailable, or errored — callers
+    fall back to the title-based score.
+    """
+    if not settings.critic.vision_enabled:
+        return None, None
+    b64_img, source = _screenshot_for(events_context, settings)
+    if not b64_img:
+        return None, None
+
+    v_name, v_off, v_conf, v_reason, v_prod, v_raw = ask_gpt_vision_verdict(
+        b64_img, events_context,
+        primary_category=primary_category, primary_off=primary_off,
+        primary_conf=primary_conf, primary_reason=primary_reason,
+        model=settings.critic.vision_model,
+        max_tokens=settings.critic.vision_max_tokens,
+        categories=categories, intention=intention,
+    )
+    if v_name in ("[ERROR]", "[PARSE_ERROR]"):
+        print(f"[vision] align-only call failed ({v_reason}) — falling back to the title")
+        return None, None
+
+    align = _parse_align(v_raw)
+    if align is not None:
+        print(f"[vision] align-only ({source}): {align:.2f} for \"{intention['text'][:40]}\"")
+    # The category verdict is deliberately discarded: the user already ruled.
+    return align, {"category_name": v_name, "is_productive": v_prod, "off": v_off,
+                   "conf": v_conf, "reason": v_reason or "", "align": align}
+
+
 # ==================== MAIN DECISION ====================
 
 def decide(
@@ -871,31 +926,49 @@ def decide(
             _cache_put(current_window, result, intention_id)
         return result
 
-    # --- 3.5. Correction with an active session: pin category, keep ALIGN ---
+    # --- 3.5. Correction with an active session: pin category, score ALIGN ---
     # The LLM ran only to score alignment against the intention; its category
-    # choice is discarded in favor of the user's correction. Vision is skipped
-    # — it exists to verify the category, which is human-pinned here.
+    # choice is discarded in favor of the user's correction. Vision still runs,
+    # for ALIGN alone: a corrected window is one whose title already misled the
+    # classifier once, so scoring alignment from that same title is the weakest
+    # possible evidence. "supplements prep - Google Docs" under the intention
+    # "outlining piq #2" scored 0.5 — drift — while the screen showed the very
+    # essay prompt named in the intention.
     if correction:
         cat_name, is_productive = _resolve_category(correction["corrected_category"], categories)
-        align_note = " (ALIGN scored by LLM)" if p1_align is not None else ""
+        v_align = None
+        vision_res = None
+        if intention is not None and forced_align is None:
+            v_align, vision_res = _align_from_screen(
+                events_context, settings, categories, intention,
+                primary_category=cat_name, primary_off=0.0 if is_productive else 1.0,
+                primary_conf=1.0, primary_reason="user correction",
+            )
+        align = v_align if v_align is not None else p1_align
+        if forced_align is not None:
+            align = forced_align
+
+        source = ("ALIGN from screen" if v_align is not None
+                  else "ALIGN from title" if align is not None else "no ALIGN")
         print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name}"
-              f" (category pinned{align_note})")
-        reason = f"User correction: was {correction['ai_category']}, corrected to {cat_name}{align_note}"
+              f" (category pinned, {source})")
+        reason = (f"User correction: was {correction['ai_category']}, "
+                  f"corrected to {cat_name} ({source})")
         result = {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
             "final_off": 0.0 if is_productive else 1.0,
             "final_conf": 1.0,
             "final_reason": reason,
-            "final_align": p1_align if forced_align is None else forced_align,
-            "vision_ran": False,
+            "final_align": align,
+            "vision_ran": v_align is not None,
             # Report the human correction as the primary, not the LLM call we
             # made only to score ALIGN — sinks log primary conf/reason, and the
             # rejected category's reasoning would misexplain the pinned one.
             "primary": {"category_name": cat_name, "is_productive": is_productive,
                         "off": 0.0, "conf": 1.0, "reason": "user correction",
-                        "align": p1_align},
-            "vision": None,
+                        "align": align},
+            "vision": vision_res,
             # Keep what the LLM would have said, for accuracy analysis.
             "align_primary": primary_res,
         }
