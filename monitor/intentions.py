@@ -130,7 +130,7 @@ def start(text: str, duration_min: int) -> Dict:
             "INSERT INTO intentions (text, started_at, ends_at, status) VALUES (?,?,?, 'active')",
             (text, started_at, ends_at),
         )
-        return {
+        active = {
             "id": cur.lastrowid,
             "text": text,
             "started_at": started_at,
@@ -138,6 +138,22 @@ def start(text: str, duration_min: int) -> Dict:
             "ended_at": None,
             "status": "active",
         }
+
+    # Declaring an intention IS choosing focus: a session started while the
+    # monitor sits in time-tracking mode would score drift and never say so,
+    # which is a session in name only. One-way on purpose — ending a session
+    # does not switch back, because "watch me again" is explicit and "stop
+    # watching me" should never happen by side effect. Failure is logged, not
+    # raised: the session matters more than the mode.
+    try:
+        from monitor import app_state
+        if app_state.get_mode() != app_state.MODE_DISTRACTION_FREE:
+            app_state.set_mode(app_state.MODE_DISTRACTION_FREE)
+            print("[intention] session started — switching to focus mode")
+    except Exception as e:
+        print(f"[intention] could not switch to focus mode ({e})")
+
+    return active
 
 
 def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional[Dict]:
