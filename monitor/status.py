@@ -99,6 +99,7 @@ STATE_ON = "on"              # doing the declared work
 STATE_PARTIAL = "partial"    # loosely related to it
 STATE_OFF = "off"            # not doing it
 STATE_SESSION = "session"    # session running, no verdict yet
+STATE_PAUSED = "paused"      # session frozen for a minute; nothing watched
 STATE_TRACKING = "tracking"  # time-tracking mode, no session
 STATE_IDLE = "idle"          # distraction-free, no session
 STATE_AWAY = "away"          # no input at all; monitoring stood down
@@ -127,9 +128,12 @@ def full_snapshot() -> Dict[str, Any]:
         active_break = None
 
     # Don't touch intentions during a break: get_active() expires past-due
-    # sessions and would start a second break on top of this one.
+    # sessions and would start a second break on top of this one. A pause is
+    # the exception — pausing moved the session's ends_at past the pause's own
+    # end, so the session cannot be past due here and the read is safe.
+    is_pause = active_break is not None and active_break.get("source") == "pause"
     active_intention = None
-    if active_break is None:
+    if active_break is None or is_pause:
         try:
             active_intention = intentions.get_active()
         except Exception:
@@ -148,7 +152,20 @@ def full_snapshot() -> Dict[str, Any]:
         "away": bool(snap.get("away")),
     }
 
-    if active_break is not None:
+    if is_pause and active_intention is not None:
+        # A paused session is still a session — the card keeps the intention,
+        # and the countdown is the pause's own: when monitoring comes back.
+        out.update(
+            phase=PHASE_SESSION,
+            state=STATE_PAUSED,
+            label=active_intention.get("text") or "Focus session",
+            started_at=active_break.get("started_at"),
+            ends_at=active_break.get("ends_at"),
+            remaining_sec=active_break.get("remaining_sec"),
+        )
+    elif active_break is not None:
+        # Real breaks — and a pause whose session is somehow gone, which has
+        # nothing left to resume and simply runs out as a break.
         out.update(
             phase=PHASE_BREAK,
             state=STATE_BREAK,

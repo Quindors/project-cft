@@ -50,10 +50,20 @@ Endpoints:
                                    moves its logged rows to reassign_to
                                    (default "Ambiguous"); Ambiguous/System are
                                    protected because the classifier needs them
-    POST /api/intention         -> {text, duration_min} starts a session intention
+    POST /api/intention         -> {text, duration_min} starts a session intention;
+                                   422 {rejected, category, reason} when the
+                                   intention gate maps the declared work itself
+                                   to an unproductive category
                                    (supersedes any active one)
     POST /api/intention/end     -> {status?: completed|abandoned} ends the active one;
                                    completing one rolls into the post-session break
+    POST /api/intention/pause   -> pauses the active session for 1 minute: the
+                                   countdown freezes (ends_at moves out by the
+                                   same minute) and monitoring stops, exactly
+                                   like a short break; resumes by itself when
+                                   the minute runs out. POST /api/break/end
+                                   resumes early and hands the unused part of
+                                   the minute back
 
 GET /intention serves a built-in page for starting/ending a session intention
 and taking a break — usable even without the bundled dashboard (the tray and
@@ -327,6 +337,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         no_conn_handlers = {
             "/api/intention": self._post_intention_start,
             "/api/intention/end": self._post_intention_end,
+            "/api/intention/pause": self._post_intention_pause,
             "/api/mode": self._post_mode,
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
@@ -372,10 +383,34 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             conn.close()
 
     def _post_intention_start(self, body) -> None:
-        text = body.get("text") or ""
+        from monitor import intent_gate
+
         try:
-            duration_min = int(body.get("duration_min") or 0)
-            active = intentions.start(text, duration_min)
+            text, duration_min = intentions.validate(
+                body.get("text") or "", body.get("duration_min") or 0
+            )
+        except (ValueError, TypeError) as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+
+        # The intention itself must be work: "scroll twitter for an hour"
+        # would make every drift check score scrolling as on-intent.
+        gate = intent_gate.check(text)
+        if not gate["allowed"]:
+            why = gate.get("reason") or "it describes off-task activity"
+            self._send_json({
+                "error": (f"Not started: “{text}” reads as "
+                          f"{gate['category']} — {why} "
+                          f"Rephrase it if it's real work."),
+                "rejected": True,
+                "category": gate.get("category"),
+                "reason": gate.get("reason"),
+            }, status=422)
+            return
+
+        try:
+            active = intentions.start(text, duration_min,
+                                      llm_category=gate.get("category"))
         except (ValueError, TypeError) as e:
             self._send_json({"error": str(e)}, status=400)
             return
@@ -481,6 +516,15 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
         beeminder.start_background_sync()
         self._send_json({"ok": True, **beeminder.status()})
+
+    def _post_intention_pause(self, body) -> None:
+        """Freeze the active session for a minute — no time lost, nothing watched."""
+        try:
+            result = intentions.pause_active()
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+        self._send_json({"ok": True, **result})
 
     def _post_intention_end(self, body) -> None:
         status = (body.get("status") or "completed").strip().lower()
@@ -680,7 +724,7 @@ _INTENTION_PAGE_SRC = """<!doctype html>
   [data-state="on"], [data-state="session"] { --accent: #10b981; --accent-soft: #10b98122; }
   [data-state="partial"] { --accent: #f59e0b; --accent-soft: #f59e0b22; }
   [data-state="off"]     { --accent: #ef4444; --accent-soft: #ef444422; }
-  [data-state="break"]   { --accent: #38bdf8; --accent-soft: #38bdf822; }
+  [data-state="break"], [data-state="paused"] { --accent: #38bdf8; --accent-soft: #38bdf822; }
   [data-state="away"]    { --accent: #64748b; --accent-soft: #64748b22; }
 
   * { box-sizing: border-box; }
@@ -794,7 +838,7 @@ function ring() {
 }
 const CHIP = {on: 'On intention', partial: 'Drifting', off: 'Off intention',
               session: 'Session running', break: 'On a break',
-              tracking: 'Tracking only', idle: 'No session',
+              paused: 'Paused', tracking: 'Tracking only', idle: 'No session',
               away: 'Away — not logging'};
 
 async function refresh() {
@@ -839,6 +883,21 @@ function render(force) {
   }
 
   if (snap.phase === 'session') {
+    if (snap.state === 'paused') {
+      // The countdown here is the pause's own: when monitoring comes back.
+      card.innerHTML = `
+        <span class="chip"><i></i>${CHIP.paused}</span>
+        <div class="dial">${ring()}
+          <div><div class="time">${fmt(left ?? 0)}</div>
+               <div class="sub">until the session resumes</div></div></div>
+        <p class="note">${esc(snap.label)}<br>
+           Timer and monitoring are frozen — no session time is lost.</p>
+        <div class="row">
+          <button class="primary" onclick="resumeSession()">Resume now</button>
+          <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
+        </div>`;
+      return;
+    }
     card.innerHTML = `
       <span class="chip"><i></i>${CHIP[snap.state] || CHIP.session}</span>
       <div class="dial">${ring()}
@@ -848,6 +907,8 @@ function render(force) {
         <strong>${esc(snap.category)}</strong>.</p>` : ''}
       <div class="row">
         <button class="primary" onclick="endSession('completed')">Done — take a break</button>
+        <button class="ghost" onclick="pauseSession()"
+                title="Freeze the timer and monitoring for 1 minute">Pause 1m</button>
         <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
       </div>`;
     return;
@@ -916,6 +977,9 @@ async function start() {
   }
 }
 async function endSession(status) { await post('/api/intention/end', {status}); }
+async function pauseSession() { await post('/api/intention/pause', {}); }
+// A pause is a break under the hood, so resuming early is ending the break.
+async function resumeSession() { await post('/api/break/end', {}); }
 async function startBreak() { await post('/api/break', {duration_min: BREAK_MIN}); }
 async function endBreak() { await post('/api/break/end', {}); }
 

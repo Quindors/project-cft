@@ -92,6 +92,7 @@ PALETTE = {
     status.STATE_PARTIAL:  ("#f59e0b", "#1c170f", "#78350f"),
     status.STATE_OFF:      ("#ef4444", "#1e1113", "#7f1d1d"),
     status.STATE_BREAK:    ("#38bdf8", "#0f1a22", "#0c4a6e"),
+    status.STATE_PAUSED:   ("#38bdf8", "#0f1a22", "#0c4a6e"),
     status.STATE_SESSION:  ("#34d399", "#0f1c19", "#14532d"),
     status.STATE_TRACKING: ("#64748b", "#111827", "#1e293b"),
     status.STATE_IDLE:     ("#94a3b8", "#111827", "#1e293b"),
@@ -1072,6 +1073,10 @@ class _TimerWidget:
         if snap.get("phase") == status.PHASE_BREAK:
             menu.add_command(label="End break now", command=self._end_break)
         else:
+            if snap.get("state") == status.STATE_PAUSED:
+                # A pause is a break under the hood: ending it resumes the
+                # session and hands back the unused part of the minute.
+                menu.add_command(label="Resume session now", command=self._end_break)
             if snap.get("intention"):
                 menu.add_command(label="Finish session (start break)",
                                  command=lambda: self._end_session("completed"))

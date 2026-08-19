@@ -43,6 +43,10 @@ class IntentionSettings:
     dwell_sec: float = 120.0        # continuous off-intent time before alerting
     partial_dwell_sec: float = 600.0  # ... and the longer fuse for partial-intent
     realert_sec: float = 300.0      # minimum gap between drift alerts
+    # A partial-band hedge in the session's home category (the category the
+    # intention gate mapped the declared work to) counts as on-intent. Ties
+    # only: a confident off-intent score is never rescued by category.
+    home_category_prior: bool = True
 
 
 @dataclass(frozen=True)

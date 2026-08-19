@@ -24,6 +24,17 @@
       "port": 4173
     },
     {
+      "name": "cft-api-test",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "rm -rf /tmp/cft-dev && cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-dev CFT_API_PORT=47999 CFT_ALLOWED_ORIGINS=http://localhost:5173 venv/bin/python -u tests/e2e/serve.py"
+      ],
+      "port": 47999
+    },
+    {
       "name": "cft-api",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [

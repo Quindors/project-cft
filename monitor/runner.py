@@ -171,8 +171,11 @@ def _run_live_loop(
                     key_src.stop()
                     status_store.set_paused(True)
                     drift_tier, drift_since, last_drift_alert = None, None, None
-                    mins = active_break.get("remaining_sec", 0) // 60
-                    print(f"[runner] BREAK — tracking and alerts off for ~{mins}m "
+                    secs = active_break.get("remaining_sec") or 0
+                    span = f"~{secs // 60}m" if secs >= 60 else f"{secs}s"
+                    word = ("PAUSE" if active_break.get("source") == "pause"
+                            else "BREAK")
+                    print(f"[runner] {word} — tracking and alerts off for {span} "
                           f"(until {active_break['ends_at'][11:16]})")
                 time.sleep(settings.poll_interval)
                 continue
@@ -371,7 +374,7 @@ def _run_live_loop(
                 # state resets so a stale streak can't fire on mode switch).
                 # With an active intention: dwell-based drift alert.
                 # Without: the original immediate off-task popup.
-                tier = _intent_tier(decision, settings) if intention is not None else None
+                tier = _intent_tier(decision, settings, intention) if intention is not None else None
 
                 # Popups need a reader. Below the away threshold activity
                 # still logs — reading produces no input either — but an
@@ -414,7 +417,7 @@ def _run_live_loop(
                       and settings.popup.enabled and user_present):
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
-                    msg = f"Off-task: {cat_name}" + (f"\n{reason}" if reason else "")
+                    msg = f"Unproductive: {cat_name}" + (f"\n{reason}" if reason else "")
                     show_popup(msg, "Focus Alert")
 
                 # Hand this verdict to the UI: the timer widget colors itself
@@ -641,7 +644,8 @@ INTENT_OFF = "off-intent"
 INTENT_UNKNOWN = "no-signal"
 
 
-def _intent_tier(decision: Dict[str, Any], settings: Settings) -> str:
+def _intent_tier(decision: Dict[str, Any], settings: Settings,
+                 intention: Optional[Dict] = None) -> str:
     """How well does this decision serve the active session intention?
 
     Returns INTENT_ON / INTENT_PARTIAL / INTENT_OFF / INTENT_UNKNOWN.
@@ -649,6 +653,12 @@ def _intent_tier(decision: Dict[str, Any], settings: Settings) -> str:
     ALIGN is authoritative when the LLM produced it; the shortcut paths
     (system windows, cached pre-intention decisions) have no ALIGN and fall
     back to the category's productivity, with neutral meaning "no signal".
+
+    Home-category prior: a partial-band score is the model hedging, and a
+    hedge inside the category the intention itself maps to usually IS the
+    declared work approached from a title that undersells it. Those hedges
+    resolve to on-intent. The prior never touches the off band — being in
+    the right category is not doing the declared work.
     """
     cfg = settings.intention
     align = decision.get("final_align")
@@ -662,6 +672,13 @@ def _intent_tier(decision: Dict[str, Any], settings: Settings) -> str:
     if align >= cfg.on_intent_min:
         return INTENT_ON
     if align >= cfg.off_intent_max:
+        if cfg.home_category_prior and intention is not None:
+            home = (intention.get("llm_category") or "").strip().lower()
+            cat = (decision.get("final_category_name") or "").strip().lower()
+            if home and cat == home:
+                print(f"[runner] home-category prior: partial ALIGN in "
+                      f"{intention.get('llm_category')} counts as on-intent")
+                return INTENT_ON
         return INTENT_PARTIAL
     return INTENT_OFF
 

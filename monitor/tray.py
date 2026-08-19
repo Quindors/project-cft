@@ -25,6 +25,7 @@ _STATE_COLORS = {
     status.STATE_PARTIAL:  (245, 158, 11),
     status.STATE_OFF:      (239, 68, 68),
     status.STATE_BREAK:    (56, 189, 248),
+    status.STATE_PAUSED:   (56, 189, 248),
     status.STATE_TRACKING: (100, 116, 139),
     status.STATE_IDLE:     (148, 163, 184),
     status.STATE_AWAY:     (71, 85, 105),
@@ -40,7 +41,7 @@ def _icon_image(state: str = status.STATE_IDLE):
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.ellipse((6, 6, 58, 58), fill=rgb + (255,))
-    if state == status.STATE_BREAK:
+    if state in (status.STATE_BREAK, status.STATE_PAUSED):
         # A pause bar reads as "stopped" at 16px where a hollow disc doesn't.
         d.rectangle((25, 22, 30, 42), fill=(255, 255, 255, 255))
         d.rectangle((34, 22, 39, 42), fill=(255, 255, 255, 255))
@@ -65,6 +66,8 @@ def _status_text(item=None) -> str:
     left = snap.get("remaining_sec")
     mins = None if left is None else max(0, int(left) // 60)
 
+    if snap.get("state") == status.STATE_PAUSED:
+        return "Session paused — resuming shortly"
     if snap.get("phase") == status.PHASE_BREAK:
         return f"On a break — {mins}m left"
     if snap.get("phase") == status.PHASE_SESSION:
@@ -83,6 +86,11 @@ def _has_active_intention(item=None) -> bool:
 def _on_break(item=None) -> bool:
     snap = _snapshot()
     return snap.get("phase") == status.PHASE_BREAK
+
+
+def _is_paused(item=None) -> bool:
+    snap = _snapshot()
+    return snap.get("state") == status.STATE_PAUSED
 
 
 def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_quit: Callable[[], None]):
@@ -154,6 +162,9 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
         pystray.MenuItem(f"Take a {breaks.DEFAULT_BREAK_MIN}-Minute Break", _start_break,
                          enabled=lambda item: not _on_break()),
         pystray.MenuItem("End Break", _end_break, enabled=_on_break),
+        # A pause renders as a session (phase), so End Break stays greyed out;
+        # this is its counterpart, live only while a pause runs.
+        pystray.MenuItem("Resume Paused Session", _end_break, enabled=_is_paused),
         pystray.MenuItem("Show Timer", _toggle_widget,
                          checked=lambda item: not timer_widget.is_hidden()),
         pystray.MenuItem("Reset Timer Position", _reset_widget),
