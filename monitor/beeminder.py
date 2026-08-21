@@ -221,19 +221,35 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
 
 # ------------------- posting -------------------
 
+def _flatten_messages(value) -> List[str]:
+    """Pull the human sentences out of an error payload of any shape.
+
+    Beeminder nests its messages — {"errors": {"slug": ["You already have a
+    goal with that goalname"]}} — and the field names add nothing the sentence
+    doesn't already say. Order is preserved; blanks are dropped.
+    """
+    if isinstance(value, dict):
+        return [m for v in value.values() for m in _flatten_messages(v)]
+    if isinstance(value, (list, tuple)):
+        return [m for v in value for m in _flatten_messages(v)]
+    s = str(value).strip()
+    return [s] if s else []
+
+
 def _error_detail(err: HTTPError) -> str:
-    """The API's own message, so a bad goal slug says so instead of '422'."""
+    """The API's own message as plain text, so a bad goal slug says so
+    instead of '422' — and never as raw JSON."""
     try:
         body = err.read().decode("utf-8", "replace").strip()
     except Exception:
         return ""
     try:
         parsed = json.loads(body)
-        if isinstance(parsed, dict):
-            body = str(parsed.get("errors") or parsed.get("error") or parsed)
     except ValueError:
-        pass
-    return body[:300]
+        return body[:300]
+    if isinstance(parsed, dict):
+        parsed = parsed.get("errors") or parsed.get("error") or parsed
+    return "; ".join(_flatten_messages(parsed))[:300]
 
 
 def post_datapoint(
