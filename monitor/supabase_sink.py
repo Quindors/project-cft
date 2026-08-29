@@ -382,4 +382,9 @@ class SupabaseSink:
             "human_label": record.get("human_label") or None,
             "typed_text": record.get("typed_text") or None,
             "events": json.dumps(events) if events else None,
+            # Kept in lockstep with LocalSink._flatten_row: DualSink mirrors
+            # rows through here, and supa_mirror's natural-key matching
+            # assumes both databases receive identical values.
+            "intention_id": record.get("intention_id"),
+            "align_score": record.get("align_score"),
         }

@@ -94,7 +94,6 @@ PALETTE = {
     status.STATE_BREAK:    ("#38bdf8", "#0f1a22", "#0c4a6e"),
     status.STATE_PAUSED:   ("#38bdf8", "#0f1a22", "#0c4a6e"),
     status.STATE_SESSION:  ("#34d399", "#0f1c19", "#14532d"),
-    status.STATE_TRACKING: ("#64748b", "#111827", "#1e293b"),
     status.STATE_IDLE:     ("#94a3b8", "#111827", "#1e293b"),
     status.STATE_AWAY:     ("#475569", "#0f141c", "#1e293b"),
 }

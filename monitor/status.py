@@ -1,7 +1,7 @@
 # monitor/status.py
 """Live monitor state, published by the runner and read by the UI.
 
-Everything else the UI needs — mode, active session, active break — is DB
+Everything else the UI needs — active session, active break — is DB
 backed and readable from any thread. What is *not* in the DB is what the last
 decision concluded: which intent tier the current activity falls in, what it
 was classified as, how long the drift has been running. The timer widget
@@ -100,27 +100,21 @@ STATE_PARTIAL = "partial"    # loosely related to it
 STATE_OFF = "off"            # not doing it
 STATE_SESSION = "session"    # session running, no verdict yet
 STATE_PAUSED = "paused"      # session frozen for a minute; nothing watched
-STATE_TRACKING = "tracking"  # time-tracking mode, no session
-STATE_IDLE = "idle"          # distraction-free, no session
+STATE_IDLE = "idle"          # no session running
 STATE_AWAY = "away"          # no input at all; monitoring stood down
 
 
 def full_snapshot() -> Dict[str, Any]:
     """Everything a timer/tray/dashboard needs, resolved into one view.
 
-    Combines the DB-backed facts (mode, active session, active break) with the
+    Combines the DB-backed facts (active session, active break) with the
     in-memory decision state above, and reduces them to a phase, a label, a
     countdown and a color state — so the widget and the dashboard can never
     disagree about what is going on.
     """
-    from monitor import app_state, breaks, intentions
+    from monitor import breaks, intentions
 
     snap = get()
-
-    try:
-        mode = app_state.get_mode()
-    except Exception:
-        mode = app_state.DEFAULT_MODE
 
     try:
         active_break = breaks.get_active()
@@ -140,7 +134,6 @@ def full_snapshot() -> Dict[str, Any]:
             active_intention = None
 
     out: Dict[str, Any] = {
-        "mode": mode,
         "break": active_break,
         "intention": active_intention,
         "tier": snap.get("tier"),
@@ -189,15 +182,13 @@ def full_snapshot() -> Dict[str, Any]:
             remaining_sec=seconds_until(active_intention.get("ends_at")),
         )
     else:
-        tracking_only = mode != app_state.MODE_DISTRACTION_FREE
         # No session means no ALIGN, so the only drift signal left is the
         # plain productive/not verdict — and only while it is fresh.
         off_task = snap.get("is_productive") is False and not snap.get("stale")
         out.update(
             phase=PHASE_IDLE,
-            state=STATE_TRACKING if tracking_only
-            else (STATE_OFF if off_task else STATE_IDLE),
-            label="Tracking" if tracking_only else "Focus",
+            state=STATE_OFF if off_task else STATE_IDLE,
+            label="Focus",
             started_at=None,
             ends_at=None,
             remaining_sec=None,

@@ -39,19 +39,22 @@ MAX_DURATION_MIN = 8 * 60
 PAUSE_MIN = 1
 
 
-def _finished(intention: Dict, status: str) -> None:
+def _finished(intention: Dict, status: str, *, start_break: bool = True) -> None:
     """A session just ended for good — roll into the post-session break, and
     record it on Beeminder if that is configured.
 
     breaks is imported lazily because it calls back into this module to close
     an active session, so a module-level import would be circular. The two
-    hooks are kept independent: a Beeminder outage must not cost you a break.
+    hooks are kept independent: a Beeminder outage must not cost you a break,
+    and a caller that owns the break slot itself (start_break=False) must
+    still get the session recorded on Beeminder.
     """
-    try:
-        from monitor import breaks
-        breaks.after_session_end(intention, status)
-    except Exception as e:
-        print(f"[intention] post-session break skipped ({e})")
+    if start_break:
+        try:
+            from monitor import breaks
+            breaks.after_session_end(intention, status)
+        except Exception as e:
+            print(f"[intention] post-session break skipped ({e})")
 
     try:
         from monitor import beeminder
@@ -180,20 +183,6 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
             "llm_category": llm_category,
         }
 
-    # Declaring an intention IS choosing focus: a session started while the
-    # monitor sits in time-tracking mode would score drift and never say so,
-    # which is a session in name only. One-way on purpose — ending a session
-    # does not switch back, because "watch me again" is explicit and "stop
-    # watching me" should never happen by side effect. Failure is logged, not
-    # raised: the session matters more than the mode.
-    try:
-        from monitor import app_state
-        if app_state.get_mode() != app_state.MODE_DISTRACTION_FREE:
-            app_state.set_mode(app_state.MODE_DISTRACTION_FREE)
-            print("[intention] session started — switching to focus mode")
-    except Exception as e:
-        print(f"[intention] could not switch to focus mode ({e})")
-
     return active
 
 
@@ -274,8 +263,9 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
     """End the active intention (completed/abandoned). Returns it, or None.
 
     Completing a session starts the post-session break; abandoning one does
-    not. fire_hook=False is for callers that are already handling the
-    aftermath themselves (breaks.start closing a session it is replacing).
+    not. fire_hook=False is for callers that are already handling the break
+    slot themselves (breaks.start closing a session it is replacing) — the
+    Beeminder record is independent of the break and is pushed either way.
     """
     if status not in ("completed", "abandoned"):
         raise ValueError("status must be 'completed' or 'abandoned'")
@@ -301,6 +291,5 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
         print(f"[intention] could not clear the pause ({e})")
     active["status"] = status
     active["ended_at"] = _now_str()
-    if fire_hook:
-        _finished(active, status)
+    _finished(active, status, start_break=fire_hook)
     return active

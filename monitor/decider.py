@@ -89,7 +89,7 @@ def _read_prompt_file(filename: str) -> str:
 # old intention must not leak into the new session. Reset on process restart;
 # corrections and prior_classifications already handle the cross-session story.
 
-_session_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+_session_cache: Dict[str, Tuple[Dict[str, Any], float, bool]] = {}
 
 _CACHE_TTL_SEC = 600.0   # 10 minutes
 _CACHE_MIN_CONF = 0.80
@@ -100,16 +100,19 @@ def _cache_key(window_title: str, intention_id) -> str:
     return f"{intention_id if intention_id is not None else ''}|{_normalize_title(window_title)}"
 
 
-def _cache_get(window_title: str, intention_id=None) -> Optional[Dict[str, Any]]:
+def _cache_get(window_title: str, intention_id=None) -> Optional[Tuple[Dict[str, Any], bool]]:
+    """The cached (decision, pinned) pair, or None. pinned=True means the
+    entry came from a user correction (force-cached), so it is only as alive
+    as the correction that made it — the caller must check."""
     key = _cache_key(window_title, intention_id)
     entry = _session_cache.get(key)
     if entry is None:
         return None
-    decision, ts = entry
+    decision, ts, pinned = entry
     if time.time() - ts > _CACHE_TTL_SEC:
         _session_cache.pop(key, None)
         return None
-    return decision
+    return decision, pinned
 
 
 def _cache_put(window_title: str, decision: Dict[str, Any], intention_id=None, force: bool = False) -> None:
@@ -121,7 +124,7 @@ def _cache_put(window_title: str, decision: Dict[str, Any], intention_id=None, f
             return
         if decision.get("final_category_name") in _CACHE_SKIP_CATS:
             return
-    _session_cache[_cache_key(window_title, intention_id)] = (decision, time.time())
+    _session_cache[_cache_key(window_title, intention_id)] = (decision, time.time(), force)
 
 
 # ==================== TITLE NORMALIZATION ====================
@@ -264,6 +267,27 @@ def _build_fewshot_prompt(
                     if remaining <= 0:
                         break
 
+    # --- Exact-title precedent (its own block, outside the slot budget) ---
+    # The session cache only pins high-confidence calls for 10 minutes under
+    # one intention. Past that, what this very title was called before is the
+    # strongest signal there is — dropping it made the same window flip
+    # category mid-session once its cache entry aged out.
+    exact_lines = []
+    exact_high_conf = True
+    current_norm = _normalize_title(current_window)
+    corrected_norms = {_normalize_title(c["window_title"]) for c in (corrections or [])}
+    if prior_classifications and current_norm not in corrected_norms:
+        for p in prior_classifications:
+            if p["normalized_title"] == current_norm:
+                n = p.get("count", 1)
+                seen = f"{n} times" if n > 1 else "once"
+                exact_high_conf = p.get("high_conf", True)
+                exact_lines.append(
+                    f'- THIS EXACT WINDOW was classified {seen} recently as '
+                    f'{p["category_name"]} (conf={p["confidence"]:.2f}).'
+                )
+                break
+
     # --- Collect prior classification examples (fill remaining slots) ---
     prior_lines = []
     remaining_slots = max_examples - len(correction_lines)
@@ -274,8 +298,13 @@ def _build_fewshot_prompt(
             # Skip if already covered by a correction
             if p["window_title"].lower() in used_titles:
                 continue
-            # Skip exact match with current window (that's handled by tier 1)
-            if p["normalized_title"] == _normalize_title(current_window):
+            # Skip exact match with current window (shown in its own block)
+            if p["normalized_title"] == current_norm:
+                continue
+            # A title that qualified only by repetition (low conf) speaks for
+            # itself, never for other windows — cross-title examples keep the
+            # confidence bar. Absent flag (Supabase sink) means high-conf.
+            if not p.get("high_conf", True):
                 continue
             overlap = len(current_words & _content_words(p["window_title"]))
             if overlap > 0:
@@ -294,6 +323,26 @@ def _build_fewshot_prompt(
     if correction_lines:
         all_lines.append("LEARNED FROM PAST CORRECTIONS (the user corrected these):")
         all_lines.extend(correction_lines)
+
+    if exact_lines:
+        all_lines.append("\nPRECEDENT FOR THIS EXACT WINDOW:")
+        all_lines.extend(exact_lines)
+        if exact_high_conf:
+            all_lines.append(
+                "Prefer this category for the current window, for consistency — repeated "
+                "past judgments of this very title are strong evidence. Depart from it "
+                "only when the current context clearly contradicts it, and say why. "
+                "Precedent speaks to CATEGORY only, never to ALIGN."
+            )
+        else:
+            # Repeat-qualified low-confidence precedent must never instruct:
+            # telling the model to prefer its own repeated coin-flips lets a
+            # few shaky calls in a row entrench the initial mistake.
+            all_lines.append(
+                "These were LOW-confidence calls that merely repeated: treat them as "
+                "context, not an instruction — judge the current evidence on its own "
+                "merits. Precedent speaks to CATEGORY only, never to ALIGN."
+            )
 
     if prior_lines:
         all_lines.append("\nSIMILAR WINDOWS PREVIOUSLY CLASSIFIED:")
@@ -908,11 +957,16 @@ def decide(
     # A cached entry that disagrees with a (possibly newer) correction is
     # stale — bypass it so the correction wins within one decision, matching
     # the no-intention path where corrections are checked before the cache.
+    # The same goes in reverse: a correction-pinned entry whose correction
+    # was DELETED must not keep serving the retracted category, so with no
+    # correction in force only unpinned entries count.
     if events_context:
-        cached = _cache_get(events_context[-1][1], intention_id)
+        hit = _cache_get(events_context[-1][1], intention_id)
+        cached, pinned = hit if hit is not None else (None, False)
         if cached is not None and (
-            correction is None
-            or cached.get("final_category_name", "").lower() == correction["corrected_category"].lower()
+            (correction is None and not pinned)
+            or (correction is not None
+                and cached.get("final_category_name", "").lower() == correction["corrected_category"].lower())
         ):
             print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
             result = dict(cached)

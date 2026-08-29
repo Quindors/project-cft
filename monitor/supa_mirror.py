@@ -70,6 +70,30 @@ def mirror_correction(timestamp: str, current_window: str, human_label: Optional
     _run_async("correction", op)
 
 
+def mirror_correction_rows(changes) -> None:
+    """Apply a rule edit's per-row outcomes to the matching Supabase rows.
+
+    `changes` is [(timestamp, current_window, human_label-or-None), ...] —
+    the exact rows the local UPDATE touched, so the cloud never re-derives
+    which rows a rule covers (normalized-title matching, the confirmation
+    guard, the works) and cannot drift from the local decision. Rows are
+    matched by the (timestamp, current_window) natural key, see the module
+    docstring.
+    """
+    if not enabled() or not changes:
+        return
+
+    def op(sb):
+        for timestamp, current_window, human_label in changes:
+            (sb.table("focus_logs")
+               .update({"human_label": human_label})
+               .eq("timestamp", timestamp)
+               .eq("current_window", current_window)
+               .execute())
+
+    _run_async("correction-rule", op)
+
+
 def mirror_category_add(name: str, description: str, is_productive) -> None:
     if not enabled():
         return

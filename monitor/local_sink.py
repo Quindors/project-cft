@@ -41,6 +41,12 @@ _DEFAULT_CATEGORIES = [
 ]
 
 
+# How far back a labeled row still defines a live correction rule. The
+# dashboard's rule list (GET /api/corrections) shows the same window, so it
+# never displays a rule the decider no longer applies.
+CORRECTIONS_DAYS_BACK = 7
+
+
 def _normalize_title(title: str) -> str:
     s = title.strip()
     if s.upper().startswith("WIN:"):
@@ -187,7 +193,7 @@ class LocalSink:
         self._categories_cache = cats
         return cats
 
-    def load_corrections(self, days_back: int = 7) -> List[Dict]:
+    def load_corrections(self, days_back: int = CORRECTIONS_DAYS_BACK) -> List[Dict]:
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         with self._lock:
             rows = self._conn.execute(
@@ -211,30 +217,69 @@ class LocalSink:
                 }
         return list(corrections.values())
 
-    def load_prior_classifications(self, days_back: int = 7, min_confidence: float = 0.85) -> List[Dict]:
+    def load_prior_classifications(
+        self, days_back: int = 7, min_confidence: float = 0.85, min_repeats: int = 3
+    ) -> List[Dict]:
+        """Uncorrected precedent for the few-shot prompt.
+
+        A title earns a slot two ways: a single classification confident
+        enough to trust on its own (>= min_confidence), or the same category
+        repeated min_repeats times — a window judged "Composition, conf 0.5"
+        thirty times over a session is settled precedent even though no one
+        row clears the confidence bar. Each entry carries how many rows agree
+        ("count"), so the prompt can say how settled it is.
+        """
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         skip = {"ambiguous", "[error]", "[parse_error]"}
+        # Counting happens in SQL so the whole days_back window is surveyed:
+        # a raw-row LIMIT here silently shrank "7 days" to however long 4000
+        # decisions take (~11 active hours at the 10s interval). The GROUP BY
+        # output is one row per distinct (title spelling, category) pair, so
+        # the LIMIT below is a safety cap, not a window.
         with self._lock:
             rows = self._conn.execute(
-                """SELECT current_window, category_name, confidence FROM focus_logs
-                   WHERE human_label IS NULL AND confidence >= ? AND timestamp >= ?
-                   ORDER BY timestamp DESC LIMIT 500""",
-                (min_confidence, cutoff),
+                """SELECT current_window, category_name, COUNT(*) AS repeats,
+                          MAX(confidence) AS confidence, MAX(timestamp) AS last_seen
+                   FROM focus_logs
+                   WHERE human_label IS NULL AND timestamp >= ?
+                   GROUP BY current_window, category_name
+                   ORDER BY last_seen DESC LIMIT 2000""",
+                (cutoff,),
             ).fetchall()
-        out: Dict[str, Dict] = {}
+        # Groups arrive newest-first, so the first spelling seen for a pair
+        # keeps the freshest title spelling, and dict order favors recency on
+        # ties.
+        agg: Dict[tuple, Dict] = {}
         for row in rows:
             window = (row["current_window"] or "").strip()
             category = (row["category_name"] or "").strip()
             if not window or not category or category.lower() in skip:
                 continue
             norm = _normalize_title(window)
-            if norm not in out:
-                out[norm] = {
+            entry = agg.get((norm, category.lower()))
+            if entry is None:
+                agg[(norm, category.lower())] = {
                     "window_title": window,
                     "normalized_title": norm,
                     "category_name": category,
-                    "confidence": row["confidence"],
+                    "confidence": row["confidence"] or 0.0,
+                    "count": row["repeats"],
                 }
+            else:
+                entry["count"] += row["repeats"]
+                entry["confidence"] = max(entry["confidence"], row["confidence"] or 0.0)
+        out: Dict[str, Dict] = {}
+        for entry in agg.values():
+            if entry["confidence"] < min_confidence and entry["count"] < min_repeats:
+                continue
+            # Repeat-qualified low-confidence entries are precedent for their
+            # own title only. Every leakage incident on record came from a
+            # DIFFERENT window's example being cited as current evidence, so
+            # cross-title few-shot keeps the high-confidence bar.
+            entry["high_conf"] = entry["confidence"] >= min_confidence
+            best = out.get(entry["normalized_title"])
+            if best is None or entry["count"] > best["count"]:
+                out[entry["normalized_title"]] = entry
         return list(out.values())
 
     # ------------------- learning loop: review + accuracy -------------------

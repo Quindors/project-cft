@@ -257,7 +257,7 @@ and once more for yesterday after midnight rolls over.
 | `BEEMINDER_USER` | — | Your Beeminder username. Required. |
 | `BEEMINDER_TOKEN` | — | Personal auth token. Required. |
 | `BEEMINDER_FOCUS_GOAL` | — | Do More goal fed daily productive hours |
-| `BEEMINDER_SESSIONS_GOAL` | — | Optional goal fed one point per finished focus session |
+| `BEEMINDER_SESSIONS_GOAL` | — | Optional goal fed one point per finished focus session (needs ≥10 logged minutes) |
 | `BEEMINDER_SYNC_SEC` | `300` | Seconds between pushes |
 | `BEEMINDER_SECONDS_PER_ROW` | `decision_interval` | Seconds of activity each logged row stands for |
 | `BEEMINDER_STRICT_INTENT` | on | Off-intent work during a focus session counts as off-task; set `0` to count any productive work |
@@ -280,6 +280,12 @@ off-task. Partially-aligned work still counts, and work done with no session
 active is judged by its category alone. Set `BEEMINDER_STRICT_INTENT=0` if you
 want any productive-category work to count regardless of the active session.
 
+The sessions goal has its own floor: a finished session only posts a point if
+at least ten minutes of activity were actually logged under it. How a session
+ended matters less than whether anyone was there for it — one clicked "Done"
+moments after starting, or left to expire in front of an empty chair (idle
+detection stops the logging), posts nothing.
+
 ### Before you put money on it
 
 - **Beemind focus hours, not distraction minutes.** A Do Less goal fed by a
@@ -291,8 +297,9 @@ want any productive-category work to count regardless of the active session.
   task for a rebuild, a sleeping machine, or a crash all silently undercount.
 - **An empty chair earns nothing.** Idle detection (above) stops the hour
   count five minutes after your last input, so parking a productive window
-  overnight doesn't feed the goal. The sessions goal is the one residual
-  soft spot: a session left to expire unattended still counts as finished.
+  overnight doesn't feed the goal — and a session that expires unattended
+  fails the sessions goal's ten-logged-minutes floor rather than counting
+  as finished.
 - **Start at a $0 pledge** and run `BEEMINDER_DRY_RUN=1` (or watch the goal
   flat) for a week or two, comparing what gets pushed against the dashboard,
   before letting a derail cost anything. Keep a week of safety buffer.

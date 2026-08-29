@@ -13,17 +13,13 @@ local SQLite DB. Two ways to reach it:
 Endpoints:
     GET  /api/status            -> the one resolved view of what's happening now:
                                    {phase, state, label, ends_at, remaining_sec,
-                                    mode, intention, break, tier, category, ...}
+                                    intention, break, tier, category, ...}
                                    The timer widget, the tray and the dashboard
                                    all render from this (see monitor/status.py).
     GET  /api/break             -> {active: {started_at, ends_at, remaining_sec} | null}
     POST /api/break             -> {duration_min?} starts a break: tracking AND
                                    alerts stop until it runs out
     POST /api/break/end         -> ends the break early, resuming the monitor
-    GET  /api/mode              -> {mode}  ("distraction_free" | "time_tracking")
-    POST /api/mode              -> {mode} switches monitor mode; alerts only
-                                   fire in distraction_free (picked up live by
-                                   the runner within one decision interval)
     GET  /api/categories        -> [{name, description, is_productive}, ...]
     GET  /api/focus?since=<ts>  -> [{timestamp, category_name, confidence}, ...]
     GET  /api/events?limit=<n>  -> recent rows with id/current_window/human_label,
@@ -31,6 +27,13 @@ Endpoints:
                                    alignment, null outside a focus session),
                                    for the dashboard's review (re-classify) tab
     GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null}
+    GET  /api/sessions?limit=<n>-> finished focus sessions (completed or expired
+                                   — the same set Beeminder counts), newest
+                                   first: [{id, text, started_at, ended_at,
+                                   status, llm_category, avg_align}, ...].
+                                   avg_align is the mean 0-1 ALIGN over the
+                                   session's scored rows, null if none were
+                                   scored. Feeds the dashboard's forest tab.
     GET  /api/beeminder         -> {configured, user, focus_goal, sessions_goal,
                                     dry_run, sync_running} — never the token
     POST /api/beeminder         -> {user, token, focus_goal, sessions_goal?,
@@ -41,7 +44,23 @@ Endpoints:
                                    .env and starts the sync; 400 with a reason
                                    when the credentials don't check out
     POST /api/correct           -> {id, human_label} sets a human correction on a
-                                   row (human_label of null/"" clears it)
+                                   row. The label must name an existing category
+                                   (matched case-insensitively, stored in the
+                                   category's exact casing); null/"" clears it
+    GET  /api/corrections       -> the learned correction rules, one per exact
+                                   window title whose recent rows (the same
+                                   window load_corrections reads) carry a
+                                   human label differing from the AI's
+                                   category: [{window_title, ai_category,
+                                     corrected_category, rows, last_at}, ...]
+    POST /api/corrections/update-> {window_title, human_label} retargets the
+                                   rule's corrected rows — matched across all
+                                   normalized spellings of the title, the way
+                                   the decider matches — to a new category
+                                   (human_label of null/"" removes the
+                                   correction; confirmation rows where the
+                                   label merely agrees with the AI are never
+                                   touched, and a retarget never creates one)
     POST /api/category          -> {name, description, is_productive} adds a category
     POST /api/category/update   -> {name, new_name?, description?, is_productive?}
                                    edits a category; a rename cascades to
@@ -49,7 +68,11 @@ Endpoints:
     POST /api/category/delete   -> {name, reassign_to?} deletes a category and
                                    moves its logged rows to reassign_to
                                    (default "Ambiguous"); Ambiguous/System are
-                                   protected because the classifier needs them
+                                   protected because the classifier needs them,
+                                   and a non-productive category's rows can
+                                   never be reassigned into a productive one —
+                                   that would retroactively count them as
+                                   focused time
     POST /api/intention         -> {text, duration_min} starts a session intention;
                                    422 {rejected, category, reason} when the
                                    intention gate maps the declared work itself
@@ -69,8 +92,9 @@ GET /intention serves a built-in page for starting/ending a session intention
 and taking a break — usable even without the bundled dashboard (the tray and
 the timer widget both link to it).
 
-Corrections and category changes reach the classifier at the next monitor
-start, when they are re-read from the DB.
+Corrections apply live: correction writes flag app_state.corrections_changed
+and the runner reloads its set for the very next decision. Category changes
+still reach the classifier at the next monitor start.
 
 CORS is deliberately an ALLOWLIST, never "*": this API serves your window titles
 off localhost, so a wildcard would let any site you visit read them. Allowed
@@ -89,11 +113,12 @@ import socketserver
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Set
 from urllib.parse import urlparse, parse_qs
 
 from monitor.paths import resource_path, data_dir
+from monitor.local_sink import CORRECTIONS_DAYS_BACK, _normalize_title
 from monitor import supa_mirror
 from monitor import intentions
 from monitor import app_state
@@ -245,14 +270,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"error": str(e)}, status=500)
             return
 
-        # Mode lives in monitor/app_state.py — same on-demand DB pattern.
-        if u.path == "/api/mode":
-            try:
-                self._send_json({"mode": app_state.get_mode()})
-            except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
-            return
-
         if u.path == "/api/break":
             try:
                 self._send_json({"active": breaks.get_active(),
@@ -323,6 +340,62 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     (limit,),
                 ).fetchall()
                 self._send_json([dict(r) for r in rows])
+            elif u.path == "/api/corrections":
+                # One rule per exact window title, defined by its newest
+                # corrected row, over the same recency window the decider's
+                # load_corrections reads — older labeled rows are inert for
+                # classification and must not be shown as live rules.
+                # Confirmation rows (label agrees with the AI) are not rules.
+                cutoff = (datetime.now()
+                          - timedelta(days=CORRECTIONS_DAYS_BACK)).isoformat()
+                rows = conn.execute(
+                    "SELECT current_window, category_name, human_label, timestamp "
+                    "FROM focus_logs "
+                    "WHERE human_label IS NOT NULL AND human_label != '' "
+                    "  AND current_window IS NOT NULL AND timestamp >= ? "
+                    "ORDER BY timestamp DESC LIMIT 5000",
+                    (cutoff,),
+                ).fetchall()
+                out = {}
+                for r in rows:
+                    window = (r["current_window"] or "").strip()
+                    ai = (r["category_name"] or "").strip()
+                    human = (r["human_label"] or "").strip()
+                    if not window or not human or human.lower() == ai.lower():
+                        continue
+                    entry = out.get(window)
+                    if entry is None:
+                        out[window] = {
+                            "window_title": window,
+                            "ai_category": ai,
+                            "corrected_category": human,
+                            "rows": 1,
+                            "last_at": r["timestamp"],
+                        }
+                    else:
+                        entry["rows"] += 1
+                self._send_json(list(out.values()))
+            elif u.path == "/api/sessions":
+                try:
+                    limit = min(max(int(qs.get("limit", ["1000"])[0]), 1), 5000)
+                except ValueError:
+                    limit = 1000
+                try:
+                    rows = conn.execute(
+                        "SELECT i.id, i.text, i.started_at, i.ended_at, "
+                        "       i.status, i.llm_category, "
+                        "       AVG(f.align_score) AS avg_align "
+                        "FROM intentions i "
+                        "LEFT JOIN focus_logs f ON f.intention_id = i.id "
+                        "WHERE i.status IN ('completed', 'expired') "
+                        "GROUP BY i.id ORDER BY i.started_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    # No intentions table yet (no session was ever declared):
+                    # an empty forest, not an error.
+                    rows = []
+                self._send_json([dict(r) for r in rows])
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:
@@ -338,7 +411,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/intention": self._post_intention_start,
             "/api/intention/end": self._post_intention_end,
             "/api/intention/pause": self._post_intention_pause,
-            "/api/mode": self._post_mode,
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
@@ -346,6 +418,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         }
         handlers = {
             "/api/correct": self._post_correct,
+            "/api/corrections/update": self._post_corrections_update,
             "/api/category": self._post_category_add,
             "/api/category/update": self._post_category_update,
             "/api/category/delete": self._post_category_delete,
@@ -415,15 +488,6 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=400)
             return
         self._send_json({"ok": True, "active": active})
-
-    def _post_mode(self, body) -> None:
-        mode = (body.get("mode") or "").strip().lower()
-        try:
-            app_state.set_mode(mode)
-        except ValueError as e:
-            self._send_json({"error": str(e)}, status=400)
-            return
-        self._send_json({"ok": True, "mode": mode})
 
     def _post_intent_correct(self, body) -> None:
         """Rule a window on/off-intent for the active session's intention.
@@ -558,6 +622,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
 
         label = (body.get("human_label") or "").strip() or None
+        if label is not None:
+            known = self._resolve_label(conn, label)
+            if known is None:
+                self._send_json({"error": f"unknown category '{label}'"}, status=400)
+                return
+            label = known  # exact casing, so the downstream joins match
         reviewed_at = datetime.now().isoformat() if label else None
         cur = conn.execute(
             "UPDATE focus_logs SET human_label = ?, reviewed_at = ? WHERE id = ?",
@@ -573,12 +643,110 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         ).fetchone()
         if row is not None:
             supa_mirror.mirror_correction(row["timestamp"], row["current_window"], label)
+        app_state.corrections_changed.set()
         self._send_json({"ok": True, "id": row_id, "human_label": label})
+
+    def _post_corrections_update(self, conn, body) -> None:
+        """Manage a learned correction rule by window title.
+
+        {window_title, human_label} retargets the rule to the new category;
+        null/"" removes the correction instead. Titles are matched after
+        _normalize_title — the same matching the decider applies — so every
+        spelling variant ("(2) Chat | Teams") of the rule is covered, not
+        just the one byte-exact spelling the list happened to display.
+        Only rows whose label DIFFERS from the AI's category are touched —
+        a confirmation (label agreeing with the AI) is the user's ground
+        truth for the learning loop, not part of the rule being managed.
+
+        Retargeting only rewrites rows carrying the rule's own label: rows
+        of the same title corrected to some OTHER category are their own
+        ground truth, not part of the rule being edited. And a retarget that
+        lands on a row's AI category clears that row's label instead of
+        writing it — label==category reads as a human CONFIRMATION to the
+        learning loop, and no human reviewed those rows.
+        """
+        window = (body.get("window_title") or "").strip()
+        if not window:
+            self._send_json({"error": "expected JSON body {window_title, human_label}"}, status=400)
+            return
+
+        label = (body.get("human_label") or "").strip() or None
+        if label is not None:
+            known = self._resolve_label(conn, label)
+            if known is None:
+                self._send_json({"error": f"unknown category '{label}'"}, status=400)
+                return
+            label = known  # exact casing from the categories table
+
+        target_norm = _normalize_title(window)
+        rows = conn.execute(
+            "SELECT id, timestamp, current_window, category_name, human_label "
+            "FROM focus_logs "
+            "WHERE human_label IS NOT NULL AND human_label != '' "
+            "  AND current_window IS NOT NULL "
+            "ORDER BY timestamp DESC LIMIT 10000"
+        ).fetchall()
+        matched = [
+            r for r in rows
+            if _normalize_title(r["current_window"]) == target_norm
+            and (r["human_label"] or "").strip().lower()
+                != (r["category_name"] or "").strip().lower()
+        ]
+        if not matched:
+            self._send_json({"error": "no corrected rows for that window title"}, status=404)
+            return
+
+        # The rule the user edited: prefer the newest row with the exact
+        # spelling they clicked (what the list displayed), falling back to
+        # the newest normalized match.
+        rule_label = next(
+            ((r["human_label"] or "").strip() for r in matched
+             if (r["current_window"] or "").strip() == window),
+            (matched[0]["human_label"] or "").strip(),
+        )
+        now_iso = datetime.now().isoformat()
+        changes = []  # (id, timestamp, current_window, new_label)
+        for r in matched:
+            if label is not None:
+                if (r["human_label"] or "").strip().lower() != rule_label.lower():
+                    continue
+                ai = (r["category_name"] or "").strip()
+                new_label = None if ai.lower() == label.lower() else label
+            else:
+                new_label = None
+            changes.append((r["id"], r["timestamp"], r["current_window"], new_label))
+
+        for row_id, _ts, _win, new_label in changes:
+            conn.execute(
+                "UPDATE focus_logs SET human_label = ?, reviewed_at = ? WHERE id = ?",
+                (new_label, now_iso if new_label else None, row_id),
+            )
+        conn.commit()
+
+        supa_mirror.mirror_correction_rows(
+            [(ts, win, new_label) for _id, ts, win, new_label in changes])
+        app_state.corrections_changed.set()
+        self._send_json({"ok": True, "window_title": window,
+                         "human_label": label, "rows": len(changes)})
 
     @staticmethod
     def _productive_flag(value):
         """JSON true/false/null -> SQLite 1/0/NULL (neutral)."""
         return None if value is None else int(bool(value))
+
+    @staticmethod
+    def _resolve_label(conn, label):
+        """The exact-cased category name for `label`, or None if unknown.
+
+        Everything downstream joins on the exact name — Beeminder's day
+        query, the learning loop, the corrections list — so a free-text or
+        miscased label would silently fall out of all of them (a NULL join:
+        neither productive nor off-task). Labels are validated here instead.
+        """
+        row = conn.execute(
+            "SELECT name FROM categories WHERE lower(name) = lower(?)", (label,)
+        ).fetchone()
+        return row["name"] if row else None
 
     def _post_category_add(self, conn, body) -> None:
         name = (body.get("name") or "").strip()
@@ -611,11 +779,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
         Rows keep their history rather than being deleted: the default target
         is "Ambiguous" (the catch-all), and human_label follows too, exactly
-        like a rename cascade.
+        like a rename cascade. Reassignment is a one-way valve, though: rows
+        may move sideways or down, never up into a productive category (see
+        the guard below).
         """
         name = (body.get("name") or "").strip()
         row = conn.execute(
-            "SELECT name FROM categories WHERE name = ? COLLATE NOCASE", (name,)
+            "SELECT name, is_productive FROM categories WHERE name = ? COLLATE NOCASE",
+            (name,),
         ).fetchone()
         if row is None:
             self._send_json({"error": f"no category named {name!r}"}, status=404)
@@ -631,7 +802,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
         target = (body.get("reassign_to") or "Ambiguous").strip()
         target_row = conn.execute(
-            "SELECT name FROM categories WHERE name = ? COLLATE NOCASE", (target,)
+            "SELECT name, is_productive FROM categories WHERE name = ? COLLATE NOCASE",
+            (target,),
         ).fetchone()
         if target_row is None:
             self._send_json({"error": f"no category named {target!r} to reassign to"}, status=400)
@@ -639,6 +811,20 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         target = target_row["name"]
         if target.lower() == name.lower():
             self._send_json({"error": "cannot reassign a category to itself"}, status=400)
+            return
+
+        # The one-way valve: "delete Gaming, reassign to Deep Work" would
+        # retroactively count every logged Gaming hour as focused work — and
+        # Beeminder re-pushes past days in place, so history would quietly
+        # pay out. Only the credit-minting direction is closed; tightening
+        # (productive -> anything) stays unrestricted.
+        if target_row["is_productive"] == 1 and row["is_productive"] != 1:
+            self._send_json(
+                {"error": f"cannot reassign {name!r} rows to productive {target!r} — "
+                          f"its logged history would start counting as focused time. "
+                          f"Pick a non-productive target (default: Ambiguous)."},
+                status=400,
+            )
             return
 
         moved = conn.execute(

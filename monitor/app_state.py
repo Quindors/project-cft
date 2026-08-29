@@ -1,34 +1,27 @@
 # monitor/app_state.py
 """Small key/value app state in the local focus.db.
 
-First user: the monitor mode. Two modes:
-
-    distraction_free - full behavior: track activity AND pop alerts
-                       (off-task popups / intention drift alerts).
-    time_tracking    - track activity only; all alerts are suppressed.
-
-Beyond the mode, the same table is the generic scratchpad for small bits of
-cross-thread state (get_value/set_value): the active break, the timer widget's
-screen position, and so on.
+The table is the generic scratchpad for small bits of cross-thread state
+(get_value/set_value): the active break, the timer widget's screen position,
+and so on.
 
 Like intentions, this opens short-lived connections so the runner loop, the
-dashboard HTTP threads, and the tray can all touch it concurrently. The
-dashboard toggles the mode via POST /api/mode; the runner re-reads it every
-decision, so a toggle takes effect within one decision interval.
+dashboard HTTP threads, and the tray can all touch it concurrently.
 """
 from __future__ import annotations
 
 import sqlite3
+import threading
 from typing import Optional
 
 from monitor.paths import data_dir
 
-MODE_DISTRACTION_FREE = "distraction_free"
-MODE_TIME_TRACKING = "time_tracking"
-MODES = (MODE_DISTRACTION_FREE, MODE_TIME_TRACKING)
-
-DEFAULT_MODE = MODE_DISTRACTION_FREE
-
+# In-process signal, not DB state: the dashboard HTTP thread sets this the
+# moment a human label is written, and the runner loop reloads its correction
+# set immediately instead of waiting out the periodic refresh. The dashboard
+# server and the runner share one process, so an Event is all it takes; the
+# periodic refresh stays on as the backstop for anything else that writes rows.
+corrections_changed = threading.Event()
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(str(data_dir() / "focus.db"), timeout=5)
@@ -39,23 +32,6 @@ def _connect() -> sqlite3.Connection:
            )"""
     )
     return conn
-
-
-def get_mode() -> str:
-    """Current monitor mode; unknown/missing values fall back to the default."""
-    with _connect() as conn:
-        row = conn.execute(
-            "SELECT value FROM app_state WHERE key = 'mode'"
-        ).fetchone()
-    if row and row[0] in MODES:
-        return row[0]
-    return DEFAULT_MODE
-
-
-def set_mode(mode: str) -> str:
-    if mode not in MODES:
-        raise ValueError(f"mode must be one of {', '.join(MODES)}")
-    return set_value("mode", mode)
 
 
 # ---------- generic key/value ----------

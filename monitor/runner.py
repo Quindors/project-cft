@@ -93,6 +93,11 @@ def _run_live_loop(
 
     events_buffer: List[Tuple[str, str]] = []
     last_decision_time: Optional[float] = None
+    # Decide on the next tick regardless of the interval, WITHOUT touching
+    # last_decision_time — the typed-text window is anchored to it, and
+    # nulling it made the forced decision swallow everything typed since the
+    # previous one.
+    force_decision = False
     decision_count = 0
     loop_start = time.time()
     waiting_logged = False
@@ -119,11 +124,6 @@ def _run_live_loop(
     idle_threshold = settings.idle.threshold_sec
     user_away = False
 
-    # Monitor mode (dashboard toggle applies live). Tracking always runs;
-    # alerts only fire in distraction-free mode.
-    current_mode = app_state.get_mode()
-    print(f"[runner] mode: {current_mode}")
-
     # Break state. A break is a hard stop, not a quieter mode: while one runs
     # we do not poll windows, do not capture keystrokes, do not classify, do
     # not log and do not alert. `on_break` tracks the transition so capture is
@@ -135,9 +135,11 @@ def _run_live_loop(
     alert_was_open = False
     resume_at: Optional[float] = None
 
-    # Corrections made in the dashboard while we run take effect within this
-    # interval — no restart needed. decide() checks corrections before its
-    # session cache, so a refreshed correction overrides cached classifications.
+    # Corrections made in the dashboard apply at the very next decision: the
+    # HTTP thread flags app_state.corrections_changed and the loop reloads on
+    # the spot. This timed reload is only the backstop for writers that don't
+    # signal (review.py, direct DB edits). decide() checks corrections before
+    # its session cache, so a fresh correction overrides cached classifications.
     try:
         corrections_refresh_sec = float(os.getenv("CFT_CORRECTIONS_REFRESH_SEC", "120"))
     except ValueError:
@@ -274,24 +276,45 @@ def _run_live_loop(
             # --- ensure correct daily sheet ---
             sink.ensure_day(now_dt.date())
 
-            # --- periodic corrections refresh (dashboard edits apply live) ---
-            if corrections_refresh_sec > 0 and (time.time() - last_corrections_reload) >= corrections_refresh_sec:
+            # --- corrections refresh (dashboard edits apply live) ---
+            edited = app_state.corrections_changed.is_set()
+            if edited or (
+                corrections_refresh_sec > 0
+                and (time.time() - last_corrections_reload) >= corrections_refresh_sec
+            ):
+                app_state.corrections_changed.clear()
                 last_corrections_reload = time.time()
                 try:
                     fresh = sink.load_corrections()
                     if len(fresh) != len(corrections or []):
                         print(f"[runner] corrections refreshed: {len(corrections or [])} -> {len(fresh)}")
                     corrections = fresh
+                    # Priors move with corrections: a label just written also
+                    # changes which rows count as uncorrected precedent.
+                    prior_classifications = sink.load_prior_classifications()
                 except Exception as e:
                     print(f"[runner] corrections refresh failed ({e}); keeping current set")
+                    if edited:
+                        # The edit never reached `corrections`. Put the signal
+                        # back so the next tick retries, and hold the forced
+                        # re-judge until the reload lands — deciding now would
+                        # re-log the very classification the user just fixed.
+                        app_state.corrections_changed.set()
+                        edited = False
+                if edited:
+                    # Re-judge the window in front right now — a correction
+                    # that waits out the decision interval reads as ignored.
+                    force_decision = True
 
             # --- decide if it's time ---
             should_decide = (
-                last_decision_time is None
+                force_decision
+                or last_decision_time is None
                 or (time.time() - last_decision_time) >= settings.decision_interval
             )
 
             if should_decide and len(events_buffer) >= settings.min_events:
+                force_decision = False
                 if last_decision_time is not None:
                     prev_dt = datetime.fromtimestamp(last_decision_time)
                 else:
@@ -304,17 +327,6 @@ def _run_live_loop(
                 print(f"\n[runner] Decision #{decision_count} on {len(events_buffer)} events...")
                 if decision_count == 1:
                     print(f"[runner] Time from loop start to first decision: {time.time() - loop_start:.1f}s")
-
-                # --- monitor mode (dashboard toggle applies live) ---
-                try:
-                    mode = app_state.get_mode()
-                except Exception as e:
-                    print(f"[runner] mode lookup failed ({e}); keeping {current_mode}")
-                    mode = current_mode
-                if mode != current_mode:
-                    current_mode = mode
-                    print(f"[runner] mode changed -> {current_mode}")
-                alerts_enabled = current_mode == app_state.MODE_DISTRACTION_FREE
 
                 # --- active session intention (dashboard/tray edits apply live) ---
                 intention = None
@@ -370,9 +382,7 @@ def _run_live_loop(
                 if flush_result:
                     print(f"[runner] Flushed to sheets ({sheets_time:.2f}s, appended={flush_result.appended}, updated={flush_result.updated})")
 
-                # Alerts. Time-tracking mode suppresses them entirely (dwell
-                # state resets so a stale streak can't fire on mode switch).
-                # With an active intention: dwell-based drift alert.
+                # Alerts. With an active intention: dwell-based drift alert.
                 # Without: the original immediate off-task popup.
                 tier = _intent_tier(decision, settings, intention) if intention is not None else None
 
@@ -383,10 +393,7 @@ def _run_live_loop(
                 user_present = (idle_sec is None
                                 or idle_sec <= settings.idle.alert_recent_input_sec)
 
-                if not alerts_enabled:
-                    drift_tier, drift_since = None, None
-                    drift_category, drift_window = None, ""
-                elif intention is not None:
+                if intention is not None:
                     now_t = time.time()
                     drift_tier, drift_since = _update_drift(tier, drift_tier, drift_since, now_t)
                     if tier in (INTENT_OFF, INTENT_PARTIAL):

@@ -13,8 +13,8 @@ Two things get pushed:
 
   focus hours   one datapoint per day, holding the productive hours logged so
                 far that day. Re-sent every sync, climbing as the day goes on.
-  sessions      one datapoint per focus session that reached its end, on a
-                separate count goal.
+  sessions      one datapoint per focus session that reached its end with
+                real logged activity behind it, on a separate count goal.
 
 Both rely on `requestid`, which is an upsert scoped to the goal: the same id
 with the same value is ignored, the same id with a different value updates the
@@ -59,6 +59,14 @@ _TS_FMT = "%Y-%m-%d %H:%M:%S"
 # Sessions worth a datapoint. Abandoning a session is not finishing it, and a
 # superseded one was replaced rather than done — same rule the auto-break uses.
 COUNTED_SESSION_STATUSES = ("completed", "expired")
+
+# ...and a finished session only counts if someone actually sat through it: at
+# least this many seconds of activity must have been logged under its
+# intention. Two holes close at once. Clicking "Done" moments after starting
+# would otherwise mint a datapoint per four clicks, and a session left to
+# expire in front of an empty chair logs (almost) nothing past the idle
+# threshold, so it no longer counts as finished work either.
+SESSION_MIN_LOGGED_SEC = 600.0
 
 
 @dataclass(frozen=True)
@@ -219,6 +227,27 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
     )
 
 
+def session_logged_sec(intention_id, *, seconds_per_row: float) -> float:
+    """Seconds of activity actually logged under this intention. Never raises.
+
+    Rows still sitting in the runner's write buffer (a handful at most) are
+    invisible here, so the figure can undershoot slightly — fine for a floor.
+    An unreadable database reads as zero, the same honest fallback day_totals
+    uses: when in doubt, no credit.
+    """
+    try:
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM focus_logs WHERE intention_id = ?",
+                (intention_id,),
+            ).fetchone()
+    except sqlite3.Error as e:
+        print(f"[beeminder] could not read focus.db ({e}); "
+              f"counting the session as unlogged")
+        return 0.0
+    return float(row["n"] if row else 0) * seconds_per_row
+
+
 # ------------------- posting -------------------
 
 def _flatten_messages(value) -> List[str]:
@@ -344,13 +373,24 @@ def _session_daystamp(intention: Dict) -> Optional[str]:
 
 
 def push_session(intention: Dict, status: str, *, cfg: Optional[Config] = None) -> Optional[Dict]:
-    """Record one finished focus session on the sessions goal."""
+    """Record one finished focus session on the sessions goal.
+
+    Only sessions with SESSION_MIN_LOGGED_SEC of logged activity count — how
+    the session ended says less than whether anyone was there for it.
+    """
     cfg = cfg or config()
     if not cfg.sessions_goal or not enabled(cfg):
         return None
     if status not in COUNTED_SESSION_STATUSES:
         return None
     if not intention.get("id"):
+        return None
+
+    logged = session_logged_sec(intention["id"], seconds_per_row=cfg.seconds_per_row)
+    if logged < SESSION_MIN_LOGGED_SEC:
+        print(f"[beeminder] session {intention['id']} not counted: "
+              f"{logged / 60:.1f}m logged, the floor is "
+              f"{SESSION_MIN_LOGGED_SEC / 60:.0f}m")
         return None
 
     text = " ".join(str(intention.get("text", "")).split())

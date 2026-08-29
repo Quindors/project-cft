@@ -119,8 +119,12 @@ def end() -> Optional[Dict]:
     data = get_active()
     if data is None:
         return None
-    if app_state.delete_value(_KEY):
-        print("[break] break ended early — monitoring resumes")
+    # The delete is the single-shot gate: the dashboard thread and the
+    # tray/widget can both end the same break, and only the winner may hand
+    # the unused time back — twice would shorten the session twice.
+    if not app_state.delete_value(_KEY):
+        return None
+    print("[break] break ended early — monitoring resumes")
     unused = data.get("remaining_sec", 0)
     if data.get("source") == "pause" and data.get("intention_id") and unused > 0:
         try:
