@@ -43,6 +43,8 @@ Endpoints:
                                    the user's account first), persists to the
                                    .env and starts the sync; 400 with a reason
                                    when the credentials don't check out
+    POST /api/beeminder/live    -> leaves dry-run mode (BEEMINDER_DRY_RUN=0)
+    POST /api/beeminder/disconnect -> blanks the Beeminder credentials
     POST /api/correct           -> {id, human_label} sets a human correction on a
                                    row. The label must name an existing category
                                    (matched case-insensitively, stored in the
@@ -415,6 +417,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
             "/api/beeminder": self._post_beeminder,
+            "/api/beeminder/live": self._post_beeminder_live,
+            "/api/beeminder/disconnect": self._post_beeminder_disconnect,
         }
         handlers = {
             "/api/correct": self._post_correct,
@@ -578,7 +582,40 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             os.environ[name] = value
             _persist_env_var(name, value)
 
+        # Past outcomes described the old goal; push once right away so the
+        # card can show this one working (or not) without waiting a tick.
+        beeminder.reset_health()
         beeminder.start_background_sync()
+        beeminder.sync_now().join(timeout=8)
+        self._send_json({"ok": True, **beeminder.status()})
+
+    def _post_beeminder_live(self, body) -> None:
+        """Leave dry-run mode: from now on datapoints are really sent."""
+        from monitor import beeminder
+        from monitor.creds import _persist_env_var
+
+        os.environ["BEEMINDER_DRY_RUN"] = "0"
+        _persist_env_var("BEEMINDER_DRY_RUN", "0")
+        beeminder.reset_health()
+        beeminder.start_background_sync()
+        # Wait for the first real push (bounded) so the answer already says
+        # whether it landed — the card renders straight from this.
+        beeminder.sync_now().join(timeout=8)
+        self._send_json({"ok": True, **beeminder.status()})
+
+    def _post_beeminder_disconnect(self, body) -> None:
+        """Forget the credentials. Blanks the values rather than deleting the
+        lines, so the .env still shows which knobs exist. The sync thread
+        stays up but every tick sees the integration disabled and does
+        nothing; the setup card reappears."""
+        from monitor import beeminder
+        from monitor.creds import _persist_env_var
+
+        for name in ("BEEMINDER_USER", "BEEMINDER_TOKEN",
+                     "BEEMINDER_FOCUS_GOAL", "BEEMINDER_SESSIONS_GOAL"):
+            os.environ.pop(name, None)
+            _persist_env_var(name, "")
+        beeminder.reset_health()
         self._send_json({"ok": True, **beeminder.status()})
 
     def _post_intention_pause(self, body) -> None:

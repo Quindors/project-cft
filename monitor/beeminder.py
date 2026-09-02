@@ -305,6 +305,7 @@ def post_datapoint(
     if cfg.dry_run:
         shown = {k: v for k, v in fields.items() if k != "auth_token"}
         print(f"[beeminder] DRY RUN {goal} <- {shown}")
+        _note_push(goal, ok=None, error=None)
         return None
 
     url = (f"{API_ROOT}/users/{quote(cfg.user, safe='')}"
@@ -318,20 +319,65 @@ def post_datapoint(
             with urlopen(req, timeout=cfg.timeout_sec) as resp:
                 point = json.loads(resp.read().decode("utf-8"))
             print(f"[beeminder] {goal} = {value:g} ({requestid})")
+            _note_push(goal, ok=True, error=None)
             return point
         except HTTPError as e:
-            detail = _error_detail(e)
             # 4xx means the request itself is wrong — a bad slug, a dead token,
             # a goal that does not exist. A second identical try cannot fix it.
             if e.code < 500 or attempt == 2:
-                print(f"[beeminder] {goal}: HTTP {e.code} {detail}")
+                problem = _http_problem(e, cfg.user, goal)
+                print(f"[beeminder] {goal}: {problem}")
+                _note_push(goal, ok=False, error=problem)
                 return None
         except (URLError, OSError, ValueError) as e:
             if attempt == 2:
-                print(f"[beeminder] {goal}: {e} (giving up)")
+                problem = f"could not reach Beeminder ({e})"
+                print(f"[beeminder] {goal}: {problem}")
+                _note_push(goal, ok=False, error=problem)
                 return None
         time.sleep(2)
     return None
+
+
+def _http_problem(err: HTTPError, user: str, goal: str) -> str:
+    """One sentence for what Beeminder is objecting to, for humans."""
+    if err.code in (401, 403):
+        return "Beeminder rejected the token"
+    if err.code == 404:
+        return f"Beeminder has no goal '{goal}' under user '{user}' (deleted or renamed?)"
+    detail = _error_detail(err)
+    return detail or f"Beeminder answered HTTP {err.code}"
+
+
+# ------------------- health (what the dashboard card reports) -------------------
+
+# Outcome of the most recent push, per goal. The card reads this to tell a
+# healthy integration from one that is quietly failing — a deleted goal or a
+# revoked token never stops the monitor, so it has to be visible somewhere
+# other than cft.log.
+_health_lock = threading.Lock()
+_health: Dict[str, Dict] = {}
+
+
+def _note_push(goal: str, *, ok: Optional[bool], error: Optional[str]) -> None:
+    with _health_lock:
+        _health[goal] = {
+            "ok": ok,                       # True sent, False failed, None dry run
+            "error": error,
+            "at": datetime.now().strftime(_TS_FMT),
+        }
+
+
+def last_push(goal: str) -> Optional[Dict]:
+    with _health_lock:
+        entry = _health.get(goal)
+        return dict(entry) if entry else None
+
+
+def reset_health() -> None:
+    """Forget past outcomes — after a reconnect they describe the old goal."""
+    with _health_lock:
+        _health.clear()
 
 
 # ------------------- the two things we push -------------------
@@ -428,7 +474,12 @@ def after_session_end(intention: Dict, status: str) -> Optional[threading.Thread
 # ------------------- setup surface (dashboard settings card) -------------------
 
 def status() -> Dict:
-    """What the settings card needs to know — never includes the token."""
+    """What the settings card needs to know — never includes the token.
+
+    last_push is the outcome of the most recent focus-goal push: ok True/False
+    (None while in dry run), an error sentence, and when. It is how a deleted
+    goal or a dead token becomes visible instead of just a line in cft.log.
+    """
     cfg = config()
     return {
         "configured": enabled(cfg),
@@ -437,7 +488,17 @@ def status() -> Dict:
         "sessions_goal": cfg.sessions_goal or None,
         "dry_run": cfg.dry_run,
         "sync_running": _sync_thread is not None and _sync_thread.is_alive(),
+        "last_push": last_push(cfg.focus_goal) if cfg.focus_goal else None,
     }
+
+
+def sync_now() -> threading.Thread:
+    """Push today off the calling thread, so a settings change is reflected
+    in last_push within seconds rather than at the next five-minute tick."""
+    thread = threading.Thread(target=lambda: sync_focus_day(), daemon=True,
+                              name="beeminder-sync-now")
+    thread.start()
+    return thread
 
 
 _SLUG_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$")

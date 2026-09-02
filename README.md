@@ -236,8 +236,15 @@ the integration stays entirely off until the `.env` names all three.
    `beeminder.com/alice/focus` → `focus`).
 3. Either way the card verifies everything against Beeminder, saves it to the
    `.env` next to the exe and starts syncing immediately — no restart. The
-   card only shows while Beeminder is unconfigured (and "Not now" hides it on
-   that browser).
+   setup form only shows while Beeminder is unconfigured (and "Not now" hides
+   it on that browser).
+
+The same card is where problems show up. A Beeminder failure never stops the
+monitor, so the card speaks up instead: in **dry-run mode** it says nothing is
+being sent yet and offers **Go live**; when the last push **failed** (goal
+deleted or renamed, token revoked, Beeminder unreachable) it shows the reason
+with **Reconnect** and **Disconnect**. When everything is healthy it shows
+nothing at all.
 
 Prefer a text editor? Add the same values to the `.env` by hand and restart:
 

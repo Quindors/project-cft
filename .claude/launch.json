@@ -1,0 +1,20 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "cft-mobile-web",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": ["-d", "Ubuntu", "bash", "/home/abl96/projects/cft-mobile/scripts/web-dev.sh"],
+      "port": 8081
+    },
+    {
+      "name": "focus-dashboard",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && npm run dev -- --mode test --port 5173 --strictPort"
+      ],
+      "port": 5173
+    }
+  ]
+}
