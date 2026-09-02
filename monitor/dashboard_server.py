@@ -35,9 +35,17 @@ Endpoints:
                                    session's scored rows, null if none were
                                    scored. Feeds the dashboard's forest tab.
     GET  /api/beeminder         -> {configured, user, focus_goal, sessions_goal,
-                                    dry_run, sync_running} — never the token
-    POST /api/beeminder         -> {user, token, focus_goal, sessions_goal?,
-                                    create_goal?, hours_per_day?}
+                                    dry_run, sync_running, last_push, goal_check,
+                                    problem} — never the token. goal_check is a
+                                   read-only probe of the goal (cached 60s);
+                                   problem is the one actionable issue, with a
+                                   reason of missing_goal | bad_token |
+                                   unreachable | other, or null when healthy
+    POST /api/beeminder         -> {user, token?, focus_goal, sessions_goal?,
+                                    create_goal?, hours_per_day?, leeway_days?}
+                                   (token may be omitted once configured — the
+                                   stored one is reused, e.g. replacing a goal
+                                   that was deleted on beeminder.com)
                                    verifies against Beeminder (or, with
                                    create_goal, creates the Do More goal on
                                    the user's account first), persists to the
@@ -546,6 +554,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         token = str(body.get("token") or "").strip()
         focus_goal = str(body.get("focus_goal") or "").strip()
         sessions_goal = str(body.get("sessions_goal") or "").strip()
+        # Replacing a goal that vanished: the stored token still works, so
+        # the card need not ask for it again. A new token, if given, wins.
+        if not token and beeminder.enabled():
+            token = beeminder.config().token
         if not user or not token or not focus_goal:
             self._send_json({"error": "user, token and focus_goal are required"}, status=400)
             return

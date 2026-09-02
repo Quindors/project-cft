@@ -42,7 +42,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -327,16 +327,29 @@ def post_datapoint(
             if e.code < 500 or attempt == 2:
                 problem = _http_problem(e, cfg.user, goal)
                 print(f"[beeminder] {goal}: {problem}")
-                _note_push(goal, ok=False, error=problem)
+                _note_push(goal, ok=False, error=problem, reason=_reason_for(e))
                 return None
         except (URLError, OSError, ValueError) as e:
             if attempt == 2:
                 problem = f"could not reach Beeminder ({e})"
                 print(f"[beeminder] {goal}: {problem}")
-                _note_push(goal, ok=False, error=problem)
+                _note_push(goal, ok=False, error=problem, reason="unreachable")
                 return None
         time.sleep(2)
     return None
+
+
+# Why a request failed, in terms the card can act on:
+#   missing_goal  the goal is gone (deleted, renamed) -> offer to make a new one
+#   bad_token     the token no longer works           -> ask for a new token
+#   unreachable   network / Beeminder down            -> nothing to do but wait
+#   other         anything else, with Beeminder's own words
+def _reason_for(err: HTTPError) -> str:
+    if err.code in (401, 403):
+        return "bad_token"
+    if err.code == 404:
+        return "missing_goal"
+    return "other"
 
 
 def _http_problem(err: HTTPError, user: str, goal: str) -> str:
@@ -359,11 +372,13 @@ _health_lock = threading.Lock()
 _health: Dict[str, Dict] = {}
 
 
-def _note_push(goal: str, *, ok: Optional[bool], error: Optional[str]) -> None:
+def _note_push(goal: str, *, ok: Optional[bool], error: Optional[str],
+               reason: Optional[str] = None) -> None:
     with _health_lock:
         _health[goal] = {
             "ok": ok,                       # True sent, False failed, None dry run
             "error": error,
+            "reason": reason,
             "at": datetime.now().strftime(_TS_FMT),
         }
 
@@ -378,6 +393,7 @@ def reset_health() -> None:
     """Forget past outcomes — after a reconnect they describe the old goal."""
     with _health_lock:
         _health.clear()
+    _forget_goal_check()
 
 
 # ------------------- the two things we push -------------------
@@ -481,6 +497,17 @@ def status() -> Dict:
     goal or a dead token becomes visible instead of just a line in cft.log.
     """
     cfg = config()
+    push = last_push(cfg.focus_goal) if cfg.focus_goal else None
+    goal = check_goal(cfg)
+
+    # One thing for the card to act on. A goal that is definitely gone wins
+    # over a stale push failure; an unreachable probe says nothing either way.
+    problem = None
+    if goal and goal["exists"] is False:
+        problem = {"reason": goal["reason"], "message": goal["error"]}
+    elif push and push["ok"] is False:
+        problem = {"reason": push.get("reason") or "other", "message": push["error"]}
+
     return {
         "configured": enabled(cfg),
         "user": cfg.user or None,
@@ -488,7 +515,9 @@ def status() -> Dict:
         "sessions_goal": cfg.sessions_goal or None,
         "dry_run": cfg.dry_run,
         "sync_running": _sync_thread is not None and _sync_thread.is_alive(),
-        "last_push": last_push(cfg.focus_goal) if cfg.focus_goal else None,
+        "last_push": push,
+        "goal_check": goal,
+        "problem": problem,
     }
 
 
@@ -574,28 +603,78 @@ def create_goal(user: str, token: str, slug: str, hours_per_day, leeway_days=0,
         return f"could not reach Beeminder ({e})"
 
 
-def verify(user: str, token: str, goal: str, *, timeout_sec: float = 10.0) -> Optional[str]:
-    """Check a (user, token, goal) trio against Beeminder before saving it.
+def probe_goal(user: str, token: str, goal: str, *, timeout_sec: float = 10.0
+               ) -> Tuple[Optional[str], Optional[str]]:
+    """Ask Beeminder whether (user, token, goal) is a live trio.
 
-    Returns None when it checks out, else a message fit to show the user.
-    Read-only: fetches the goal rather than posting a datapoint, so a typo'd
-    slug can't smudge a real graph. Beeminder's API authenticates GETs by
-    query parameter — over TLS to beeminder.com only, never logged here.
+    Returns (reason, message): (None, None) when it checks out, else one of
+    the _reason_for kinds and a sentence fit to show the user. Read-only —
+    fetches the goal rather than posting a datapoint, so a typo'd slug can't
+    smudge a real graph. Beeminder's API authenticates GETs by query
+    parameter: over TLS to beeminder.com only, never logged here.
     """
     url = (f"{API_ROOT}/users/{quote(user, safe='')}"
            f"/goals/{quote(goal, safe='')}.json?{urlencode({'auth_token': token})}")
     try:
         with urlopen(Request(url), timeout=timeout_sec) as resp:
             json.loads(resp.read().decode("utf-8"))
-        return None
+        return None, None
     except HTTPError as e:
         if e.code in (401, 403):
-            return "Beeminder rejected that token"
+            return "bad_token", "Beeminder rejected that token"
         if e.code == 404:
-            return f"Beeminder has no goal '{goal}' under user '{user}'"
-        return f"Beeminder answered HTTP {e.code}: {_error_detail(e)}"
+            return "missing_goal", f"Beeminder has no goal '{goal}' under user '{user}'"
+        return "other", f"Beeminder answered HTTP {e.code}: {_error_detail(e)}"
     except (URLError, OSError, ValueError) as e:
-        return f"could not reach Beeminder ({e})"
+        return "unreachable", f"could not reach Beeminder ({e})"
+
+
+def verify(user: str, token: str, goal: str, *, timeout_sec: float = 10.0) -> Optional[str]:
+    """probe_goal for callers that only want the sentence (None = fine)."""
+    return probe_goal(user, token, goal, timeout_sec=timeout_sec)[1]
+
+
+# The card polls status every 30s; a deleted goal must show up without
+# waiting for the next five-minute push - and in dry-run mode a push would
+# never notice at all. So status() probes the goal itself, at most once a
+# minute, read-only.
+_GOAL_CHECK_TTL_SEC = 60.0
+_goal_check_lock = threading.Lock()
+_goal_check: Dict = {"key": None, "at": 0.0, "result": None}
+
+
+def check_goal(cfg: Optional[Config] = None, *, force: bool = False) -> Optional[Dict]:
+    """Does the configured focus goal still exist? Cached for a minute.
+
+    Returns {"exists": bool|None, "reason", "error", "checked_at"} or None
+    when there is nothing configured to check. exists is None when Beeminder
+    could not be reached - unknown is not the same as gone.
+    """
+    cfg = cfg or config()
+    if not enabled(cfg) or not cfg.focus_goal:
+        return None
+    key = (cfg.user, cfg.focus_goal, cfg.token)
+    now = time.time()
+    with _goal_check_lock:
+        fresh = (_goal_check["key"] == key
+                 and now - _goal_check["at"] < _GOAL_CHECK_TTL_SEC)
+        if fresh and not force:
+            return dict(_goal_check["result"])
+    reason, message = probe_goal(cfg.user, cfg.token, cfg.focus_goal)
+    result = {
+        "exists": None if reason == "unreachable" else reason is None,
+        "reason": reason,
+        "error": message,
+        "checked_at": datetime.now().strftime(_TS_FMT),
+    }
+    with _goal_check_lock:
+        _goal_check.update(key=key, at=now, result=result)
+    return dict(result)
+
+
+def _forget_goal_check() -> None:
+    with _goal_check_lock:
+        _goal_check.update(key=None, at=0.0, result=None)
 
 
 # ------------------- the background sync -------------------

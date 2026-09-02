@@ -240,11 +240,17 @@ the integration stays entirely off until the `.env` names all three.
    it on that browser).
 
 The same card is where problems show up. A Beeminder failure never stops the
-monitor, so the card speaks up instead: in **dry-run mode** it says nothing is
-being sent yet and offers **Go live**; when the last push **failed** (goal
-deleted or renamed, token revoked, Beeminder unreachable) it shows the reason
-with **Reconnect** and **Disconnect**. When everything is healthy it shows
-nothing at all.
+monitor, so the card speaks up instead. The monitor probes the goal itself
+(read-only, at most once a minute), so it notices even in dry-run mode:
+
+- **Goal deleted or renamed on beeminder.com** — the card says so and turns
+  into a "new goal" form: create a replacement (commitment, leeway) or point at
+  another existing goal. Your token is kept, so it's one step.
+- **Dry-run mode** — nothing is being sent yet; **Go live** switches it on.
+- **Any other failure** (token revoked, Beeminder unreachable) — the reason,
+  with **Reconnect** and **Disconnect**.
+
+When everything is healthy it shows nothing at all.
 
 Prefer a text editor? Add the same values to the `.env` by hand and restart:
 
