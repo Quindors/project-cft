@@ -322,6 +322,15 @@ def post_datapoint(
             _note_push(goal, ok=True, error=None)
             return point
         except HTTPError as e:
+            # Beeminder answers a re-sent requestid whose value has not
+            # changed with an error status reading "Duplicate request". That
+            # is the upsert working as designed - the datapoint is already
+            # exactly this - not a failure, so it must not trip the card.
+            if e.code < 500:
+                detail = _error_detail(e)
+                if "duplicate" in detail.lower():
+                    _note_push(goal, ok=True, error=None)
+                    return {"duplicate": True, "requestid": requestid}
             # 4xx means the request itself is wrong — a bad slug, a dead token,
             # a goal that does not exist. A second identical try cannot fix it.
             if e.code < 500 or attempt == 2:
