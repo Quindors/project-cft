@@ -36,9 +36,12 @@ if __name__ == "__main__":
         register_protocol()
 
     # The hosted dashboard draws the forest from the cloud mirror when this
-    # exe is off, so every session ever declared must be up there.
+    # exe is off, so every session ever declared must be up there. The .env
+    # (mirror credentials, LLM key) has to be loaded first — nothing below
+    # sees it otherwise, and a silent "mirroring disabled" is the result.
     try:
-        from monitor import intentions
+        from monitor import creds, intentions
+        creds.load_env()
         intentions.mirror_all()
         # Sessions from before the intention gate get classified the way new
         # ones are, in the background (one LLM call each). Frozen only: source
