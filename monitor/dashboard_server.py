@@ -34,10 +34,18 @@ Endpoints:
     GET  /api/sessions?limit=<n>-> finished focus sessions (completed or expired
                                    — the same set Beeminder counts), newest
                                    first: [{id, text, started_at, ended_at,
-                                   status, llm_category, avg_align}, ...].
+                                   status, llm_category, avg_align,
+                                   top_category, top_share}, ...].
                                    avg_align is the mean 0-1 ALIGN over the
                                    session's scored rows, null if none were
-                                   scored. Feeds the dashboard's forest tab.
+                                   scored. llm_category is what the intention
+                                   gate DECLARED the session to be (null before
+                                   the gate existed); top_category is what the
+                                   monitor actually OBSERVED — the session's
+                                   most-logged effective category (human
+                                   correction wins) — with top_share its
+                                   fraction of the session's classifiable rows.
+                                   Feeds the dashboard's forest tab.
     GET  /api/beeminder         -> {configured, user, focus_goal, sessions_goal,
                                     dry_run, sync_running, last_push, goal_check,
                                     problem} — never the token. goal_check is a
@@ -205,6 +213,71 @@ def _db_rw():
     conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+# Categories that say nothing about what a session was FOR — the classifier's
+# own shrugs and the OS. They never become a session's observed category and
+# don't count toward its classifiable rows either.
+_SESSION_CATEGORY_SKIP = ("ambiguous", "system", "[error]", "[parse_error]")
+
+
+def _finished_sessions(conn, limit: int) -> list:
+    """Finished sessions (completed or expired) newest first, each with its
+    mean ALIGN and the category the monitor actually OBSERVED during it.
+
+    llm_category is what the intention gate mapped the declared text to at
+    session start — null on every session from before the gate existed.
+    top_category is derived from the session's own focus_logs rows (a human
+    correction wins over the classifier, as everywhere else), with top_share
+    its fraction of the session's classifiable rows. So a pre-gate session
+    still knows what it was, and a session declared as one thing but spent
+    on another shows both.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT i.id, i.text, i.started_at, i.ended_at, "
+            "       i.status, i.llm_category, "
+            "       AVG(f.align_score) AS avg_align "
+            "FROM intentions i "
+            "LEFT JOIN focus_logs f ON f.intention_id = i.id "
+            "WHERE i.status IN ('completed', 'expired') "
+            "GROUP BY i.id ORDER BY i.started_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # No intentions table yet (no session was ever declared):
+        # an empty forest, not an error.
+        return []
+    out = [dict(r) for r in rows]
+    for s in out:
+        s["top_category"] = None
+        s["top_share"] = None
+    if not out:
+        return out
+    by_id = {s["id"]: s for s in out}
+    marks = ",".join("?" * len(by_id))
+    counts = conn.execute(
+        "SELECT intention_id, "
+        "       COALESCE(NULLIF(TRIM(human_label), ''), category_name) AS cat, "
+        "       COUNT(*) AS n "
+        f"FROM focus_logs WHERE intention_id IN ({marks}) "
+        "GROUP BY intention_id, cat",
+        list(by_id),
+    ).fetchall()
+    totals = {}
+    best = {}
+    for r in counts:
+        cat = (r["cat"] or "").strip()
+        if not cat or cat.lower() in _SESSION_CATEGORY_SKIP:
+            continue
+        iid = r["intention_id"]
+        totals[iid] = totals.get(iid, 0) + r["n"]
+        if iid not in best or r["n"] > best[iid][1]:
+            best[iid] = (cat, r["n"])
+    for iid, (cat, n) in best.items():
+        by_id[iid]["top_category"] = cat
+        by_id[iid]["top_share"] = round(n / totals[iid], 3)
+    return out
 
 
 class _Handler(http.server.SimpleHTTPRequestHandler):
@@ -400,22 +473,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     limit = min(max(int(qs.get("limit", ["1000"])[0]), 1), 5000)
                 except ValueError:
                     limit = 1000
-                try:
-                    rows = conn.execute(
-                        "SELECT i.id, i.text, i.started_at, i.ended_at, "
-                        "       i.status, i.llm_category, "
-                        "       AVG(f.align_score) AS avg_align "
-                        "FROM intentions i "
-                        "LEFT JOIN focus_logs f ON f.intention_id = i.id "
-                        "WHERE i.status IN ('completed', 'expired') "
-                        "GROUP BY i.id ORDER BY i.started_at DESC LIMIT ?",
-                        (limit,),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    # No intentions table yet (no session was ever declared):
-                    # an empty forest, not an error.
-                    rows = []
-                self._send_json([dict(r) for r in rows])
+                self._send_json(_finished_sessions(conn, limit))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except Exception as e:
