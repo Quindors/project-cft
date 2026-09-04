@@ -11,10 +11,19 @@ No admin rights are required: the task runs with the user's own interactive
 token (the exe must run in the interactive session to see foreground windows).
 `--uninstall-autostart` removes the task again.
 
+The task also re-fires every ten minutes as a self-heal: if the monitor was
+closed or crashed, it is back within ten minutes without anyone noticing. The
+single-instance mutex makes those launches free while it IS running.
+
 The single-instance mutex complements the task: Task Scheduler's IgnoreNew
 policy stops the task from starting twice, but not a manual double-click racing
 a task launch. The mutex is session-local, which still covers elevated +
 non-elevated instances in the same session.
+
+cft:// is the third way in: the exe registers itself as the handler for that
+URL scheme (per-user, HKCU, no admin), so the hosted dashboard's "Start CFT"
+button — a plain link to cft://start — makes the browser ask "Open CFT
+Monitor?" and launch the exe on a PC where it isn't running.
 """
 import ctypes
 import os
@@ -24,11 +33,57 @@ import tempfile
 from xml.sax.saxutils import escape
 
 TASK_NAME = "CFT Monitor"
+PROTOCOL_SCHEME = "cft"       # cft://start — the dashboard's "Start CFT" button
+SELF_HEAL_INTERVAL = "PT10M"  # ISO 8601 duration for the task's repetition
 
 _MUTEX_NAME = "cft-monitor-single-instance"
 _ERROR_ACCESS_DENIED = 5     # mutex exists but is held by an elevated instance
 _ERROR_ALREADY_EXISTS = 183
 _mutex_handle = None
+
+
+def strip_protocol_args(args):
+    """Drop cft:// URLs from argv. A protocol launch is just "start": the URL
+    is whatever web page linked it, so it is never treated as a command."""
+    return [a for a in args if not a.lower().startswith(PROTOCOL_SCHEME + ":")]
+
+
+def register_protocol():
+    """Register cft:// under HKCU so a browser can launch this exe.
+
+    Per-user, no admin. Idempotent and cheap: it rewrites the keys only when
+    the stored command differs from this exe's path, so a moved dist re-points
+    the scheme at itself on its next start. Source mode never registers —
+    a python.exe with the wrong args is not what a click should open.
+    """
+    if not getattr(sys, "frozen", False) or sys.platform != "win32":
+        return False
+    import winreg
+    exe = sys.executable
+    command = f'"{exe}" "%1"'
+    root = rf"Software\Classes\{PROTOCOL_SCHEME}"
+    try:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, root + r"\shell\open\command") as k:
+                current, _ = winreg.QueryValueEx(k, "")
+                if current == command:
+                    return True
+        except OSError:
+            pass
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root) as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "URL:CFT Monitor")
+            winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
+            winreg.SetValueEx(k, "FriendlyAppName", 0, winreg.REG_SZ, "CFT Monitor")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root + r"\DefaultIcon") as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, f'"{exe}",0')
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, root + r"\shell\open\command") as k:
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, command)
+            winreg.SetValueEx(k, "FriendlyAppName", 0, winreg.REG_SZ, "CFT Monitor")
+        print(f"[autostart] registered {PROTOCOL_SCHEME}:// -> {exe}")
+        return True
+    except OSError as e:
+        print(f"[autostart] could not register {PROTOCOL_SCHEME}:// ({e})")
+        return False
 
 
 def acquire_single_instance():
@@ -68,6 +123,14 @@ def _task_xml(exe, workdir, user):
       <StateChange>SessionUnlock</StateChange>
       <UserId>{user}</UserId>
     </SessionStateChangeTrigger>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>{SELF_HEAL_INTERVAL}</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">

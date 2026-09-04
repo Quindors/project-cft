@@ -3,8 +3,10 @@
 
 Local SQLite stays the source of truth. When MIRROR_SUPABASE is enabled and
 Supabase credentials exist, dashboard edits (corrections, category changes)
-are pushed to Supabase in a background thread so the cloud copy stays current.
-Event rows themselves are mirrored by DualSink (monitor/dual_sink.py).
+and session intentions are pushed to Supabase in a background thread so the
+cloud copy stays current. Event rows themselves are mirrored by DualSink
+(monitor/dual_sink.py). Intentions exist upstream so the hosted dashboard can
+draw the forest and the session history while this exe is off.
 
 Every call here is fire-and-forget: failures are logged and never block or
 break the local write that already succeeded.
@@ -92,6 +94,39 @@ def mirror_correction_rows(changes) -> None:
                .execute())
 
     _run_async("correction-rule", op)
+
+
+_INTENTION_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status", "llm_category")
+
+
+def _intention_payload(row) -> dict:
+    return {k: row.get(k) for k in _INTENTION_COLS}
+
+
+def mirror_intention(row) -> None:
+    """Upsert one session intention (any status) by its local id."""
+    if not enabled():
+        return
+    payload = _intention_payload(row)
+
+    def op(sb):
+        sb.table("intentions").upsert(payload, on_conflict="id").execute()
+
+    _run_async(f"intention-{payload['id']}", op)
+
+
+def mirror_intentions(rows) -> None:
+    """Bulk upsert — the startup backfill. Idempotent, so running it on every
+    start costs one request per 500 rows and never duplicates anything."""
+    if not enabled() or not rows:
+        return
+    payloads = [_intention_payload(r) for r in rows]
+
+    def op(sb):
+        for i in range(0, len(payloads), 500):
+            sb.table("intentions").upsert(payloads[i:i + 500], on_conflict="id").execute()
+
+    _run_async(f"intentions-backfill({len(payloads)})", op)
 
 
 def mirror_category_add(name: str, description: str, is_productive) -> None:

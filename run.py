@@ -15,7 +15,9 @@ if getattr(sys, "frozen", False):
     sys.stderr = _log
 
 if __name__ == "__main__":
-    args = sys.argv[1:]
+    from monitor.autostart import strip_protocol_args
+    # A cft:// launch (the dashboard's "Start CFT" button) is a plain start.
+    args = strip_protocol_args(sys.argv[1:])
 
     if "--install-autostart" in args or "--uninstall-autostart" in args:
         # Register/remove the logon+unlock scheduled task, then exit.
@@ -24,12 +26,30 @@ if __name__ == "__main__":
         sys.exit(0 if ok else 1)
 
     if getattr(sys, "frozen", False):
-        # The task retriggers on every unlock; the mutex keeps that (and manual
-        # double-launches) from stacking a second monitor onto the same DB.
-        from monitor.autostart import acquire_single_instance
+        # The task retriggers on every unlock and every ten minutes; the mutex
+        # keeps that (and manual double-launches) from stacking a second
+        # monitor onto the same DB.
+        from monitor.autostart import acquire_single_instance, register_protocol
         if not acquire_single_instance():
             print("[cft] another instance is already running; exiting.")
             sys.exit(0)
+        register_protocol()
+
+    # The hosted dashboard draws the forest from the cloud mirror when this
+    # exe is off, so every session ever declared must be up there.
+    try:
+        from monitor import intentions
+        intentions.mirror_all()
+        # Sessions from before the intention gate get classified the way new
+        # ones are, in the background (one LLM call each). Frozen only: source
+        # mode is trace mode and should not spend real calls on startup.
+        if getattr(sys, "frozen", False) and "--dashboard" not in args:
+            import threading
+            threading.Thread(
+                target=intentions.backfill_categories, daemon=True, name="intention-backfill",
+            ).start()
+    except Exception as e:
+        print(f"[cft] intention backfill skipped ({e})")
 
     from monitor.app import run, run_dashboard_only
 

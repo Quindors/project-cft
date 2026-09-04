@@ -63,6 +63,77 @@ def _finished(intention: Dict, status: str, *, start_break: bool = True) -> None
         print(f"[intention] beeminder push skipped ({e})")
 
 
+def _mirror(row: Dict) -> None:
+    """Push one intention row to the cloud mirror, if configured. Never raises:
+    the local write already happened and is the truth."""
+    try:
+        from monitor import supa_mirror
+        supa_mirror.mirror_intention(row)
+    except Exception as e:
+        print(f"[intention] cloud mirror skipped ({e})")
+
+
+def mirror_all() -> None:
+    """Startup backfill: every intention ever, so the hosted dashboard can draw
+    the forest from the cloud while this monitor is off."""
+    try:
+        from monitor import supa_mirror
+        if not supa_mirror.enabled():
+            return
+        with _connect() as conn:
+            rows = [dict(r) for r in conn.execute("SELECT * FROM intentions").fetchall()]
+        supa_mirror.mirror_intentions(rows)
+    except Exception as e:
+        print(f"[intention] cloud backfill skipped ({e})")
+
+
+def backfill_categories(limit: int = 50) -> int:
+    """Classify finished sessions that predate the intention gate.
+
+    Runs the same gate a new intention goes through, on the stored text, so
+    an old "personal statement" session is a College Application session the
+    way a new one would be — not whatever the monitor happened to log most
+    during it. Returns the number of rows filled. One LLM call per row,
+    bounded per call, and safe to run on every start: rows the gate cannot
+    place stay NULL and are simply retried next time.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, text FROM intentions WHERE llm_category IS NULL "
+            "AND status IN ('completed', 'expired') ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return 0
+    from monitor import intent_gate
+    filled = 0
+    for row in rows:
+        try:
+            verdict = intent_gate.check(row["text"])
+        except Exception as e:
+            print(f"[intention] backfill check failed ({e})")
+            break
+        if verdict.get("reason") == "check unavailable":
+            break  # no LLM right now; every further row would fail the same way
+        cat = verdict.get("category")
+        if not cat:
+            continue
+        with _connect() as conn:
+            conn.execute(
+                "UPDATE intentions SET llm_category = ? WHERE id = ? AND llm_category IS NULL",
+                (cat, row["id"]),
+            )
+            full = conn.execute(
+                "SELECT * FROM intentions WHERE id = ?", (row["id"],)
+            ).fetchone()
+        if full is not None:
+            _mirror(dict(full))
+        filled += 1
+    if filled:
+        print(f"[intention] backfilled categories on {filled} pre-gate session(s)")
+    return filled
+
+
 def _now_str() -> str:
     return datetime.now().strftime(_TS_FMT)
 
@@ -119,6 +190,7 @@ def get_active() -> Optional[Dict]:
 
     # Outside the connection block: the hook writes to the same DB file.
     if expired is not None:
+        _mirror(expired)
         _finished(expired, "expired")
     return None
 
@@ -164,6 +236,11 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
         print(f"[intention] could not clear the pause ({e})")
 
     with _connect() as conn:
+        superseded = [
+            dict(r) for r in conn.execute(
+                "SELECT * FROM intentions WHERE status = 'active'"
+            ).fetchall()
+        ]
         conn.execute(
             "UPDATE intentions SET status = 'superseded', ended_at = ? WHERE status = 'active'",
             (started_at,),
@@ -183,6 +260,11 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
             "llm_category": llm_category,
         }
 
+    for row in superseded:
+        row["status"] = "superseded"
+        row["ended_at"] = started_at
+        _mirror(row)
+    _mirror(active)
     return active
 
 
@@ -234,6 +316,7 @@ def pause_active() -> Dict:
         raise
 
     active["ends_at"] = new_ends
+    _mirror(active)
     return {"active": active, "pause": pause}
 
 
@@ -253,10 +336,16 @@ def shift_active_ends(intention_id: int, delta_sec: int) -> bool:
         new_ends = (
             datetime.strptime(row["ends_at"], _TS_FMT) + timedelta(seconds=delta_sec)
         ).strftime(_TS_FMT)
-        return conn.execute(
+        won = conn.execute(
             "UPDATE intentions SET ends_at = ? WHERE id = ? AND status = 'active'",
             (new_ends, intention_id),
         ).rowcount == 1
+        full = dict(conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (intention_id,)
+        ).fetchone()) if won else None
+    if full is not None:
+        _mirror(full)
+    return won
 
 
 def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional[Dict]:
@@ -291,5 +380,6 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
         print(f"[intention] could not clear the pause ({e})")
     active["status"] = status
     active["ended_at"] = _now_str()
+    _mirror(active)
     _finished(active, status, start_break=fire_hook)
     return active
