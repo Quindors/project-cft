@@ -21,7 +21,11 @@ Endpoints:
                                    alerts stop until it runs out
     POST /api/break/end         -> ends the break early, resuming the monitor
     GET  /api/categories        -> [{name, description, is_productive}, ...]
-    GET  /api/focus?since=<ts>  -> [{timestamp, category_name, confidence}, ...]
+    GET  /api/focus?since=<ts>  -> [{timestamp, category_name, ai_category,
+                                    confidence}, ...] — category_name is the
+                                   effective label (human correction wins over
+                                   the classifier, as Beeminder counts it);
+                                   ai_category is the classifier's original
     GET  /api/events?limit=<n>  -> recent rows with id/current_window/human_label,
                                    plus intention_id/align_score (0-1 intent
                                    alignment, null outside a focus session),
@@ -324,17 +328,23 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 ]
                 self._send_json(data)
             elif u.path == "/api/focus":
+                # category_name is the EFFECTIVE label: a human correction
+                # wins over the classifier, the same rule Beeminder totals
+                # by, so the pie, the split, the weekly trend and the
+                # datapoint all count the same thing. ai_category keeps the
+                # classifier's original call for anyone who wants it.
+                cols = ("SELECT timestamp, "
+                        "COALESCE(NULLIF(TRIM(human_label), ''), category_name) AS category_name, "
+                        "category_name AS ai_category, confidence FROM focus_logs ")
                 since = (qs.get("since", [""])[0] or "").strip()
                 if since:
                     rows = conn.execute(
-                        "SELECT timestamp, category_name, confidence FROM focus_logs "
-                        "WHERE timestamp >= ? ORDER BY timestamp DESC",
+                        cols + "WHERE timestamp >= ? ORDER BY timestamp DESC",
                         (since,),
                     ).fetchall()
                 else:
                     rows = conn.execute(
-                        "SELECT timestamp, category_name, confidence FROM focus_logs "
-                        "ORDER BY timestamp DESC LIMIT 5000"
+                        cols + "ORDER BY timestamp DESC LIMIT 5000"
                     ).fetchall()
                 self._send_json([dict(r) for r in rows])
             elif u.path == "/api/events":
