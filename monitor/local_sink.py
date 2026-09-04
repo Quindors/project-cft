@@ -228,6 +228,11 @@ class LocalSink:
         thirty times over a session is settled precedent even though no one
         row clears the confidence bar. Each entry carries how many rows agree
         ("count"), so the prompt can say how settled it is.
+
+        Rows whose category came from the screen rather than the title (the
+        decider tags their reason "[vision]") are left out: a vision override
+        says the title was uninformative or wrong, which is the opposite of
+        evidence about what that title means next time.
         """
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         skip = {"ambiguous", "[error]", "[parse_error]"}
@@ -242,6 +247,7 @@ class LocalSink:
                           MAX(confidence) AS confidence, MAX(timestamp) AS last_seen
                    FROM focus_logs
                    WHERE human_label IS NULL AND timestamp >= ?
+                     AND (reason IS NULL OR reason NOT LIKE '[vision]%')
                    GROUP BY current_window, category_name
                    ORDER BY last_seen DESC LIMIT 2000""",
                 (cutoff,),

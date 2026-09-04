@@ -674,6 +674,12 @@ OVERRIDE RULES (asymmetric — direction matters):
 DEFAULT BEHAVIOR — AGREE WITH PRIMARY:
   If the screenshot is unclear, low-resolution, shows a lock/idle screen, doesn't show a recognizable activity, or is consistent with the primary's call — AGREE. Do not override on uncertainty. The primary's window-title evidence stands.
 {intent_rules}
+CONF is how certain YOU are of your CATEGORY from what is visible. Score it
+honestly — an override you are unsure of is worse than none:
+  0.85-0.95  unmistakable: the activity is plainly on screen
+  0.70-0.80  likely, but partly inferred from context
+  below 0.70 uncertain — AGREE with the primary instead
+
 Output format (strict, single line):
 CATEGORY=<exact category name from list above> | OFF_SCORE=<0.0-1.0> | CONF=<0.0-1.0>{align_field} | REASON=<brief explanation citing what you saw on screen>"""
 
@@ -755,8 +761,9 @@ def _should_run_vision(
     is_productive: Optional[bool],
     conf: float,
     settings: Settings,
+    category_name: Optional[str] = None,
 ) -> bool:
-    """Vision tiebreaker fires in two directions:
+    """Vision looks at the screen in three cases:
 
       Direction A — VERIFY PRODUCTIVE:
         Primary said the user is being productive (is_productive=True).
@@ -768,6 +775,13 @@ def _should_run_vision(
         likely fell back because the title had no specific signal. Vision
         checks whether the screen reveals productive activity the title
         couldn't.
+
+      Direction C — LOOK BEHIND AMBIGUOUS:
+        Primary said Ambiguous, at any confidence. That call is the model
+        saying the title told it nothing, whatever CONF it put on it, so the
+        screen is the only evidence left. Whether the screen actually lifts
+        it is a separate question, answered by the high bar in
+        _vision_may_override — this only decides that it gets a look.
 
     Confident off-task calls (CONF > 0.70, is_productive=False) skip vision —
     the title already carried a specific signal (Twitter, Minecraft, etc.)
@@ -782,7 +796,11 @@ def _should_run_vision(
     if conf <= _DEFAULT_BY_ABSENCE_CONF_CEILING:
         return True
 
+    if _is_ambiguous(category_name):
+        return True
+
     return False
+
 
 def _screen_still_shows(window_key: str) -> bool:
     """True if the foreground window still matches the event being classified.
@@ -823,29 +841,148 @@ def _screenshot_for(events_context, settings) -> Tuple[Optional[str], str]:
     return take_screenshot_b64(), "live"
 
 
-def _align_from_screen(
+# ==================== VISION OVERRIDE GATE ====================
+#
+# Vision sees the screen, so it outranks the title — but not for free. The
+# classifier is center-biased on purpose: Ambiguous is where a decision lands
+# without evidence, and it should take strong evidence to leave. So vision's
+# CONF has to clear a bar to overturn what it reviewed, and the bar depends on
+# what that was:
+#
+#   override_min_conf (0.70)            a specific category the title supported,
+#                                       demoting it back to Ambiguous included
+#   override_ambiguous_min_conf (0.85)  leaving Ambiguous, or overruling a user
+#                                       correction that is open to the screen
+#
+# What vision decides is a verdict, never a correction: it is logged (tagged,
+# so it never becomes title precedent) and cached, and nothing about it is
+# written back as a human label, a correction rule or an intent ruling.
+
+_AMBIGUOUS = "ambiguous"
+
+
+def _is_ambiguous(name: Optional[str]) -> bool:
+    return (name or "").strip().lower() == _AMBIGUOUS
+
+
+def _correction_is_open(correction: Dict) -> bool:
+    """Is this correction one the screen may look behind?
+
+    Ambiguous on either side of it means the window's title carried no
+    evidence: the model found none (Ambiguous -> X), or the user declined to
+    give any (X -> Ambiguous). Such a label is only as good as whatever the
+    user happened to be doing under that title when they made it — bare
+    "Claude" is essays one day and robotics the next — so vision gets a say,
+    at the high bar. A correction between two specific categories is a policy
+    call the screen cannot see (music while working is Music, not
+    Entertainment, whatever YouTube looks like) and stays final.
+    """
+    return (_is_ambiguous(correction.get("ai_category"))
+            or _is_ambiguous(correction.get("corrected_category")))
+
+
+def _known_category(name: Optional[str], categories: Optional[List[Dict]]) -> bool:
+    """With a category list to check against, does `name` name one of them?"""
+    if not categories:
+        return True
+    wanted = (name or "").strip().lower()
+    return any(c["name"].lower() == wanted for c in categories)
+
+
+def _vision_may_override(
+    current_name: str,
+    v_name: str,
+    v_conf: float,
+    settings: Settings,
+    categories: Optional[List[Dict]],
+    *,
+    correction: Optional[Dict] = None,
+) -> Tuple[bool, str]:
+    """Does vision's verdict clear the bar to replace `current_name`?
+
+    Returns (override, why). A verdict naming something that is not one of
+    the user's categories never overrides, however sure it sounds — an
+    invented category would count as neither work nor drift.
+    """
+    if (v_name or "").strip().lower() == (current_name or "").strip().lower():
+        return False, "agrees"
+    if not _known_category(v_name, categories):
+        return False, f"'{v_name}' is not one of the categories"
+    if correction is not None:
+        bar, what = settings.critic.override_ambiguous_min_conf, "overrule a user correction"
+    elif _is_ambiguous(current_name):
+        bar, what = settings.critic.override_ambiguous_min_conf, "leave Ambiguous"
+    else:
+        bar, what = settings.critic.override_min_conf, f"overturn {current_name}"
+    if v_conf >= bar:
+        return True, f"conf {v_conf:.2f} clears the {bar:.2f} bar to {what}"
+    return False, f"conf {v_conf:.2f} is under the {bar:.2f} bar to {what}"
+
+
+def _cache_entry_applies(cached: Dict, pinned: bool, correction: Optional[Dict]) -> bool:
+    """Is a cached verdict still the answer under the correction now in force?
+
+    - No correction: only unpinned entries count. A pinned one came from a
+      correction that has since been deleted, and must not keep serving the
+      retracted category.
+    - A correction: the entry must agree with it — or be vision's overrule of
+      this very correction, the one disagreement allowed to stand (otherwise
+      the screen would be re-read every decision for as long as the overrule
+      lasts). A correction retargeted since fails both tests and is judged
+      afresh.
+    """
+    if correction is None:
+        return not pinned
+    want = correction["corrected_category"].strip().lower()
+    if (cached.get("final_category_name") or "").strip().lower() == want:
+        return True
+    return bool(pinned) and (cached.get("overrode_correction") or "").strip().lower() == want
+
+
+def _overridden_primary(primary: Dict, vision: Dict) -> Dict:
+    """The `primary` record to report when vision overrode the title call.
+
+    Sinks store the primary's conf and reason beside the FINAL category, so on
+    an override the reason has to explain the category actually stored — what
+    vision saw, tagged "[vision]" so the review tab reads it as a screen
+    verdict and load_prior_classifications never mistakes it for title
+    precedent. The title call's own reason stays in the text, and its conf
+    stays put: that column measures how sure the title-only call was, and the
+    review tab's low-confidence filter leans on it to surface exactly these
+    rows.
+    """
+    seen = vision.get("reason") or "overrode on screen evidence"
+    was = primary.get("category_name") or "?"
+    said = primary.get("reason") or "no reason given"
+    return dict(primary, reason=f"[vision] {seen} (overrode {was}: {said})")
+
+
+def _vision_review(
     events_context,
     settings: Settings,
     categories: Optional[List[Dict]],
-    intention: Dict,
+    intention: Optional[Dict],
     *,
     primary_category: str,
     primary_off: float,
     primary_conf: float,
     primary_reason: str,
-) -> Tuple[Optional[float], Optional[Dict]]:
-    """Score ALIGN from the screen when the title cannot be trusted for it.
+) -> Optional[Dict[str, Any]]:
+    """Vision's read of the screen behind a corrected window.
 
-    Used by the correction path, where the category is already settled by the
-    user and only alignment is in question. Returns (align, vision_record);
-    align is None whenever vision is off, unavailable, or errored — callers
-    fall back to the title-based score.
+    Returns the same record the main path builds for a vision verdict —
+    {category_name, is_productive, off, conf, reason, align} — or None when
+    vision is off, has no screenshot, or errored, in which case callers fall
+    back to the title. ALIGN is scored only under a session intention. The
+    category in the record is advisory: the caller decides whether the
+    correction is open to it (_correction_is_open) and whether it clears the
+    bar (_vision_may_override).
     """
     if not settings.critic.vision_enabled:
-        return None, None
+        return None
     b64_img, source = _screenshot_for(events_context, settings)
     if not b64_img:
-        return None, None
+        return None
 
     v_name, v_off, v_conf, v_reason, v_prod, v_raw = ask_gpt_vision_verdict(
         b64_img, events_context,
@@ -856,15 +993,15 @@ def _align_from_screen(
         categories=categories, intention=intention,
     )
     if v_name in ("[ERROR]", "[PARSE_ERROR]"):
-        print(f"[vision] align-only call failed ({v_reason}) — falling back to the title")
-        return None, None
+        print(f"[vision] correction review failed ({v_reason}) — falling back to the title")
+        return None
 
-    align = _parse_align(v_raw)
+    align = _parse_align(v_raw) if intention else None
     if align is not None:
-        print(f"[vision] align-only ({source}): {align:.2f} for \"{intention['text'][:40]}\"")
-    # The category verdict is deliberately discarded: the user already ruled.
-    return align, {"category_name": v_name, "is_productive": v_prod, "off": v_off,
-                   "conf": v_conf, "reason": v_reason or "", "align": align}
+        print(f"[vision] correction review ({source}): ALIGN {align:.2f} "
+              f"for \"{intention['text'][:40]}\"")
+    return {"category_name": v_name, "is_productive": v_prod, "off": v_off,
+            "conf": v_conf, "reason": v_reason or "", "align": align}
 
 
 # ==================== MAIN DECISION ====================
@@ -877,22 +1014,30 @@ def decide(
     prior_classifications: List[Dict] = None,
     intention: Optional[Dict] = None,
 ) -> Dict[str, Any]:
-    """Window-title primary + two-direction vision tiebreaker.
+    """Window-title primary + a vision second look that has to earn its override.
 
     Pipeline:
-      1. User correction exact-match  -> skip LLM
+      1. User correction exact-match  -> pinned, LLM-free — unless a session
+         needs ALIGN or the correction is open to the screen (step 3.5)
       2. System window shortcut       -> skip LLM
       3. Primary text-LLM (window title + history, no screenshot)
-      4. Vision tiebreaker fires if EITHER:
-           (A) primary returned a productive category, OR
-           (B) primary returned Ambiguous with CONF <= 0.70
+      4. Vision looks at the screen if ANY of:
+           (A) primary returned a productive category
+           (B) primary's CONF <= 0.70 (the default-by-absence band)
+           (C) primary returned Ambiguous, at any confidence
+         and overturns the primary only past a bar — override_min_conf for a
+         specific category, the higher override_ambiguous_min_conf to leave
+         Ambiguous or overrule a correction (_vision_may_override).
 
     `intention` is the active session intention (monitor/intentions.py). When
     set, prompts additionally request an ALIGN score against it and the result
     carries final_align (None on the LLM-skipping shortcut paths).
 
     Returns: dict with final_category_name, final_is_productive, final_off,
-    final_conf, final_reason, final_align, vision_ran, primary, vision.
+    final_conf, final_reason, final_align, vision_ran, vision_overrode,
+    primary, vision. `primary` is what the stored row's conf/reason describe:
+    the title call, or the human correction that pinned the category; on a
+    vision override its reason leads with what the screen showed, tagged.
     """
     intention_id = intention["id"] if intention else None
 
@@ -914,15 +1059,21 @@ def decide(
                   f"{'ON' if ruled else 'OFF'}-intent for \"{intention['text'][:40]}\"")
 
     # --- 1. User correction exact-match ---
-    # A correction pins the CATEGORY (human ground truth), but ALIGN is
-    # intention-relative and a category label says nothing about it. With no
-    # session active, skip the LLM entirely (as always). With one, fall
-    # through so the primary call can score ALIGN — the corrected category is
-    # pinned after the call (see step 3.5).
+    # A correction pins the CATEGORY (human ground truth). Two things send it
+    # past this shortcut to step 3.5 instead of returning here, LLM-free:
+    #   - a session: ALIGN is intention-relative and a category label says
+    #     nothing about it, so the primary call still runs to score ALIGN and
+    #     the corrected category is pinned after it;
+    #   - an OPEN correction (_correction_is_open): Ambiguous on either side
+    #     means the title carried no evidence, so the screen gets a look and
+    #     may overrule the label at the high bar.
+    # A closed correction with no session is final, and free.
     correction = None
     if corrections and events_context:
         correction = _match_correction(events_context[-1][1], corrections)
-    if correction and intention is None:
+    if correction and intention is None and not (
+        settings.critic.vision_enabled and _correction_is_open(correction)
+    ):
         cat_name, is_productive = _resolve_category(correction["corrected_category"], categories)
         print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name} (skipping LLM)")
         return {
@@ -933,6 +1084,7 @@ def decide(
             "final_reason": f"User correction: was {correction['ai_category']}, corrected to {cat_name}",
             "final_align": None,
             "vision_ran": False,
+            "vision_overrode": False,
             "primary": {"category_name": cat_name, "is_productive": is_productive,
                         "off": 0.0, "conf": 1.0, "reason": "user correction"},
             "vision": None,
@@ -948,6 +1100,7 @@ def decide(
             "final_reason": "System/utility window - not a user activity",
             "final_align": None,
             "vision_ran": False,
+            "vision_overrode": False,
             "primary": {"category_name": "System", "is_productive": None,
                         "off": 0.5, "conf": 1.0, "reason": "system window shortcut"},
             "vision": None,
@@ -959,15 +1112,13 @@ def decide(
     # the no-intention path where corrections are checked before the cache.
     # The same goes in reverse: a correction-pinned entry whose correction
     # was DELETED must not keep serving the retracted category, so with no
-    # correction in force only unpinned entries count.
+    # correction in force only unpinned entries count. The one disagreement
+    # allowed to stand is vision's overrule of the very correction in force
+    # (_cache_entry_applies).
     if events_context:
         hit = _cache_get(events_context[-1][1], intention_id)
         cached, pinned = hit if hit is not None else (None, False)
-        if cached is not None and (
-            (correction is None and not pinned)
-            or (correction is not None
-                and cached.get("final_category_name", "").lower() == correction["corrected_category"].lower())
-        ):
+        if cached is not None and _cache_entry_applies(cached, pinned, correction):
             print(f"[cache] hit: {events_context[-1][1][:50]} -> {cached['final_category_name']}")
             result = dict(cached)
             result["final_reason"] = f"[cache] {cached.get('final_reason', '')}"
@@ -976,36 +1127,48 @@ def decide(
                 result["final_align"] = forced_align
             return result
 
-    # --- 3. Primary text-LLM call ---
-    p1_prompt = build_prompt(
-        events_context,
-        categories=categories,
-        corrections=corrections,
-        prior_classifications=prior_classifications,
-        intention=intention,
-    )
-    p1_name, p1_off, p1_conf, p1_reason, p1_prod, p1_raw = ask_gpt(
-        p1_prompt,
-        settings.model,
-        max_tokens=150,
-        temperature=0.0,
-        categories=categories,
-    )
-    p1_align = _parse_align(p1_raw) if intention else None
-    primary_res = {
-        "category_name": p1_name,
-        "is_productive": p1_prod,
-        "off": p1_off,
-        "conf": p1_conf,
-        "reason": p1_reason or "",
-        "align": p1_align,
-    }
-
     current_window = events_context[-1][1] if events_context else ""
 
-    def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran, vision_res=None, align=None):
+    # --- 3. Primary text-LLM call ---
+    # Skipped for a correction with no session: the category is pinned and
+    # there is no ALIGN to score, so the title has nothing left to say — only
+    # the screen does (step 3.5).
+    primary_res: Optional[Dict[str, Any]] = None
+    p1_align: Optional[float] = None
+    if not (correction and intention is None):
+        p1_prompt = build_prompt(
+            events_context,
+            categories=categories,
+            corrections=corrections,
+            prior_classifications=prior_classifications,
+            intention=intention,
+        )
+        p1_name, p1_off, p1_conf, p1_reason, p1_prod, p1_raw = ask_gpt(
+            p1_prompt,
+            settings.model,
+            max_tokens=150,
+            temperature=0.0,
+            categories=categories,
+        )
+        p1_align = _parse_align(p1_raw) if intention else None
+        primary_res = {
+            "category_name": p1_name,
+            "is_productive": p1_prod,
+            "off": p1_off,
+            "conf": p1_conf,
+            "reason": p1_reason or "",
+            "align": p1_align,
+        }
+
+    def mk_ret(cat_name, is_productive, off, conf, reason, vision_ran,
+               vision_res=None, align=None, overrode: bool = False):
+        """Assemble and cache a main-path verdict. `overrode`: vision replaced
+        the primary's category, so the stored row has to explain itself."""
         if forced_align is not None:
             align = forced_align
+        primary = primary_res
+        if overrode and vision_res is not None:
+            primary = _overridden_primary(primary_res, vision_res)
         result = {
             "final_category_name": cat_name,
             "final_is_productive": is_productive,
@@ -1014,62 +1177,108 @@ def decide(
             "final_reason": reason,
             "final_align": align,
             "vision_ran": vision_ran,
-            "primary": primary_res,
+            "vision_overrode": overrode,
+            "primary": primary,
             "vision": vision_res,
         }
         if current_window:
             _cache_put(current_window, result, intention_id)
         return result
 
-    # --- 3.5. Correction with an active session: pin category, score ALIGN ---
-    # The LLM ran only to score alignment against the intention; its category
-    # choice is discarded in favor of the user's correction. Vision still runs,
-    # for ALIGN alone: a corrected window is one whose title already misled the
-    # classifier once, so scoring alignment from that same title is the weakest
-    # possible evidence. "supplements prep - Google Docs" under the intention
-    # "outlining piq #2" scored 0.5 — drift — while the screen showed the very
-    # essay prompt named in the intention.
+    # --- 3.5. Correction: pin the category, score ALIGN, let the screen look behind an open one ---
     if correction:
         cat_name, is_productive = _resolve_category(correction["corrected_category"], categories)
-        v_align = None
+        pinned_off = 0.0 if is_productive else 1.0
+        is_open = _correction_is_open(correction)
+        want_align = intention is not None and forced_align is None
+
+        # Vision runs for ALIGN on any correction under a session: a
+        # corrected window is one whose title already misled the classifier
+        # once, so scoring alignment from that same title is the weakest
+        # possible evidence — "supplements prep - Google Docs" under
+        # "outlining piq #2" scored 0.5, drift, while the screen showed the
+        # very essay prompt named in the intention. On an open correction it
+        # also gets to judge the category.
         vision_res = None
-        if intention is not None and forced_align is None:
-            v_align, vision_res = _align_from_screen(
+        if settings.critic.vision_enabled and (want_align or is_open):
+            vision_res = _vision_review(
                 events_context, settings, categories, intention,
-                primary_category=cat_name, primary_off=0.0 if is_productive else 1.0,
-                primary_conf=1.0, primary_reason="user correction",
+                primary_category=cat_name, primary_off=pinned_off, primary_conf=1.0,
+                primary_reason=(f"user correction — the user labelled this exact window "
+                                f"title {cat_name}; the title-only call had been "
+                                f"{correction['ai_category']}"),
             )
+        v_align = vision_res["align"] if vision_res is not None else None
         align = v_align if v_align is not None else p1_align
         if forced_align is not None:
             align = forced_align
+        align_src = ("ALIGN from screen" if v_align is not None
+                     else "ALIGN from title" if align is not None else "no ALIGN")
 
-        source = ("ALIGN from screen" if v_align is not None
-                  else "ALIGN from title" if align is not None else "no ALIGN")
-        print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name}"
-              f" (category pinned, {source})")
-        reason = (f"User correction: was {correction['ai_category']}, "
-                  f"corrected to {cat_name} ({source})")
-        result = {
-            "final_category_name": cat_name,
-            "final_is_productive": is_productive,
-            "final_off": 0.0 if is_productive else 1.0,
-            "final_conf": 1.0,
-            "final_reason": reason,
-            "final_align": align,
-            "vision_ran": v_align is not None,
+        overrode = False
+        why = ""
+        if is_open and vision_res is not None:
+            overrode, why = _vision_may_override(
+                cat_name, vision_res["category_name"], vision_res["conf"],
+                settings, categories, correction=correction,
+            )
+            if not overrode and why != "agrees":
+                print(f"[vision] correction stands: {cat_name} — saw "
+                      f"{vision_res['category_name']}, {why}")
+
+        if not overrode:
+            print(f"[correction] Exact match: '{correction['window_title'][:40]}' -> {cat_name}"
+                  f" (category pinned, {align_src})")
+            reason = (f"User correction: was {correction['ai_category']}, "
+                      f"corrected to {cat_name} ({align_src})")
             # Report the human correction as the primary, not the LLM call we
             # made only to score ALIGN — sinks log primary conf/reason, and the
             # rejected category's reasoning would misexplain the pinned one.
-            "primary": {"category_name": cat_name, "is_productive": is_productive,
-                        "off": 0.0, "conf": 1.0, "reason": "user correction",
-                        "align": align},
+            primary = {"category_name": cat_name, "is_productive": is_productive,
+                       "off": 0.0, "conf": 1.0, "reason": "user correction",
+                       "align": align}
+            final_name, final_prod, final_off, final_conf = cat_name, is_productive, pinned_off, 1.0
+        else:
+            v_name = vision_res["category_name"]
+            print(f"[vision] OVERRIDE correction: {cat_name} -> {v_name} ({why})")
+            reason = (f"[Vision] {vision_res['reason']} — overrode the user correction "
+                      f"({correction['ai_category']} -> {cat_name})")
+            # The stored row now rests on the screen: vision's category, its
+            # confidence (the human's 1.0 was never vision's certainty) and its
+            # reason, tagged so the review tab shows a screen verdict and
+            # precedent never mistakes it for a title call. None of this is
+            # written back as a correction — the user's rule stays exactly as
+            # it was, and the moment it changes it outranks the cache again.
+            primary = {"category_name": v_name, "is_productive": vision_res["is_productive"],
+                       "off": vision_res["off"], "conf": vision_res["conf"],
+                       "reason": (f"[vision] {vision_res['reason']} (overrode user correction: "
+                                  f"was {correction['ai_category']}, corrected to {cat_name})"),
+                       "align": align}
+            final_name, final_prod = v_name, vision_res["is_productive"]
+            final_off, final_conf = vision_res["off"], vision_res["conf"]
+
+        result = {
+            "final_category_name": final_name,
+            "final_is_productive": final_prod,
+            "final_off": final_off,
+            "final_conf": final_conf,
+            "final_reason": reason,
+            "final_align": align,
+            "vision_ran": vision_res is not None,
+            "vision_overrode": overrode,
+            # The corrected category vision overruled, if it did: the session
+            # cache serves this entry only while that exact correction stands.
+            "overrode_correction": cat_name if overrode else None,
+            "primary": primary,
             "vision": vision_res,
-            # Keep what the LLM would have said, for accuracy analysis.
+            # Keep what the title call would have said, for accuracy analysis.
             "align_primary": primary_res,
         }
         # The normal cache gate skips categories like Ambiguous; pin corrected
-        # decisions regardless so the align call isn't repeated for 10 minutes.
-        if current_window:
+        # decisions regardless so neither call is repeated for 10 minutes. A
+        # decision that made no call at all (open correction, no session, no
+        # screenshot to be had) is not pinned, so the screen gets another try.
+        if current_window and (primary_res is not None or vision_res is not None):
             _cache_put(current_window, result, intention_id, force=True)
         return result
 
@@ -1077,11 +1286,16 @@ def decide(
     if p1_name in ("[ERROR]", "[PARSE_ERROR]"):
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, primary_res["reason"], False)
 
-    # --- 4. Vision tiebreaker? ---
-    if not _should_run_vision(p1_prod, p1_conf, settings):
+    # --- 4. Vision second look? ---
+    if not _should_run_vision(p1_prod, p1_conf, settings, p1_name):
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, False, align=p1_align)
 
-    direction = "verify-productive" if p1_prod is True else "second-guess-default"
+    if p1_prod is True:
+        direction = "verify-productive"
+    elif p1_conf <= _DEFAULT_BY_ABSENCE_CONF_CEILING:
+        direction = "second-guess-default"
+    else:
+        direction = "look-behind-ambiguous"
 
     # In trace mode, the live screen grab has nothing to do with the historical
     # event being evaluated. Skip the vision call but log that it would have fired
@@ -1133,10 +1347,22 @@ def decide(
         print(f"[vision] Error ({v_reason}) — primary stands.")
         return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res, align=p1_align)
 
-    # Vision verdict wins
-    overrode = (v_name.lower() != p1_name.lower())
-    tag = "OVERRIDE" if overrode else "AGREE"
-    print(f"[vision] {tag}: {p1_name} -> {v_name} (conf {p1_conf:.2f} -> {v_conf:.2f})")
-    # Vision saw the screen; its ALIGN wins when present, else the primary's stands.
+    # Vision saw the screen; its ALIGN wins when present, else the primary's
+    # stands. Alignment is judged from the screen on its own terms, so it
+    # holds whether or not the category verdict below clears its bar.
     final_align = v_align if v_align is not None else p1_align
-    return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True, vision_res, align=final_align)
+
+    if v_name.lower() == p1_name.lower():
+        print(f"[vision] AGREE: {p1_name} (conf {p1_conf:.2f} -> {v_conf:.2f})")
+        return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True,
+                      vision_res, align=final_align)
+
+    override, why = _vision_may_override(p1_name, v_name, v_conf, settings, categories)
+    if not override:
+        print(f"[vision] {p1_name} stands — saw {v_name}, {why}")
+        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True,
+                      vision_res, align=final_align)
+
+    print(f"[vision] OVERRIDE: {p1_name} -> {v_name} ({why})")
+    return mk_ret(v_name, v_prod, v_off, v_conf, f"[Vision] {v_reason}", True,
+                  vision_res, align=final_align, overrode=True)

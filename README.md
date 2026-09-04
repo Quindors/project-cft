@@ -12,7 +12,7 @@ A desktop productivity tracker that uses LLM-based classification to categorize 
 3. Results are written to Google Sheets with a daily worksheet
 4. A popup alert fires when you drift into non-productive categories
 
-The system uses a two-pass verification approach: a primary model classifies the activity, and a critic model double-checks ambiguous or low-confidence results. If they disagree, an optional vision tiebreaker (screenshot analysis) resolves the conflict.
+The system uses a two-pass approach: a primary model classifies the activity from the window title alone, and a vision model then looks at a screenshot whenever the title left room for doubt — a productive call to verify, a low-confidence call, or an Ambiguous one. Vision only overturns the title call when its own confidence clears a bar, and the bar is higher for leaving Ambiguous than for overturning a specific category (see [Vision second look](#vision-second-look)).
 
 ## Quick Start
 
@@ -145,7 +145,7 @@ project cft/
 │   ├── __main__.py        # Entry point: python -m monitor
 │   ├── app.py             # Initialization (env, creds, sources, sink)
 │   ├── runner.py           # Main monitoring loop
-│   ├── decider.py          # LLM calls, parsing, critic/vision logic
+│   ├── decider.py          # LLM calls, parsing, the vision second look
 │   ├── config.py           # All settings and defaults
 │   ├── creds.py            # Environment and credential loading
 │   ├── sheets_sink.py      # Google Sheets read/write
@@ -180,9 +180,48 @@ Key settings:
 | `context_window_size` | `10` | Number of recent events sent to LLM |
 | `min_events` | `1` | Minimum events before first decision |
 | `off_threshold` | `0.60` | OFF_SCORE threshold |
-| `critic.enabled` | `True` | Run critic on ambiguous classifications |
-| `critic.vision_enabled` | `True` | Use screenshot tiebreaker on disagreements |
+| `critic.vision_enabled` | `True` | Let a vision model check the screen behind productive, low-confidence and Ambiguous calls |
+| `critic.override_min_conf` | `0.70` | Vision confidence needed to overturn a specific category (`CFT_VISION_OVERRIDE_CONF`) |
+| `critic.override_ambiguous_min_conf` | `0.85` | Vision confidence needed to leave Ambiguous or overrule an open correction (`CFT_VISION_OVERRIDE_AMBIGUOUS_CONF`) |
 | `popup.enabled` | `True` | Show popup alerts for non-productive categories |
+
+## Vision second look
+
+The title-only classifier is deliberately center-biased: with no evidence it
+lands on Ambiguous, and it should take real evidence to leave. So when the
+vision model looks at the screen — after every productive call, every
+low-confidence call and every Ambiguous one — its verdict has to clear a bar
+before it replaces the title call, and the bar depends on what it is
+replacing:
+
+| Vision wants to… | Needs `CONF` ≥ | `.env` knob |
+|---|---|---|
+| overturn a specific category (demoting it to Ambiguous included) | `0.70` | `CFT_VISION_OVERRIDE_CONF` |
+| leave Ambiguous for a specific category | `0.85` | `CFT_VISION_OVERRIDE_AMBIGUOUS_CONF` |
+| overrule a user correction that is open to the screen | `0.85` | `CFT_VISION_OVERRIDE_AMBIGUOUS_CONF` |
+
+A verdict under the bar leaves the title call standing (its ALIGN score is
+still used, since alignment is judged from the screen on its own terms), and
+a verdict naming something that is not one of your categories never
+overrides.
+
+**Which corrections are open to the screen.** A correction with Ambiguous on
+either side of it — the model called the title Ambiguous and you named the
+category, or you set it to Ambiguous yourself — is a ruling about a title
+that carried no evidence, so it is only as good as what you happened to be
+doing under that title at the time (bare "Claude" is essays one day and
+robotics the next). Vision may overrule those, at the high bar. A correction
+between two specific categories (Entertainment → Music for background
+listening, say) is a policy call the screen cannot see: it stays final and
+never even costs a screenshot.
+
+**Vision never records anything.** An override is a verdict, not a
+correction: the row is logged with a reason starting `[vision]` so the review
+tab shows what the screen showed, nothing is written to `human_label`, your
+correction rules and intent rulings stay exactly as they were, and a screen
+verdict never becomes precedent for what that title means next time. Correct
+the row in the review tab if vision got it wrong — that is a real correction,
+and it applies at the next decision.
 
 ## Idle detection
 

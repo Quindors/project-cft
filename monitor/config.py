@@ -71,6 +71,16 @@ class CriticSettings:
     vision_enabled: bool = True
     vision_model: str = "gpt-4o"
     vision_max_tokens: int = 120
+    # How sure vision must be (its CONF) to overturn the call it reviewed.
+    # Two bars, because the classifier is center-biased: Ambiguous is where a
+    # decision lands without evidence, so LEAVING it — promoting the model's
+    # default, or overruling a user correction that has Ambiguous on either
+    # side of it — takes strong screen evidence, while overturning a specific
+    # category the title supported (demoting it back to Ambiguous included)
+    # takes less. Override with CFT_VISION_OVERRIDE_CONF and
+    # CFT_VISION_OVERRIDE_AMBIGUOUS_CONF in the .env.
+    override_min_conf: float = 0.70
+    override_ambiguous_min_conf: float = 0.85
 
 
 @dataclass(frozen=True)
@@ -157,9 +167,36 @@ def load_settings() -> Settings:
             print(f"[config] CFT_IDLE_SEC={raw_idle!r} is not a number; "
                   f"keeping {idle.threshold_sec:g}s")
 
+    critic = replace(DEFAULT_SETTINGS.critic, vision_model=model)
+    for env, name in (("CFT_VISION_OVERRIDE_CONF", "override_min_conf"),
+                      ("CFT_VISION_OVERRIDE_AMBIGUOUS_CONF", "override_ambiguous_min_conf")):
+        value = _conf_from_env(env, getattr(critic, name))
+        critic = replace(critic, **{name: value})
+    if critic.override_ambiguous_min_conf < critic.override_min_conf:
+        print("[config] CFT_VISION_OVERRIDE_AMBIGUOUS_CONF is below "
+              "CFT_VISION_OVERRIDE_CONF: leaving Ambiguous is now easier than "
+              "overturning a specific category, which undoes the center bias")
+
     return replace(
         DEFAULT_SETTINGS,
         model=model,
-        critic=replace(DEFAULT_SETTINGS.critic, vision_model=model),
+        critic=critic,
         idle=idle,
     )
+
+
+def _conf_from_env(env: str, default: float) -> float:
+    """A 0..1 confidence bar from the environment, or `default` when unset or
+    unusable (a bad value is reported, never silently applied)."""
+    raw = os.getenv(env, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not 0.0 <= value <= 1.0:
+        print(f"[config] {env}={raw!r} is not a number between 0 and 1; "
+              f"keeping {default:g}")
+        return default
+    return value

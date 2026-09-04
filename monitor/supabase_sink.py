@@ -224,14 +224,18 @@ class SupabaseSink:
         return result_list
 
     def load_prior_classifications(self, days_back: int = 7, min_confidence: float = 0.85) -> List[Dict]:
-        """Load recent high-confidence classifications for cache priming."""
+        """Load recent high-confidence classifications for cache priming.
+
+        Rows the decider tagged "[vision]" are skipped, as in the local sink:
+        a screen verdict is not evidence about what the title means.
+        """
         cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
         skip_categories = {"ambiguous", "[error]", "[parse_error]"}
 
         try:
             result = (
                 self.sb.table("focus_logs")
-                .select("current_window, category_name, confidence")
+                .select("current_window, category_name, confidence, reason")
                 .is_("human_label", "null")
                 .gte("confidence", min_confidence)
                 .gte("timestamp", cutoff)
@@ -253,6 +257,8 @@ class SupabaseSink:
             if not window or not category:
                 continue
             if category.lower() in skip_categories:
+                continue
+            if (row.get("reason") or "").lower().startswith("[vision]"):
                 continue
 
             normalized = _normalize_title(window)
