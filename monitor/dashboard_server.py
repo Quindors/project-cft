@@ -22,10 +22,15 @@ Endpoints:
     POST /api/break/end         -> ends the break early, resuming the monitor
     GET  /api/categories        -> [{name, description, is_productive}, ...]
     GET  /api/focus?since=<ts>  -> [{timestamp, category_name, ai_category,
-                                    confidence}, ...] — category_name is the
-                                   effective label (human correction wins over
-                                   the classifier, as Beeminder counts it);
-                                   ai_category is the classifier's original
+                                    confidence, intention_id, align_score}, ...]
+                                   — category_name is the effective label
+                                   (human correction wins over the classifier,
+                                   as Beeminder counts it); ai_category is the
+                                   classifier's original; intention_id and
+                                   align_score (null outside a focus session)
+                                   let the page apply Beeminder's other rule —
+                                   a neutral category is productive only while
+                                   declared (beeminder.NEVER_DECLARED)
     GET  /api/events?limit=<n>  -> recent rows with id/current_window/human_label,
                                    plus intention_id/align_score (0-1 intent
                                    alignment, null outside a focus session),
@@ -406,9 +411,15 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 # by, so the pie, the split, the weekly trend and the
                 # datapoint all count the same thing. ai_category keeps the
                 # classifier's original call for anyone who wants it.
+                # intention_id/align_score ride along for Beeminder's other
+                # rule — a neutral category is productive only while it is
+                # the declared work of a session — which the page applies
+                # itself (focus-dashboard's useFocusData), so the pie can
+                # show that time as a slice of its own.
                 cols = ("SELECT timestamp, "
                         "COALESCE(NULLIF(TRIM(human_label), ''), category_name) AS category_name, "
-                        "category_name AS ai_category, confidence FROM focus_logs ")
+                        "category_name AS ai_category, confidence, "
+                        "intention_id, align_score FROM focus_logs ")
                 since = (qs.get("since", [""])[0] or "").strip()
                 if since:
                     rows = conn.execute(

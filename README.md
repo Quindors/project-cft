@@ -61,7 +61,7 @@ Categories live in the **"Categories" sheet** in your Google Spreadsheet. To man
 |--------|----------|-------------|
 | `name` | Yes | Display name shown in logs and popups, e.g. "Deep Work" |
 | `description` | Yes | Tells the LLM what belongs in this category. Be specific — include app names, site names, and examples. |
-| `is_productive` | Yes | `TRUE`, `FALSE`, or leave blank for ambiguous categories. Determines if the category counts as focused work. |
+| `is_productive` | Yes | `TRUE`, `FALSE`, or leave blank for neutral categories. Determines if the category counts as focused work. A neutral category counts as neither — except as the declared work of a focus session, when it counts as productive (see [How the numbers are worked out](#how-the-numbers-are-worked-out)). |
 
 **Adding a new category:**
 
@@ -331,6 +331,16 @@ general: a productive-category row logged off-intent (ALIGN below
 off-task. Partially-aligned work still counts, and work done with no session
 active is judged by its category alone. Set `BEEMINDER_STRICT_INTENT=0` if you
 want any productive-category work to count regardless of the active session.
+
+The same line works the other way for a neutral category (blank
+`is_productive` — Composition, say): it is *productive only while declared*.
+Its rows count as productive when they were logged under a focus session and
+scored at or above the off-intent line, and as neither otherwise, whatever you
+were doing. Ambiguous and System never qualify — they mean the monitor could
+not tell what the time was for, and a session does not change that. The
+dashboard counts the same way, and its category pie gives that time a slice of
+its own ("Composition (in session)") so you can see both that it counted and
+why. There is no switch for this: it is what a neutral category means.
 
 The sessions goal has its own floor: a finished session only posts a point if
 at least ten minutes of activity were actually logged under it. How a session

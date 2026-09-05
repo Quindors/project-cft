@@ -50,8 +50,20 @@ from urllib.request import Request, urlopen
 from monitor.config import DEFAULT_SETTINGS
 from monitor.paths import data_dir
 
-# ALIGN below this is off-intent — the same line the drift alerts draw.
+# ALIGN below this is off-intent — the same line the drift alerts draw. It
+# cuts both ways here: a productive-category row under it is drift (see
+# strict_intent), and a neutral-category row at or above it is declared work
+# (see NEVER_DECLARED).
 OFF_INTENT_MAX = DEFAULT_SETTINGS.intention.off_intent_max
+
+# Neutral categories (is_productive NULL) are productive only while declared:
+# a row counts when it was logged under a focus session and scored at least
+# partially on-intent. Composition earns nothing on its own; an hour of it
+# inside a session you declared for it earns the hour. These two never
+# qualify — they are the classifier's shrug and the OS, and say nothing about
+# what the time was for. Mirrored by focus-dashboard's useFocusData, which
+# draws the pie from the same rule; keep the two in step.
+NEVER_DECLARED = ("ambiguous", "system")
 
 API_ROOT = "https://www.beeminder.com/api/v1"
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
@@ -86,7 +98,8 @@ class Config:
 class DayTotals:
     """A day's logged time, in hours, split by the category's productive flag.
 
-    Ambiguous activity (a category with is_productive NULL) counts as neither,
+    Neutral activity (a category with is_productive NULL) counts as neither —
+    unless it was the declared work of a focus session, which is productive —
     so the two figures deliberately do not add up to the wall-clock day.
     """
     productive_hours: float
@@ -154,16 +167,26 @@ _LABEL = "COALESCE(NULLIF(TRIM(f.human_label), ''), f.category_name)"
 # off_intent: logged during a focus session with an ALIGN score below the
 # drift line — the same tier the runner's drift alerts fire on. Rows without
 # an ALIGN score (no session, cache shortcuts) are never off-intent.
+# declared: the mirror image, for neutral categories — logged during a focus
+# session with an ALIGN score at or above that line, under a label that is a
+# real category and not one of NEVER_DECLARED. Such rows never score as
+# off-intent either way, so the two flags cannot both be set.
+_NEVER_DECLARED_SQL = ", ".join(f"'{name}'" for name in NEVER_DECLARED)
 _DAY_QUERY = f"""
     SELECT {_LABEL} AS label, c.is_productive AS productive,
            (f.intention_id IS NOT NULL
             AND f.align_score IS NOT NULL
             AND f.align_score < ?) AS off_intent,
+           (c.name IS NOT NULL AND c.is_productive IS NULL
+            AND f.intention_id IS NOT NULL
+            AND f.align_score IS NOT NULL
+            AND f.align_score >= ?
+            AND LOWER({_LABEL}) NOT IN ({_NEVER_DECLARED_SQL})) AS declared,
            COUNT(*) AS n
       FROM focus_logs f
       LEFT JOIN categories c ON c.name = {_LABEL}
      WHERE f.timestamp >= ? AND f.timestamp < ?
-  GROUP BY label, productive, off_intent
+  GROUP BY label, productive, off_intent, declared
   ORDER BY n DESC
 """
 
@@ -181,13 +204,17 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
     By default a productive-category row logged off-intent during a focus
     session goes to the off-task column: it was real work, but not the work
     you declared. strict_intent=False counts it as productive anyway.
+
+    A neutral-category row goes to the productive column only while it is
+    the declared work (see NEVER_DECLARED) and counts as neither otherwise.
+    That has no opt-out: it is what a neutral category means.
     """
     start = f"{day:%Y-%m-%d} 00:00:00"
     end = f"{day + timedelta(days=1):%Y-%m-%d} 00:00:00"
     try:
         with _connect() as conn:
             rows: List[sqlite3.Row] = conn.execute(
-                _DAY_QUERY, (OFF_INTENT_MAX, start, end)
+                _DAY_QUERY, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
             ).fetchall()
     except sqlite3.Error as e:
         # A fresh install has no focus_logs table yet.
@@ -201,12 +228,14 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
         if row["productive"] == 1 and strict_intent and row["off_intent"]:
             offtask_sec += seconds
             drifted_sec += seconds
-        elif row["productive"] == 1:
+        elif row["productive"] == 1 or row["declared"]:
             productive_sec += seconds
             # 0.1h is the smallest slice the breakdown can render; anything
-            # below it would read as a pointless "Foo 0.0h".
+            # below it would read as a pointless "Foo 0.0h". Declared neutral
+            # work is tagged, so the datapoint says why Composition counted.
             if len(parts) < 3 and seconds >= 360:
-                parts.append(f"{row['label']} {seconds / 3600:.1f}h")
+                tag = " in session" if row["declared"] else ""
+                parts.append(f"{row['label']} {seconds / 3600:.1f}h{tag}")
         elif row["productive"] == 0:
             offtask_sec += seconds
 
