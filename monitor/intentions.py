@@ -134,6 +134,29 @@ def backfill_categories(limit: int = 50) -> int:
     return filled
 
 
+def set_category(intention_id: int, category: Optional[str]) -> Optional[Dict]:
+    """Relabel a FINISHED session (completed/expired); None clears the label.
+
+    Returns the row, or None when no finished session has that id — an
+    active session's category is set at the start, not edited from the
+    forest. Mirrored like every other transition.
+    """
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE intentions SET llm_category = ? "
+            "WHERE id = ? AND status IN ('completed', 'expired')",
+            (category, intention_id),
+        ).rowcount == 1
+        row = conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (intention_id,)
+        ).fetchone() if changed else None
+    if row is None:
+        return None
+    row = dict(row)
+    _mirror(row)
+    return row
+
+
 def _now_str() -> str:
     return datetime.now().strftime(_TS_FMT)
 

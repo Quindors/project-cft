@@ -100,11 +100,21 @@ Endpoints:
                                    never be reassigned into a productive one —
                                    that would retroactively count them as
                                    focused time
-    POST /api/intention         -> {text, duration_min} starts a session intention;
-                                   422 {rejected, category, reason} when the
-                                   intention gate maps the declared work itself
-                                   to an unproductive category
-                                   (supersedes any active one)
+    POST /api/intention         -> {text, duration_min, category?, confirm?}
+                                   starts a session intention (supersedes any
+                                   active one). category is the user's pick:
+                                   validated against the real categories (400
+                                   unknown, 422 rejected if it is marked
+                                   unproductive) and only CHECKED by the gate —
+                                   when the gate disagrees it answers 409
+                                   {needs_confirm, picked, suggested, reason}
+                                   once; confirm=true keeps the pick anyway.
+                                   Without a pick the gate decides, and 422
+                                   {rejected, category, reason} refuses work
+                                   that maps to an unproductive category
+    POST /api/sessions/category -> {id, category|null} relabels a FINISHED
+                                   session (validated like a correction; null
+                                   clears); 404 if no such finished session
     POST /api/intention/end     -> {status?: completed|abandoned} ends the active one;
                                    completing one rolls into the post-session break
     POST /api/intention/pause   -> pauses the active session for 1 minute: the
@@ -513,6 +523,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/category": self._post_category_add,
             "/api/category/update": self._post_category_update,
             "/api/category/delete": self._post_category_delete,
+            "/api/sessions/category": self._post_session_category,
         }
         handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
@@ -557,28 +568,94 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=400)
             return
 
+        # The category is the user's call. A picked one is validated against
+        # the real categories and refused only when it is marked unproductive;
+        # the gate then merely CHECKS it, and says so once (409) when it
+        # disagrees — unless the caller already confirmed. Nothing here needs
+        # the LLM, so a dead key can't leave a session uncategorized.
+        picked = (body.get("category") or "").strip() or None
+        confirmed = bool(body.get("confirm"))
+        chosen = None
+        if picked:
+            row = None
+            conn = _db_ro()
+            if conn is not None:
+                try:
+                    row = conn.execute(
+                        "SELECT name, is_productive FROM categories "
+                        "WHERE lower(name) = lower(?)", (picked,)
+                    ).fetchone()
+                finally:
+                    conn.close()
+            if row is None:
+                self._send_json({"error": f"unknown category {picked!r}"}, status=400)
+                return
+            if row["is_productive"] == 0:
+                self._send_json({
+                    "error": (f"Not started: {row['name']} is an unproductive "
+                              f"category. Pick the work you mean to do."),
+                    "rejected": True,
+                    "category": row["name"],
+                    "reason": "picked category is marked unproductive",
+                }, status=422)
+                return
+            chosen = row["name"]
+
         # The intention itself must be work: "scroll twitter for an hour"
         # would make every drift check score scrolling as on-intent.
         gate = intent_gate.check(text)
-        if not gate["allowed"]:
-            why = gate.get("reason") or "it describes off-task activity"
+        if chosen is None:
+            if not gate["allowed"]:
+                why = gate.get("reason") or "it describes off-task activity"
+                self._send_json({
+                    "error": (f"Not started: “{text}” reads as "
+                              f"{gate['category']} — {why} "
+                              f"Rephrase it if it's real work."),
+                    "rejected": True,
+                    "category": gate.get("category"),
+                    "reason": gate.get("reason"),
+                }, status=422)
+                return
+            chosen = gate.get("category")
+        elif (not confirmed and gate.get("category")
+              and gate["category"].lower() != chosen.lower()):
             self._send_json({
-                "error": (f"Not started: “{text}” reads as "
-                          f"{gate['category']} — {why} "
-                          f"Rephrase it if it's real work."),
-                "rejected": True,
-                "category": gate.get("category"),
+                "error": f"The gate reads “{text}” as {gate['category']}, not {chosen}.",
+                "needs_confirm": True,
+                "picked": chosen,
+                "suggested": gate["category"],
                 "reason": gate.get("reason"),
-            }, status=422)
+            }, status=409)
             return
 
         try:
-            active = intentions.start(text, duration_min,
-                                      llm_category=gate.get("category"))
+            active = intentions.start(text, duration_min, llm_category=chosen)
         except (ValueError, TypeError) as e:
             self._send_json({"error": str(e)}, status=400)
             return
         self._send_json({"ok": True, "active": active})
+
+    def _post_session_category(self, conn, body) -> None:
+        """Relabel a finished session — the honest fix for the sessions the
+        gate never saw (or got wrong), instead of guessing from what the
+        monitor happened to log."""
+        try:
+            sid = int(body.get("id"))
+        except (TypeError, ValueError):
+            self._send_json({"error": "expected JSON body {id, category}"}, status=400)
+            return
+        label = (body.get("category") or "").strip() or None
+        known = None
+        if label is not None:
+            known = self._resolve_label(conn, label)
+            if known is None:
+                self._send_json({"error": f"unknown category {label!r}"}, status=400)
+                return
+        row = intentions.set_category(sid, known)
+        if row is None:
+            self._send_json({"error": "no finished session with that id"}, status=404)
+            return
+        self._send_json({"ok": True, "session": row})
 
     def _post_intent_correct(self, body) -> None:
         """Rule a window on/off-intent for the active session's intention.
