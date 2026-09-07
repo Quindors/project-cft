@@ -243,6 +243,9 @@ class _TimerWidget:
         self._drag: Optional[Dict] = None
         self._last_error = (None, 0.0)
         self._anim: Optional[Dict] = None
+        # The stand-in window that covers resizes (see _resize_seamless).
+        self._veil = None
+        self._veil_canvas = None
         self._hover_chevron = False
         self._pointer_in = False
         self._menu_open = False
@@ -572,17 +575,19 @@ class _TimerWidget:
             "shape_from": self._shape_rect(self.collapsed, self.side, *start),
             "shape_to": self._shape_rect(target, self.side, *end),
         }
-        # Grow to the union invisibly, with the first frame already painted
-        # when the window reappears — see _resize_cloaked for why.
+        # Grow to the union behind a stand-in showing exactly the current
+        # form — see _resize_seamless for why neither a bare resize nor an
+        # alpha blink is acceptable here.
         ux, uy = union[0], union[1]
         sf = self._anim["shape_from"]
         # The first frame shows the form we are leaving: opening (currently a
         # tab) starts fully tab-like, closing starts fully card-like.
         first = 1.0 if self.collapsed else 0.0
-        self._resize_cloaked(
+        self._resize_seamless(
             union,
-            lambda: self._render_morph(sf[0] - ux, sf[1] - uy,
-                                       sf[2] - ux, sf[3] - uy, first))
+            draw_current=self._render,
+            draw_new=lambda: self._render_morph(sf[0] - ux, sf[1] - uy,
+                                                sf[2] - ux, sf[3] - uy, first))
         self._animate()
 
     def _animate(self) -> None:
@@ -611,38 +616,139 @@ class _TimerWidget:
             return
         self.win.after(ANIM_FRAME_MS, self._animate)
 
-    def _resize_cloaked(self, rect, draw) -> None:
-        """Resize the window while it is invisible, then show it painted.
+    # ---------- seamless resizes ----------
+    #
+    # Two facts conspire against resizing this window in view. A layered
+    # (-transparentcolor) window's newly allocated memory is uninitialized
+    # and composites as opaque BLACK until something paints it — the black
+    # box once seen when the card opened. And the first cure, blanking the
+    # window (alpha 0) around the resize, just traded the box for a blink:
+    # the widget vanished for a frame at the start and end of every slide,
+    # because the blanking happened to the window the user was looking at.
+    #
+    # So: all invisible-surface work now happens behind a stand-in. A second
+    # window (the veil) is painted with the SAME pixels off-screen, faded in
+    # over the widget — two identical images stacked, nothing to see — and
+    # only then does the real window hide, resize, repaint and return, all of
+    # it behind the veil. At no instant is there a frame without the widget
+    # drawn on it.
 
-        A layered (-transparentcolor) window's newly allocated region is
-        uninitialized until something paints it, and uninitialized layered
-        memory composites as opaque BLACK — the one-frame black box seen when
-        the card opened, since opening is the direction that grows the
-        window. So: alpha to 0, resize, flush the resize, paint the content,
-        flush the paint, alpha back. The window only ever reappears whole.
-        """
-        self.canvas.delete("all")
-        self._set_alpha(0.0)
-        self._apply_geometry(*rect)
+    def _ensure_veil(self):
+        import tkinter as tk
+
+        if self._veil is not None:
+            return
+        veil = tk.Toplevel(tk_host.root())
+        veil.overrideredirect(True)
+        veil.attributes("-topmost", True)
+        veil.configure(bg=CHROMA)
         try:
-            self.win.update_idletasks()
+            veil.attributes("-transparentcolor", CHROMA)
+        except Exception:
+            veil.configure(bg="#111827")
+        veil.withdraw()
+        canvas = tk.Canvas(veil, highlightthickness=0, bd=0, bg=CHROMA)
+        canvas.pack(fill="both", expand=True)
+        self._veil = veil
+        self._veil_canvas = canvas
+
+    def _flush(self, win) -> None:
+        try:
+            win.update_idletasks()
         except Exception:
             pass
+
+    def _on_veil(self, draw) -> None:
+        """Run one of the self.canvas renderers onto the veil's canvas."""
+        real = self.canvas
+        self.canvas = self._veil_canvas
         try:
             draw()
-        except Exception as e:
-            self._log_once(f"cloaked draw failed ({type(e).__name__}: {e})")
+        finally:
+            self.canvas = real
+
+    def _resize_seamless(self, rect, draw_current, draw_new) -> None:
+        """Change the window's geometry without a visible frame of anything.
+
+        draw_current must repaint what is on screen RIGHT NOW (it renders
+        onto the veil); draw_new paints the post-resize content. Every
+        mapped-but-unpainted surface moment happens at alpha 0, and every
+        alpha-0 moment happens while the other window still shows the same
+        pixels.
+        """
+        alpha = 1.0 if self._pointer_in else 0.96
         try:
-            self.win.update_idletasks()
-        except Exception:
-            pass
-        self._set_alpha(1.0 if self._pointer_in else 0.96)
+            self._ensure_veil()
+            veil = self._veil
+            # Stand-in first: painted invisibly at the current geometry...
+            veil.geometry(f"{self.win.winfo_width()}x{self.win.winfo_height()}"
+                          f"+{self._x}+{self._y}")
+            try:
+                veil.attributes("-alpha", 0.0)
+            except Exception:
+                pass
+            veil.deiconify()
+            # To the top of the topmost band: covering is its entire job, and
+            # a veil that maps beneath some other topmost window covers
+            # nothing.
+            try:
+                veil.lift()
+            except Exception:
+                pass
+            self._veil_canvas.delete("all")
+            self._on_veil(draw_current)
+            self._flush(veil)
+            # ...then faded in over identical pixels.
+            try:
+                veil.attributes("-alpha", alpha)
+            except Exception:
+                pass
+            self._flush(veil)
+            covered = True
+        except Exception as e:
+            self._log_once(f"veil unavailable ({type(e).__name__}: {e})")
+            covered = False
+
+        # The real window's turn, entirely behind the veil (or, if the veil
+        # failed, degraded to the old blink rather than showing black).
+        if covered:
+            self.win.withdraw()
+        else:
+            self._set_alpha(0.0)
+        self.canvas.delete("all")
+        self._apply_geometry(*rect)
+        self._flush(self.win)
+        try:
+            draw_new()
+        except Exception as e:
+            self._log_once(f"resize draw failed ({type(e).__name__}: {e})")
+        if covered:
+            self._set_alpha(0.0)
+            self.win.deiconify()
+        self._flush(self.win)
+        self._set_alpha(alpha)
+        self._flush(self.win)
+        if covered:
+            try:
+                self._veil.withdraw()
+            except Exception:
+                pass
 
     def _finish_anim(self, anim: Dict) -> None:
         """Land on the real geometry and repaint the real content."""
         self._anim = None
         self.collapsed = anim["target"]
-        self._resize_cloaked(anim["to"], self._render)
+        # What is on screen right now is the slide's final frame; the veil
+        # reproduces it while the window shrinks to the real geometry and
+        # paints the real content behind it.
+        ux, uy = anim["union"][0], anim["union"][1]
+        st = anim["shape_to"]
+        last = 1.0 if anim["target"] else 0.0
+        self._resize_seamless(
+            anim["to"],
+            draw_current=lambda: self._render_morph(st[0] - ux, st[1] - uy,
+                                                    st[2] - ux, st[3] - uy, last),
+            draw_new=self._render)
         self._keep_on_top()
         self._note_shown()
 
@@ -968,6 +1074,7 @@ class _TimerWidget:
             # settles on a new one when dropped, so its chevron does not
             # twitch from side to side while you move it.
             changed = False
+            old_side = self.side
             if self.collapsed:
                 side = self._pick_side(ox, oy, self.side)
                 if side != self.side:
@@ -977,10 +1084,21 @@ class _TimerWidget:
                     ox, oy = self._origin_for(gx, gy, side)
             if changed:
                 # Turning sideways grows one dimension — same uninitialized
-                # black-box risk as the open slide, same cloaked resize.
-                self._resize_cloaked(
+                # black-box risk as the open slide, same seamless resize. The
+                # veil must show the OLD orientation (what is on screen), and
+                # self.side has already moved on, so it is put back for the
+                # duration of that one draw.
+                def _draw_old_side():
+                    cur = self.side
+                    self.side = old_side
+                    try:
+                        self._render()
+                    finally:
+                        self.side = cur
+                self._resize_seamless(
                     self._geometry_for(self.collapsed, self.side, ox, oy),
-                    self._render)
+                    draw_current=_draw_old_side,
+                    draw_new=self._render)
             else:
                 self._apply_geometry(*self._geometry_for(self.collapsed, self.side, ox, oy))
         except Exception as e:
@@ -1132,10 +1250,12 @@ class _TimerWidget:
         self._refresh_now()
 
     def destroy(self) -> None:
-        try:
-            self.win.destroy()
-        except Exception:
-            pass
+        for win in (self._veil, self.win):
+            try:
+                if win is not None:
+                    win.destroy()
+            except Exception:
+                pass
 
 
 # ---------- public API (safe to call from any thread) ----------
