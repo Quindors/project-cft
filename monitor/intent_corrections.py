@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from monitor.paths import data_dir
+from monitor.problems import UserError
 
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -64,7 +65,10 @@ def save(intention_text: str, window_title: str, aligned: bool) -> Dict:
     i_norm = normalize_intention(intention_text)
     w_norm = normalize_title(window_title)
     if not i_norm or not w_norm:
-        raise ValueError("intention text and window title are both required")
+        raise UserError(
+            "That feedback needs both a session and a window to attach to.",
+            "Refresh the dashboard and try again \u2014 the session may have "
+            "ended between the click and the save.")
 
     with _connect() as conn:
         conn.execute(

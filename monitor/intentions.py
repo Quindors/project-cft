@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from monitor.paths import data_dir
+from monitor.problems import UserError
 
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
 
@@ -226,14 +227,26 @@ def validate(text: str, duration_min) -> tuple:
     """
     text = " ".join((text or "").split())
     if not text:
-        raise ValueError("intention text must not be empty")
+        raise UserError(
+            "A focus session needs something to aim at.",
+            "Write what you're about to work on \u2014 \u201cfinish the stats "
+            "problem set\u201d beats \u201cwork\u201d, because the monitor "
+            "checks what's on screen against it.")
     if len(text) > MAX_TEXT_LEN:
-        raise ValueError(f"intention text must be at most {MAX_TEXT_LEN} characters")
+        raise UserError(
+            f"That's longer than the {MAX_TEXT_LEN} characters a session "
+            f"intention can hold.",
+            "Shorten it to the one thing you're working on \u2014 a whole "
+            "to-do list is harder to judge your screen against than a single "
+            "aim.")
     duration_min = int(duration_min)
     if not (MIN_DURATION_MIN <= duration_min <= MAX_DURATION_MIN):
-        raise ValueError(
-            f"duration must be {MIN_DURATION_MIN}-{MAX_DURATION_MIN} minutes"
-        )
+        raise UserError(
+            f"A focus session has to run between {MIN_DURATION_MIN} and "
+            f"{MAX_DURATION_MIN} minutes.",
+            "Pick one of the preset lengths, or type anything in that range. "
+            "You can finish early \u2014 the session counts what you actually "
+            "sat through.")
     return text, duration_min
 
 
@@ -308,10 +321,15 @@ def pause_active() -> Dict:
     from monitor import breaks
 
     if breaks.get_active() is not None:
-        raise ValueError("already on a break")
+        raise UserError(
+            "You're on a break, so there's no session to pause.",
+            "End the break first if you want to get back to work.")
     active = get_active()
     if active is None:
-        raise ValueError("no active focus session to pause")
+        raise UserError(
+            "There's no focus session running to pause.",
+            "Start one first \u2014 pausing only holds a session that's "
+            "already going.")
 
     old_ends = active["ends_at"]
     new_ends = (
@@ -325,7 +343,9 @@ def pause_active() -> Dict:
             (new_ends, active["id"]),
         ).rowcount == 1
     if not won:
-        raise ValueError("no active focus session to pause")
+        raise UserError(
+            "The focus session ended while that was being processed.",
+            "Refresh the dashboard to see where things stand.")
 
     try:
         pause = breaks.start(PAUSE_MIN, source="pause", intention_id=active["id"])
@@ -380,7 +400,11 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
     Beeminder record is independent of the break and is pushed either way.
     """
     if status not in ("completed", "abandoned"):
-        raise ValueError("status must be 'completed' or 'abandoned'")
+        raise UserError(
+            "A session can only be finished or abandoned.",
+            "Use \u201cDone\u201d if you saw it through, or \u201cGive "
+            "up\u201d if you didn't \u2014 only finished sessions count "
+            "towards your goals.")
     active = get_active()
     if active is None:
         return None

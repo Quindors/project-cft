@@ -24,6 +24,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 
 from monitor import app_state
+from monitor.problems import UserError
 
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
 _KEY = "break"
@@ -83,7 +84,11 @@ def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
     """
     duration_min = int(duration_min)
     if not (MIN_BREAK_MIN <= duration_min <= MAX_BREAK_MIN):
-        raise ValueError(f"break must be {MIN_BREAK_MIN}-{MAX_BREAK_MIN} minutes")
+        raise UserError(
+            f"A break has to run between {MIN_BREAK_MIN} and {MAX_BREAK_MIN} "
+            f"minutes.",
+            "Pick a length in that range. You can always end a break early "
+            "from the tray or the dashboard.")
 
     # Starting a break mid-session means the session is over. Import locally:
     # intentions calls back into this module on session end, and a top-level
