@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dotenv import load_dotenv
 
@@ -25,9 +26,12 @@ def _prompt_for_key(label: str) -> str:
     ps = (
         "Add-Type -AssemblyName Microsoft.VisualBasic;"
         "[Microsoft.VisualBasic.Interaction]::InputBox("
-        f"'project-cft needs your {label} API key to run. Paste it below - "
-        "it will be saved to the .env next to the app so you are only asked once.',"
-        "'project-cft setup','')"
+        f"'cft needs a {label} API key before it can classify what you are "
+        f"working on. Paste it below and you will not be asked again - it is "
+        f"saved to the .env file next to the app, on this PC only. "
+        f"Without a key, cft still records which windows you use, but cannot "
+        f"sort them into categories.',"
+        "'Set up cft','')"
     )
     try:
         # CREATE_NO_WINDOW: in the windowed exe, don't flash a console for powershell.
@@ -41,21 +45,45 @@ def _prompt_for_key(label: str) -> str:
         return ""
 
 
+# Characters a value can carry bare on a KEY=value line. Anything else —
+# spaces, `#` (starts a comment mid-value), quotes, backslashes — has to be
+# quoted or python-dotenv reads back something other than what was saved.
+# Tokens, slugs, URLs and flags are all bare; an SMTP password is the case
+# that is not.
+_BARE_VALUE = re.compile(r"^[A-Za-z0-9_./:@+=,%~\-]*$")
+
+
+def _env_literal(value: str) -> str:
+    """`value` as a .env literal that load_dotenv reads back verbatim."""
+    if _BARE_VALUE.match(value):
+        return value
+    if "$" in value and "'" not in value:
+        # `${NAME}` is interpolated inside double quotes; single quotes are
+        # the only way to keep a dollar sign literal.
+        return "'" + value + "'"
+    escaped = (value.replace("\\", "\\\\").replace('"', '\\"')
+                    .replace("\n", "\\n").replace("\r", "\\r"))
+    return '"' + escaped + '"'
+
+
 def _persist_env_var(name: str, value: str) -> None:
     """Write or update NAME=value in the .env next to the app."""
     path = env_path()
+    literal = _env_literal(value)
     lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
     for i, line in enumerate(lines):
         if line.strip().startswith(f"{name}="):
-            lines[i] = f"{name}={value}"
+            lines[i] = f"{name}={literal}"
             break
     else:
-        lines.append(f"{name}={value}")
+        lines.append(f"{name}={literal}")
     try:
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         print(f"[creds] saved {name} to {path}")
     except Exception as e:
-        print(f"[creds] could not save {name} to {path}: {e}")
+        print(f"[creds] Couldn't save {name} to {path}. It will work for "
+              f"this session but you'll be asked again next time \u2014 check "
+              f"the app's folder isn't read-only. ({e})")
 
 
 def _require_key(var_name: str, label: str) -> str:
@@ -63,7 +91,7 @@ def _require_key(var_name: str, label: str) -> str:
     key = os.getenv(var_name)
     if key:
         return key
-    print(f"[creds] {var_name} not set - prompting user...")
+    print(f"[creds] No {var_name} on file yet; asking for one.")
     key = _prompt_for_key(label)
     if key:
         os.environ[var_name] = key

@@ -49,6 +49,7 @@ from urllib.request import Request, urlopen
 
 from monitor.config import DEFAULT_SETTINGS
 from monitor.paths import data_dir
+from monitor.problems import Problem
 
 # ALIGN below this is off-intent — the same line the drift alerts draw. It
 # cuts both ways here: a productive-category row under it is drift (see
@@ -197,6 +198,44 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def label_rows(start: str, end: str) -> List[sqlite3.Row]:
+    """The day query over [start, end): one row per (label, productive,
+    off_intent, declared) with its row count `n`.
+
+    The single place the "what counts" SQL is run — the weekly email report
+    (monitor/email_report.py) totals through here too, so a number in the
+    inbox is the number Beeminder was sent. Raises sqlite3.Error when the
+    database cannot be read; callers decide what an empty answer means.
+    """
+    with _connect() as conn:
+        return conn.execute(
+            _DAY_QUERY, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
+        ).fetchall()
+
+
+# What a label_rows() row counts as. DRIFTED is off-task time that was real
+# work done off-intent during a session — reported separately so a comment
+# can say "of which off-intent".
+PRODUCTIVE, DRIFTED, OFFTASK, NEITHER = "productive", "drifted", "offtask", "neither"
+
+
+def bucket(row, *, strict_intent: bool = True) -> str:
+    """Which column a label_rows() row belongs in — the one rule, in one place.
+
+    A productive-category row logged off-intent during a session is DRIFTED
+    (off-task) under strict intent and PRODUCTIVE otherwise; a declared
+    neutral row is PRODUCTIVE; an unproductive category is OFFTASK; anything
+    else (neutral, undeclared, or not a category at all) is NEITHER.
+    """
+    if row["productive"] == 1 and strict_intent and row["off_intent"]:
+        return DRIFTED
+    if row["productive"] == 1 or row["declared"]:
+        return PRODUCTIVE
+    if row["productive"] == 0:
+        return OFFTASK
+    return NEITHER
+
+
 def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True) -> DayTotals:
     """Total the rows logged on `day`. Never raises — an unreadable database
     reports an empty day, which is the honest thing to push.
@@ -212,10 +251,7 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
     start = f"{day:%Y-%m-%d} 00:00:00"
     end = f"{day + timedelta(days=1):%Y-%m-%d} 00:00:00"
     try:
-        with _connect() as conn:
-            rows: List[sqlite3.Row] = conn.execute(
-                _DAY_QUERY, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
-            ).fetchall()
+        rows = label_rows(start, end)
     except sqlite3.Error as e:
         # A fresh install has no focus_logs table yet.
         print(f"[beeminder] could not read focus.db ({e}); reporting an empty day")
@@ -225,10 +261,11 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
     parts: List[str] = []
     for row in rows:
         seconds = row["n"] * seconds_per_row
-        if row["productive"] == 1 and strict_intent and row["off_intent"]:
+        kind = bucket(row, strict_intent=strict_intent)
+        if kind == DRIFTED:
             offtask_sec += seconds
             drifted_sec += seconds
-        elif row["productive"] == 1 or row["declared"]:
+        elif kind == PRODUCTIVE:
             productive_sec += seconds
             # 0.1h is the smallest slice the breakdown can render; anything
             # below it would read as a pointless "Foo 0.0h". Declared neutral
@@ -236,7 +273,7 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
             if len(parts) < 3 and seconds >= 360:
                 tag = " in session" if row["declared"] else ""
                 parts.append(f"{row['label']} {seconds / 3600:.1f}h{tag}")
-        elif row["productive"] == 0:
+        elif kind == OFFTASK:
             offtask_sec += seconds
 
     comment = f"{productive_sec / 3600:.2f}h productive"
@@ -369,8 +406,12 @@ def post_datapoint(
                 return None
         except (URLError, OSError, ValueError) as e:
             if attempt == 2:
-                problem = f"could not reach Beeminder ({e})"
-                print(f"[beeminder] {goal}: {problem}")
+                problem = Problem(
+                    "Couldn't reach Beeminder.",
+                    "Your hours are recorded locally either way and pushed "
+                    "again in five minutes, so a dropped connection doesn't "
+                    "cost you the time.")
+                print(f"[beeminder] {goal}: {problem} ({e})")
                 _note_push(goal, ok=False, error=problem, reason="unreachable")
                 return None
         time.sleep(2)
@@ -390,14 +431,43 @@ def _reason_for(err: HTTPError) -> str:
     return "other"
 
 
-def _http_problem(err: HTTPError, user: str, goal: str) -> str:
-    """One sentence for what Beeminder is objecting to, for humans."""
+# The token page, named once so every message can point at the same place.
+TOKEN_URL = "beeminder.com/api/v1/auth_token.json"
+
+
+def _bad_token_problem() -> Problem:
+    return Problem(
+        "Beeminder won't accept your token any more.",
+        f"Tokens change when you reset your Beeminder password. Get the "
+        f"current one from {TOKEN_URL} while you're signed in, then use "
+        f"Reconnect below.")
+
+
+def _missing_goal_problem(user: str, goal: str) -> Problem:
+    return Problem(
+        f"Beeminder has no goal called \u201c{goal}\u201d on your account.",
+        "It was deleted or renamed. Point the monitor at the goal's current "
+        "name, or have it make you a new one \u2014 either way your hours "
+        "start counting again straight away.")
+
+
+def _http_problem(err: HTTPError, user: str, goal: str) -> Problem:
+    """What Beeminder is objecting to, and what to do about it."""
     if err.code in (401, 403):
-        return "Beeminder rejected the token"
+        return _bad_token_problem()
     if err.code == 404:
-        return f"Beeminder has no goal '{goal}' under user '{user}' (deleted or renamed?)"
+        return _missing_goal_problem(user, goal)
     detail = _error_detail(err)
-    return detail or f"Beeminder answered HTTP {err.code}"
+    if detail:
+        return Problem(
+            "Beeminder turned the datapoint down.",
+            f"It said: {detail}. That's Beeminder's own wording \u2014 if it "
+            f"mentions the goal's units, the goal has to be a Do More goal "
+            f"measured in hours.")
+    return Problem(
+        f"Beeminder answered with an error ({err.code}) and no explanation.",
+        "Your hours are kept locally and pushed again in five minutes, so a "
+        "short outage costs nothing. Check status.beeminder.com if it lasts.")
 
 
 # ------------------- health (what the dashboard card reports) -------------------
@@ -542,9 +612,15 @@ def status() -> Dict:
     # over a stale push failure; an unreachable probe says nothing either way.
     problem = None
     if goal and goal["exists"] is False:
-        problem = {"reason": goal["reason"], "message": goal["error"]}
+        # A goal that WAS working and is now gone wants different advice from
+        # a slug typed wrong during setup: the card can offer to make a new
+        # one, so say so rather than sending them off to check the spelling.
+        err = (_missing_goal_problem(cfg.user, cfg.focus_goal)
+               if goal["reason"] == "missing_goal" else goal["error"])
+        problem = {"reason": goal["reason"], **_problem_parts(err)}
     elif push and push["ok"] is False:
-        problem = {"reason": push.get("reason") or "other", "message": push["error"]}
+        problem = {"reason": push.get("reason") or "other",
+                   **_problem_parts(push["error"])}
 
     return {
         "configured": enabled(cfg),
@@ -557,6 +633,13 @@ def status() -> Dict:
         "goal_check": goal,
         "problem": problem,
     }
+
+
+def _problem_parts(err) -> Dict[str, str]:
+    """{message, fix} for the card. Older stored errors are plain strings
+    with no fix; they still render, just without the second line."""
+    return {"message": getattr(err, "message", err) or "",
+            "fix": getattr(err, "fix", "")}
 
 
 def sync_now() -> threading.Thread:
@@ -659,12 +742,27 @@ def probe_goal(user: str, token: str, goal: str, *, timeout_sec: float = 10.0
         return None, None
     except HTTPError as e:
         if e.code in (401, 403):
-            return "bad_token", "Beeminder rejected that token"
+            return "bad_token", Problem(
+                "Beeminder didn't accept that token.",
+                f"Copy it from {TOKEN_URL} while you're signed in \u2014 it's "
+                f"a long string of letters and numbers, not your password.")
         if e.code == 404:
-            return "missing_goal", f"Beeminder has no goal '{goal}' under user '{user}'"
-        return "other", f"Beeminder answered HTTP {e.code}: {_error_detail(e)}"
+            return "missing_goal", Problem(
+                f"Beeminder has no goal called \u201c{goal}\u201d under "
+                f"\u201c{user}\u201d.",
+                "Check the spelling of both. The goal name is the short slug "
+                "in its web address, not its title.")
+        detail = _error_detail(e)
+        return "other", Problem(
+            "Beeminder wouldn't confirm that goal.",
+            f"It said: {detail}" if detail else
+            f"It answered with an error ({e.code}) and no explanation. Try "
+            f"again in a minute.")
     except (URLError, OSError, ValueError) as e:
-        return "unreachable", f"could not reach Beeminder ({e})"
+        return "unreachable", Problem(
+            "Couldn't reach Beeminder to check that goal.",
+            "Check you're online and try again \u2014 nothing has been saved "
+            "yet, so you won't end up half-connected.")
 
 
 def verify(user: str, token: str, goal: str, *, timeout_sec: float = 10.0) -> Optional[str]:

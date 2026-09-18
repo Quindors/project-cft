@@ -145,6 +145,20 @@ def _start_beeminder(shutdown: threading.Event) -> None:
         print(f"[boot] beeminder sync not started ({e})")
 
 
+def _start_email_report(shutdown: threading.Event) -> None:
+    """Begin the weekly email report scheduler, if the .env configures it.
+
+    Like Beeminder, this runs in dashboard-only mode too: the report reads
+    the database, not the monitor, and a machine that only ever opens the
+    dashboard on Monday morning should still get its mail.
+    """
+    try:
+        from monitor import email_report
+        email_report.start_background_scheduler(shutdown)
+    except Exception as e:
+        print(f"[boot] email report not started ({e})")
+
+
 def _stop_ui() -> None:
     """Tear down the Tk thread (timer widget, focus alerts) on shutdown."""
     try:
@@ -169,6 +183,7 @@ def run_dashboard_only() -> None:
     shutdown = threading.Event()
     icon = _start_tray(None, shutdown)
     _start_beeminder(shutdown)
+    _start_email_report(shutdown)
     print("[boot] dashboard-only mode ready — quit from the tray icon")
     try:
         while not shutdown.wait(timeout=1.0):
@@ -241,6 +256,7 @@ def run(settings: Settings | None = None) -> None:
     if not testing_mode:
         tray_icon = _start_tray(settings, shutdown)
         _start_beeminder(shutdown)
+        _start_email_report(shutdown)
 
     print(f"\n[boot] === INIT COMPLETE in {time.time() - boot_start:.2f}s ===\n")
 

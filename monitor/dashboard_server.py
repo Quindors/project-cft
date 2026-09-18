@@ -70,6 +70,24 @@ Endpoints:
                                    when the credentials don't check out
     POST /api/beeminder/live    -> leaves dry-run mode (BEEMINDER_DRY_RUN=0)
     POST /api/beeminder/disconnect -> blanks the Beeminder credentials
+    GET  /api/email-report      -> {configured, recipients, smtp_host, smtp_port,
+                                    smtp_user, security, sender, day, hour,
+                                    next_send, pending, last_sent, last_attempt,
+                                    scheduler_running, problem} — never the
+                                   password (monitor/email_report.py)
+    GET  /api/email-report/preview -> the report for the last seven days, as
+                                   the HTML that would be mailed
+    POST /api/email-report      -> {to, smtp_host, smtp_port?, smtp_user?,
+                                    smtp_password?, sender?, security?, day?,
+                                    hour?, send_test?} — `to` is a list or a
+                                   comma-separated string; the password may be
+                                   omitted once stored. Logs in to the SMTP
+                                   server before saving anything (400 with the
+                                   reason otherwise), persists to the .env and
+                                   starts the weekly scheduler; send_test mails
+                                   the last seven days right away
+    POST /api/email-report/send -> mails the last seven days now
+    POST /api/email-report/disconnect -> blanks the recipients and SMTP settings
     POST /api/correct           -> {id, human_label} sets a human correction on a
                                    row. The label must name an existing category
                                    (matched case-insensitively, stored in the
@@ -106,9 +124,11 @@ Endpoints:
                                    validated against the real categories (400
                                    unknown, 422 rejected if it is marked
                                    unproductive) and only CHECKED by the gate —
-                                   when the gate disagrees it answers 409
-                                   {needs_confirm, picked, suggested, reason}
-                                   once; confirm=true keeps the pick anyway.
+                                   when the gate reads the text as UNPRODUCTIVE
+                                   work it answers 409 {needs_confirm, picked,
+                                   suggested, reason} once; confirm=true keeps
+                                   the pick anyway. A disagreement between two
+                                   productive categories keeps the pick silently.
                                    Without a pick the gate decides, and 422
                                    {rejected, category, reason} refuses work
                                    that maps to an unproductive category
@@ -161,6 +181,7 @@ from monitor import intentions
 from monitor import app_state
 from monitor import breaks
 from monitor import status as status_store
+from monitor import problems
 
 
 DEFAULT_API_PORT = 47113
@@ -343,7 +364,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         if _STATIC_ROOT is None:
             # API-only mode (dashboard is hosted): don't serve arbitrary files.
-            self._send_json({"error": "dashboard not bundled; use the hosted URL"}, status=404)
+            self._send_problem(
+                "This copy of the monitor doesn't include the dashboard.",
+                "Open the hosted dashboard instead \u2014 it reads from this "
+                "same machine while the monitor is running.", status=404)
             return
         super().do_GET()
 
@@ -357,6 +381,27 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_problem(self, message, fix: str = "", status: int = 400) -> None:
+        """Reject a request in two sentences: what went wrong, and what to do.
+
+        `message` may be a string or a Problem/exception carrying its own fix
+        (monitor/problems.py). The body is always {"error", "fix"} so the
+        dashboard can set the fix in its own line; older clients that only
+        read `error` still get a complete sentence.
+        """
+        if isinstance(message, str) and not isinstance(message, problems.Problem):
+            body = problems.Problem(message, fix).as_json()
+        else:
+            body = problems.body(message, fix)
+        self._send_json(body, status=status)
+
+    def _send_unexpected(self, err: Exception, doing: str) -> None:
+        """A 500 for something nobody predicted. The raw exception text never
+        goes out on its own — it rides along inside the fix, framed as where
+        to look, because a stack-trace fragment is not an instruction."""
+        print(f"[api] {doing}: {err!r}")
+        self._send_json(problems.unexpected(err, doing).as_json(), status=500)
+
     def _handle_api(self) -> None:
         global _last_client_seen
         _last_client_seen = time.time()  # a dashboard page is alive out there
@@ -369,7 +414,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             try:
                 self._send_json({"active": intentions.get_active()})
             except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
+                self._send_unexpected(e, "loading your focus session")
             return
 
         if u.path == "/api/break":
@@ -377,7 +422,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_json({"active": breaks.get_active(),
                                  "default_min": breaks.DEFAULT_BREAK_MIN})
             except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
+                self._send_unexpected(e, "loading your break")
             return
 
         # Beeminder setup state, so the dashboard's setup card knows whether
@@ -387,7 +432,33 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 from monitor import beeminder
                 self._send_json(beeminder.status())
             except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
+                self._send_unexpected(e, "checking on Beeminder")
+            return
+
+        # Weekly email report: settings + health for its card, never the
+        # SMTP password; and a preview of what would be mailed.
+        if u.path == "/api/email-report":
+            try:
+                from monitor import email_report
+                self._send_json(email_report.status())
+            except Exception as e:
+                self._send_unexpected(e, "checking on the weekly report")
+            return
+        if u.path == "/api/email-report/preview":
+            try:
+                from monitor import email_report
+                from datetime import date as _date
+                body = email_report.render_html(
+                    email_report.build_report(_date.today())).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self._send_cors()
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception as e:
+                self._send_unexpected(e, "building the report preview")
             return
 
         # The resolved everything-at-once view the timer widget renders from.
@@ -395,7 +466,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             try:
                 self._send_json(status_store.full_snapshot())
             except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
+                self._send_unexpected(e, "loading the monitor's status")
             return
 
         conn = _db_ro()
@@ -496,9 +567,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     limit = 1000
                 self._send_json(_finished_sessions(conn, limit))
             else:
-                self._send_json({"error": "not found"}, status=404)
+                self._send_problem(
+                    "The monitor doesn’t have anything at that address.",
+                    "Refresh the dashboard — if it keeps happening, the "
+                    "page is probably newer than the monitor.", status=404)
         except Exception as e:
-            self._send_json({"error": str(e)}, status=500)
+            self._send_unexpected(e, "reading your activity history")
         finally:
             conn.close()
 
@@ -516,6 +590,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/beeminder": self._post_beeminder,
             "/api/beeminder/live": self._post_beeminder_live,
             "/api/beeminder/disconnect": self._post_beeminder_disconnect,
+            "/api/email-report": self._post_email_report,
+            "/api/email-report/send": self._post_email_report_send,
+            "/api/email-report/disconnect": self._post_email_report_disconnect,
         }
         handlers = {
             "/api/correct": self._post_correct,
@@ -527,7 +604,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         }
         handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
-            self._send_json({"error": "not found"}, status=404)
+            self._send_problem(
+                "The monitor doesn’t have anything at that address.",
+                "Refresh the dashboard — if it keeps happening, the "
+                "page is probably newer than the monitor.", status=404)
             return
 
         try:
@@ -536,24 +616,31 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError
         except (ValueError, json.JSONDecodeError):
-            self._send_json({"error": "expected a JSON object body"}, status=400)
+            self._send_problem(
+                "That request didn't arrive in a form the monitor understands.",
+                "Refresh the dashboard and try again. If it keeps happening, "
+                "the page and the monitor are probably different versions.")
             return
 
         if u.path in no_conn_handlers:
             try:
                 handler(body)
             except Exception as e:
-                self._send_json({"error": str(e)}, status=500)
+                self._send_unexpected(e, "saving that change")
             return
 
         conn = _db_rw()
         if conn is None:
-            self._send_json({"error": "no local database yet"}, status=503)
+            self._send_problem(
+                "There's no activity history on this machine yet.",
+                "Leave the monitor running for a few minutes and refresh \u2014 "
+                "it starts recording as soon as you're at the screen.",
+                status=503)
             return
         try:
             handler(conn, body)
         except Exception as e:
-            self._send_json({"error": str(e)}, status=500)
+            self._send_unexpected(e, "saving that change")
         finally:
             conn.close()
 
@@ -565,7 +652,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 body.get("text") or "", body.get("duration_min") or 0
             )
         except (ValueError, TypeError) as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
 
         # The category is the user's call. A picked one is validated against
@@ -588,12 +675,17 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 finally:
                     conn.close()
             if row is None:
-                self._send_json({"error": f"unknown category {picked!r}"}, status=400)
+                self._send_json(problems.unknown_category(picked, action="start").as_json(),
+                                status=400)
                 return
             if row["is_productive"] == 0:
                 self._send_json({
-                    "error": (f"Not started: {row['name']} is an unproductive "
-                              f"category. Pick the work you mean to do."),
+                    "error": (f"\u201c{row['name']}\u201d isn't something you "
+                              f"can declare a focus session for."),
+                    "fix": (f"It's marked as time that doesn't count. Pick the "
+                            f"work you actually mean to do \u2014 or, if "
+                            f"{row['name']} really is work for you, change that "
+                            f"on the Categories tab."),
                     "rejected": True,
                     "category": row["name"],
                     "reason": "picked category is marked unproductive",
@@ -608,9 +700,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             if not gate["allowed"]:
                 why = gate.get("reason") or "it describes off-task activity"
                 self._send_json({
-                    "error": (f"Not started: “{text}” reads as "
-                              f"{gate['category']} — {why} "
-                              f"Rephrase it if it's real work."),
+                    "error": (f"\u201c{text}\u201d reads as "
+                              f"{gate['category']}, which isn't work the "
+                              f"session can measure you against."),
+                    "fix": (f"{why} If it really is work, say what you'll "
+                            f"produce \u2014 \u201cread the Chapter 4 "
+                            f"problems\u201d rather than \u201clook at "
+                            f"stuff\u201d."),
                     "rejected": True,
                     "category": gate.get("category"),
                     "reason": gate.get("reason"),
@@ -619,19 +715,32 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             chosen = gate.get("category")
         elif (not confirmed and gate.get("category")
               and gate["category"].lower() != chosen.lower()):
-            self._send_json({
-                "error": f"The gate reads “{text}” as {gate['category']}, not {chosen}.",
-                "needs_confirm": True,
-                "picked": chosen,
-                "suggested": gate["category"],
-                "reason": gate.get("reason"),
-            }, status=409)
-            return
+            # Two productive categories disagreeing is a close call between
+            # two labels the user is allowed to pick, so the pick stands and
+            # the disagreement is only logged. The gate asks once (409) only
+            # when it reads the text as a LOOPHOLE — work that maps to an
+            # unproductive category — because that is the case it exists for.
+            if gate["allowed"]:
+                print(f"[gate] pick {chosen!r} kept over {gate['category']!r} "
+                      f"for {text!r}: {gate.get('reason') or ''}")
+            else:
+                self._send_json({
+                    "error": (f"That reads more like {gate['category']} than "
+                              f"{chosen}."),
+                    "fix": ("Start it anyway if you're sure \u2014 you know "
+                            "what you're working on better than the gate "
+                            "does."),
+                    "needs_confirm": True,
+                    "picked": chosen,
+                    "suggested": gate["category"],
+                    "reason": gate.get("reason"),
+                }, status=409)
+                return
 
         try:
             active = intentions.start(text, duration_min, llm_category=chosen)
         except (ValueError, TypeError) as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, "active": active})
 
@@ -642,18 +751,25 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             sid = int(body.get("id"))
         except (TypeError, ValueError):
-            self._send_json({"error": "expected JSON body {id, category}"}, status=400)
+            self._send_problem(
+                "The dashboard didn't send everything needed for changing a session's category.",
+                "Refresh the page and try again \u2014 this usually means the "
+                "page and the monitor are different versions.")
             return
         label = (body.get("category") or "").strip() or None
         known = None
         if label is not None:
             known = self._resolve_label(conn, label)
             if known is None:
-                self._send_json({"error": f"unknown category {label!r}"}, status=400)
+                self._send_json(problems.unknown_category(label, action="use").as_json(),
+                                status=400)
                 return
         row = intentions.set_category(sid, known)
         if row is None:
-            self._send_json({"error": "no finished session with that id"}, status=404)
+            self._send_problem(
+                "That focus session isn't there any more.",
+                "Refresh the Forest tab \u2014 it may have been relabelled or "
+                "removed since the page loaded.", status=404)
             return
         self._send_json({"ok": True, "session": row})
 
@@ -670,11 +786,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if not text:
             active = intentions.get_active()
             if active is None:
-                self._send_json({"error": "no active session to correct against"}, status=400)
+                self._send_problem(
+                    "There's no focus session running, so there's nothing to "
+                    "judge that window against.",
+                    "Start a session first \u2014 alignment feedback only means "
+                    "something once you've declared what you're working on.")
                 return
             text = active["text"]
         if not window:
-            self._send_json({"error": "expected JSON body {window, aligned}"}, status=400)
+            self._send_problem(
+                "The dashboard didn't send everything needed for recording that feedback.",
+                "Refresh the page and try again \u2014 this usually means the "
+                "page and the monitor are different versions.")
             return
 
         if body.get("aligned") is None:
@@ -684,7 +807,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             saved = intent_corrections.save(text, window, bool(body.get("aligned")))
         except ValueError as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, **saved})
 
@@ -715,7 +838,11 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         if not token and beeminder.enabled():
             token = beeminder.config().token
         if not user or not token or not focus_goal:
-            self._send_json({"error": "user, token and focus_goal are required"}, status=400)
+            self._send_problem(
+                "Beeminder needs your username, your token and a goal name.",
+                "Your token is on beeminder.com/api/v1/auth_token.json while "
+                "you're signed in \u2014 it's a long string of letters and "
+                "numbers, not your password.")
             return
 
         if body.get("create_goal"):
@@ -723,12 +850,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                                             body.get("hours_per_day"),
                                             body.get("leeway_days") or 0)
             if problem:
-                self._send_json({"error": problem}, status=400)
+                self._send_json(problems.body(problem), status=400)
                 return
             if sessions_goal:  # the card never sends this, but keep the API honest
                 problem = beeminder.verify(user, token, sessions_goal)
                 if problem:
-                    self._send_json({"error": problem}, status=400)
+                    self._send_json(problems.body(problem), status=400)
                     return
         else:
             for goal in (focus_goal, sessions_goal):
@@ -736,7 +863,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     continue
                 problem = beeminder.verify(user, token, goal)
                 if problem:
-                    self._send_json({"error": problem}, status=400)
+                    self._send_json(problems.body(problem), status=400)
                     return
 
         saves = {
@@ -786,12 +913,144 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         beeminder.reset_health()
         self._send_json({"ok": True, **beeminder.status()})
 
+    # The .env names the weekly email report writes. Blanked, not deleted, on
+    # disconnect — same convention as Beeminder.
+    _REPORT_ENV = ("REPORT_EMAIL_TO", "REPORT_SMTP_HOST", "REPORT_SMTP_PORT",
+                   "REPORT_SMTP_USER", "REPORT_SMTP_PASSWORD", "REPORT_EMAIL_FROM",
+                   "REPORT_SMTP_SECURITY", "REPORT_DAY", "REPORT_HOUR")
+
+    def _post_email_report(self, body) -> None:
+        """Set up (or edit) the weekly email report from the dashboard card.
+
+        Recipients, the SMTP server and the schedule arrive together; the
+        password may be left out once one is stored, so editing the
+        recipient list never asks for it again. The server is logged into
+        BEFORE anything is saved — a wrong app password comes back as a 400
+        in plain words and the .env is untouched. On success the settings
+        persist next to the exe and the scheduler starts at once; with
+        send_test the last seven days are mailed right away, so the card can
+        show whether it landed.
+        """
+        from monitor import email_report
+        from monitor.creds import _persist_env_var
+
+        try:
+            to = email_report.parse_recipients(body.get("to"))
+            day = email_report.parse_day(body.get("day", "mon"))
+            hour = email_report.parse_hour(body.get("hour", 9))
+        except ValueError as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        if not to:
+            self._send_problem(
+                "Nobody is set to receive the report.",
+                "Add at least one email address \u2014 your own, or whoever "
+                "should be reading it. Separate several with commas.")
+            return
+        host = str(body.get("smtp_host") or "").strip()
+        if not host:
+            self._send_problem(
+                "The report needs to know which mail server to send through.",
+                "Pick your provider with the buttons above and it fills "
+                "itself in \u2014 Gmail is smtp.gmail.com.")
+            return
+        try:
+            port = int(str(body.get("smtp_port") or "587").strip())
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            self._send_problem(
+                f"\u201c{body.get('smtp_port')}\u201d isn't a port number.",
+                "Use 587 for STARTTLS or 465 for SSL/TLS \u2014 between them "
+                "those cover almost every provider.")
+            return
+        user = str(body.get("smtp_user") or "").strip()
+        password = str(body.get("smtp_password") or "").strip()
+        current = email_report.config()
+        if not password and user and user == current.smtp_user:
+            password = current.smtp_password   # editing: keep the stored one
+        sender = str(body.get("sender") or "").strip() or user
+        if not sender:
+            self._send_problem(
+                "The report has no address to send from.",
+                "Fill in \u201cSend from\u201d with the address the mail "
+                "should come from \u2014 usually the same one you log in to "
+                "the mail server with.")
+            return
+        security = str(body.get("security") or "").strip().lower()
+        if security not in ("starttls", "ssl", "none"):
+            security = "ssl" if port == 465 else "starttls"
+
+        cfg = email_report.Config(
+            to=tuple(to), smtp_host=host, smtp_port=port, smtp_user=user,
+            smtp_password=password, sender=sender, security=security,
+            day=day, hour=hour, timeout_sec=current.timeout_sec,
+            seconds_per_row=current.seconds_per_row,
+            strict_intent=current.strict_intent,
+        )
+        problem = email_report.verify_smtp(cfg)
+        if problem:
+            self._send_json(problems.body(problem), status=400)
+            return
+
+        saves = {
+            "REPORT_EMAIL_TO": ", ".join(to),
+            "REPORT_SMTP_HOST": host,
+            "REPORT_SMTP_PORT": str(port),
+            "REPORT_SMTP_USER": user,
+            "REPORT_SMTP_PASSWORD": password,
+            "REPORT_EMAIL_FROM": sender,
+            "REPORT_SMTP_SECURITY": security,
+            "REPORT_DAY": email_report.DAYS[day],
+            "REPORT_HOUR": str(hour),
+        }
+        for name, value in saves.items():
+            os.environ[name] = value
+            _persist_env_var(name, value)
+
+        email_report.reset_health()
+        email_report.start_background_scheduler()
+        if body.get("send_test"):
+            # Bounded wait so the answer already says whether it landed.
+            email_report.send_now().join(timeout=cfg.timeout_sec + 5)
+        self._send_json({"ok": True, **email_report.status()})
+
+    def _post_email_report_send(self, body) -> None:
+        """Mail the last seven days to the configured recipients now."""
+        from monitor import email_report
+
+        if not email_report.enabled():
+            self._send_problem(
+                "The weekly report isn't set up yet, so there's nothing to send.",
+                "Add recipients and a mail server first, then try again.")
+            return
+        email_report.send_now().join(timeout=email_report.config().timeout_sec + 5)
+        self._send_json({"ok": True, **email_report.status()})
+
+    def _post_email_report_disconnect(self, body) -> None:
+        """Forget recipients and server. The scheduler thread sees the
+        integration disabled at its next tick and does nothing.
+
+        The sent-marker goes too, so switching the report back on months
+        later baselines from that moment instead of catching up on a slot
+        from before the disconnect and mailing a stale week.
+        """
+        from monitor import email_report
+        from monitor.creds import _persist_env_var
+
+        for name in self._REPORT_ENV:
+            os.environ.pop(name, None)
+            _persist_env_var(name, "")
+        email_report.clear_marker()
+        email_report.reset_health()
+        self._send_json({"ok": True, **email_report.status()})
+
     def _post_intention_pause(self, body) -> None:
         """Freeze the active session for a minute — no time lost, nothing watched."""
         try:
             result = intentions.pause_active()
         except ValueError as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, **result})
 
@@ -800,7 +1059,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             ended = intentions.end_active(status)
         except ValueError as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
         # Completing a session starts the break; report it so the caller can
         # render the new countdown without a second round trip.
@@ -810,9 +1069,16 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         raw = body.get("duration_min")
         try:
             duration = breaks.DEFAULT_BREAK_MIN if raw in (None, "") else int(raw)
+        except (ValueError, TypeError):
+            self._send_problem(
+                f"\u201c{raw}\u201d isn't a number of minutes.",
+                f"Pick one of the preset lengths, or type a whole number "
+                f"between {breaks.MIN_BREAK_MIN} and {breaks.MAX_BREAK_MIN}.")
+            return
+        try:
             active = breaks.start(duration)
         except (ValueError, TypeError) as e:
-            self._send_json({"error": str(e)}, status=400)
+            self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, "active": active})
 
@@ -823,14 +1089,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             row_id = int(body["id"])
         except (KeyError, ValueError, TypeError):
-            self._send_json({"error": "expected JSON body {id, human_label}"}, status=400)
+            self._send_problem(
+                "The dashboard didn't send everything needed for correcting a row.",
+                "Refresh the page and try again \u2014 this usually means the "
+                "page and the monitor are different versions.")
             return
 
         label = (body.get("human_label") or "").strip() or None
         if label is not None:
             known = self._resolve_label(conn, label)
             if known is None:
-                self._send_json({"error": f"unknown category '{label}'"}, status=400)
+                self._send_json(problems.unknown_category(label, action="use").as_json(),
+                                status=400)
                 return
             label = known  # exact casing, so the downstream joins match
         reviewed_at = datetime.now().isoformat() if label else None
@@ -840,7 +1110,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         )
         conn.commit()
         if cur.rowcount == 0:
-            self._send_json({"error": f"no row with id {row_id}"}, status=404)
+            self._send_problem(
+                "That entry isn't in your history any more.",
+                "Refresh the Review tab \u2014 it may have been corrected or "
+                "cleaned up since the page loaded.", status=404)
             return
 
         row = conn.execute(
@@ -872,14 +1145,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         """
         window = (body.get("window_title") or "").strip()
         if not window:
-            self._send_json({"error": "expected JSON body {window_title, human_label}"}, status=400)
+            self._send_problem(
+                "The dashboard didn't send everything needed for updating that correction rule.",
+                "Refresh the page and try again \u2014 this usually means the "
+                "page and the monitor are different versions.")
             return
 
         label = (body.get("human_label") or "").strip() or None
         if label is not None:
             known = self._resolve_label(conn, label)
             if known is None:
-                self._send_json({"error": f"unknown category '{label}'"}, status=400)
+                self._send_json(problems.unknown_category(label, action="use").as_json(),
+                                status=400)
                 return
             label = known  # exact casing from the categories table
 
@@ -898,7 +1175,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 != (r["category_name"] or "").strip().lower()
         ]
         if not matched:
-            self._send_json({"error": "no corrected rows for that window title"}, status=404)
+            self._send_problem(
+                "There's nothing corrected for that window any more.",
+                "Refresh the Review tab \u2014 the rule may already have been "
+                "changed or removed.", status=404)
             return
 
         # The rule the user edited: prefer the newest row with the exact
@@ -956,14 +1236,20 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _post_category_add(self, conn, body) -> None:
         name = (body.get("name") or "").strip()
         if not name or len(name) > 60:
-            self._send_json({"error": "category name must be 1-60 characters"}, status=400)
+            self._send_problem(
+                "A category needs a name between 1 and 60 characters.",
+                "Something short and recognisable works best \u2014 it's what "
+                "you'll be picking from menus and reading in the report.")
             return
         description = (body.get("description") or "").strip()
         exists = conn.execute(
             "SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE", (name,)
         ).fetchone()
         if exists:
-            self._send_json({"error": f"category {name!r} already exists"}, status=409)
+            self._send_problem(
+                f"You already have a category called \u201c{name}\u201d.",
+                "Pick a different name, or edit the existing one on the "
+                "Categories tab.", status=409)
             return
         productive = self._productive_flag(body.get("is_productive"))
         conn.execute(
@@ -994,7 +1280,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             (name,),
         ).fetchone()
         if row is None:
-            self._send_json({"error": f"no category named {name!r}"}, status=404)
+            self._send_problem(
+                f"There's no category called \u201c{name}\u201d.",
+                "Refresh the Categories tab \u2014 it may have been renamed or "
+                "deleted since the page loaded.", status=404)
             return
         name = row["name"]  # exact casing
 
@@ -1011,11 +1300,17 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             (target,),
         ).fetchone()
         if target_row is None:
-            self._send_json({"error": f"no category named {target!r} to reassign to"}, status=400)
+            self._send_problem(
+                f"There's no category called \u201c{target}\u201d to move that "
+                f"history into.",
+                "Pick an existing category to absorb the hours \u2014 Ambiguous "
+                "is the usual choice when nothing else fits.")
             return
         target = target_row["name"]
         if target.lower() == name.lower():
-            self._send_json({"error": "cannot reassign a category to itself"}, status=400)
+            self._send_problem(
+                "A category can't absorb its own history.",
+                "Pick a different category for the old entries to move into.")
             return
 
         # The one-way valve: "delete Gaming, reassign to Deep Work" would
@@ -1051,19 +1346,28 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "SELECT name, description, is_productive FROM categories WHERE name = ?", (name,)
         ).fetchone()
         if row is None:
-            self._send_json({"error": f"no category named {name!r}"}, status=404)
+            self._send_problem(
+                f"There's no category called \u201c{name}\u201d.",
+                "Refresh the Categories tab \u2014 it may have been renamed or "
+                "deleted since the page loaded.", status=404)
             return
 
         new_name = (body.get("new_name") or "").strip() or name
         if len(new_name) > 60:
-            self._send_json({"error": "category name must be 1-60 characters"}, status=400)
+            self._send_problem(
+                "A category needs a name between 1 and 60 characters.",
+                "Something short and recognisable works best \u2014 it's what "
+                "you'll be picking from menus and reading in the report.")
             return
         if new_name.lower() != name.lower():
             clash = conn.execute(
                 "SELECT 1 FROM categories WHERE name = ? COLLATE NOCASE", (new_name,)
             ).fetchone()
             if clash:
-                self._send_json({"error": f"category {new_name!r} already exists"}, status=409)
+                self._send_problem(
+                    f"You already have a category called \u201c{new_name}\u201d.",
+                    "Pick a different name \u2014 two categories with the same "
+                    "name would split your hours between them.", status=409)
                 return
 
         description = body["description"].strip() if "description" in body else row["description"]

@@ -365,3 +365,143 @@ detection stops the logging), posts nothing.
 - **Start at a $0 pledge** and run `BEEMINDER_DRY_RUN=1` (or watch the goal
   flat) for a week or two, comparing what gets pushed against the dashboard,
   before letting a derail cost anything. Keep a week of safety buffer.
+
+## Weekly email report (optional)
+
+Once a week the monitor totals the last seven days and mails them to whoever
+you name — productive hours, the productivity rate, the split by category,
+each day's line, and every focus session declared and finished. You, a parent,
+a study partner, a coach: anyone who should be reading the same numbers you
+are. It is off until you configure it, and everything it needs lives in the
+`.env` on the machine running the monitor.
+
+### Setup
+
+The card on the dashboard's Overview tab is the whole setup: enter the
+recipients, pick your mail provider, paste an app password, choose a day and
+an hour. Nothing is written until the monitor has logged in to the mail
+server, so a wrong password comes back in plain words rather than as a silent
+Monday with no mail. "Send a copy now" ticks by default so you see the first
+one immediately.
+
+For **Gmail**, the password field wants an
+[app password](https://myaccount.google.com/apppasswords) — sixteen characters
+from Google, not your account password, and it needs 2-Step Verification
+turned on. Outlook and iCloud are the same story under different names. Any
+other SMTP server works if you know its host, port and encryption.
+
+Hand-editing the `.env` does the same job:
+
+```
+REPORT_EMAIL_TO=mum@example.com, me@example.com
+REPORT_SMTP_HOST=smtp.gmail.com
+REPORT_SMTP_PORT=587
+REPORT_SMTP_USER=me@example.com
+REPORT_SMTP_PASSWORD="abcd efgh ijkl mnop"
+REPORT_EMAIL_FROM=me@example.com
+REPORT_DAY=mon
+REPORT_HOUR=9
+```
+
+Recipients are comma-separated and all of them go in the `To:` header, so they
+can see each other's addresses. The card also offers **Preview** (the report
+for the last seven days, in a browser tab, without sending anything) and
+**Send now**.
+
+### Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REPORT_EMAIL_TO` | — | Recipients, comma-separated. Required; the report is off without it. Max 20. |
+| `REPORT_SMTP_HOST` | — | Mail server. Required. |
+| `REPORT_SMTP_PORT` | `587` | Mail server port |
+| `REPORT_SMTP_USER` | — | Login for the mail server. Blank for an open relay. |
+| `REPORT_SMTP_PASSWORD` | — | App password. Quote it if it contains spaces. |
+| `REPORT_EMAIL_FROM` | the SMTP user | `From:` address |
+| `REPORT_SMTP_SECURITY` | `starttls` (`ssl` on port 465) | `starttls`, `ssl` or `none` |
+| `REPORT_DAY` | `mon` | Day to send on — `mon`…`sun`, or `0`…`6` |
+| `REPORT_HOUR` | `9` | Hour to send at, 0–23, local time |
+| `REPORT_TIMEOUT_SEC` | `30` | Per-connection timeout |
+
+### When it actually sends
+
+The exe is not reliably awake at nine on a Monday, so the schedule is
+catch-up based rather than alarm-based. A background thread wakes every
+fifteen minutes, works out the most recent send time that has passed, and
+sends the week ending the day before it if that slot has not been covered yet.
+A machine asleep through the slot sends when it wakes. A machine off for a
+fortnight sends **once**, for the latest week, not twice. The marker lives in
+the local database, so restarting never re-sends, and a failed send is retried
+an hour later rather than immediately.
+
+Switching the report on does not mail you last week a minute later: the slot
+that has already passed is marked settled, and the first real report goes at
+the next one. Use "Send now" if you want one sooner. Turning the report off
+forgets that marker too, so switching it back on months later starts fresh
+instead of posting a stale week.
+
+None of this is on the critical path. A mail server that is down prints,
+shows the reason on the dashboard card, and is retried; nothing about the
+monitoring, the classification or the Beeminder push depends on it.
+
+### The numbers are the ones Beeminder gets
+
+The report does not compute anything of its own. Every hour in it comes out
+of `beeminder.label_rows` / `bucket` — the same two functions the datapoint
+push totals through — so the figure in your inbox is the figure on the goal.
+A human correction beats the classifier, off-intent work during a session is
+off-task, a neutral category is productive only while declared, and a session
+needs ten logged minutes before it counts as one. Relabel a day in the review
+tab and next week's mail says the new thing about it.
+
+The one place the report reads differently from a Beeminder datapoint is the
+*rate*: it is productive time over **all** time at the screen, Ambiguous and
+System included in the denominator, which is how the dashboard's Today card
+reads it. Beeminder is only ever sent the numerator.
+
+## How errors are written
+
+Every failure a user can see is two sentences: **what happened**, and **what to
+do about it**. The second half is not optional — a message that only says
+something broke tells someone their evening is ruined and leaves them to guess.
+
+```
+Gmail wouldn't accept that password.
+Gmail needs a 16-character app password here, not the password you sign in
+with. Make one at myaccount.google.com/apppasswords — you'll need 2-Step
+Verification turned on first.
+```
+
+`monitor/problems.py` holds the vocabulary. `Problem(message, fix)` is a string
+subclass whose value is the two joined, so it drops into any caller that wanted
+a plain message — printing, logging, `"app password" in problem` — while the
+halves stay reachable for the dashboard, which sets the fix in its own quieter
+line (`src/components/ErrorNote.jsx`). `UserError` is the ValueError that
+carries one, for validation raised down in `intentions.py`, `breaks.py` and
+friends and caught up in the API.
+
+Three rules, and two tests that enforce them:
+
+1. **Name what they typed, not what the field is called.** "The report needs to
+   know which mail server to send through", never "smtp_host is required".
+   Nobody chose the variable name.
+2. **Say who is refusing.** "Gmail wouldn't accept that password" puts the
+   refusal where it belongs; "SMTPAuthenticationError" blames the void.
+3. **The fix is an action.** "Use 587 for STARTTLS or 465 for SSL/TLS" beats
+   "invalid port for the selected security mode".
+
+Every API rejection answers `{"error", "fix"}`.
+`test_every_rejection_says_what_to_do_about_it` walks the whole POST surface
+with bad input and fails if any 4xx comes back without a fix;
+`test_no_rejection_leaks_python_at_the_reader` fails if one leaks a field name,
+an exception class or a traceback. Adding an endpoint means adding its
+rejections to that list.
+
+Where the cause is genuinely unknown — an exception nobody predicted escaping a
+handler — `problems.unexpected()` says what was being attempted and points at
+`cft.log`. Knowing where to look is still an action; "Internal Server Error" is
+not. The raw exception text rides inside the fix, never on its own.
+
+Console logs are exempt. Boot timings and `[tray]` diagnostics are read by
+whoever is debugging the monitor, not by the person using it, and rewriting
+them as prose would make cft.log worse rather than better.
