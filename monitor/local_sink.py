@@ -111,6 +111,14 @@ class LocalSink:
                     self._conn.execute(f"ALTER TABLE focus_logs ADD COLUMN {col} {typ}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
+            # After the column exists (older databases only gain it just
+            # above). Every per-session read — the forest's /api/sessions,
+            # Beeminder's session totals — groups focus_logs by intention_id,
+            # and without this each one scanned the whole table.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_focus_intention "
+                "ON focus_logs(intention_id) WHERE intention_id IS NOT NULL"
+            )
             # Error verdicts are transient noise; sweep any that made it in
             # (e.g. rows written by older builds).
             purged = self._conn.execute(

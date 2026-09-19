@@ -112,11 +112,15 @@ def open_dashboard(url: str, *, raise_existing: bool = True) -> str:
     return "opened"
 
 
-def open_dashboard_if_absent(url: str, *, grace_sec: float = 20.0) -> str:
+def open_dashboard_if_absent(url: str, *, grace_sec: float = 5.0) -> str:
     """Startup path: open the dashboard only if one isn't already open.
 
     Waits up to grace_sec for an existing page to poll the API — a pinned or
-    background tab announces itself that way and nothing else does. Never
+    background tab announces itself that way and nothing else does. A page
+    that has lost the monitor probes for it every 2s (focus-dashboard's
+    useMonitorLive), so 5s is a couple of probes plus slack; it used to be
+    20s, sized for the page's 15s idle poll, and that was most of the wait
+    between the timer card appearing and the dashboard doing so. Never
     raises a window: stealing focus on every logon would be worse than the
     stray tab this avoids.
     """
@@ -129,7 +133,7 @@ def open_dashboard_if_absent(url: str, *, grace_sec: float = 20.0) -> str:
             return "already-open"
         if time.time() >= deadline:
             break
-        time.sleep(1.0)
+        time.sleep(0.5)
     webbrowser.open(url)
     print(f"[browser] opened dashboard: {url}")
     return "opened"

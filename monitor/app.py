@@ -2,21 +2,54 @@
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
+from typing import Optional
 
 from monitor.config import Settings, load_settings
 from monitor.creds import load_env, configure_llm
-from monitor.decider import set_llm_client
-from monitor.supabase_sink import SupabaseSink, NullSink
 from monitor.sources import make_sources
 from monitor.alerts import show_popup
-from monitor.runner import run_monitor_loop
+
+# NOT imported here: monitor.decider (pulls in the openai package),
+# monitor.supabase_sink (the supabase package) and monitor.runner (decider
+# again). Together they are most of the exe's import time, and nothing the
+# user sees first — the timer card, the tray, the local API — needs any of
+# them. They are imported inside the init threads below, so their cost
+# overlaps the UI coming up instead of preceding it.
+
+
+def _process_age() -> Optional[float]:
+    """Seconds since this process was created, or None where unknown.
+
+    The boot log otherwise starts at run(); the exe's own bootstrap and the
+    package imports before it are invisible, and they are the first thing the
+    user waits through. Windows only — it is the only platform the exe ships
+    on.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel32.GetProcessTimes(kernel32.GetCurrentProcess(),
+                                        ctypes.byref(created), ctypes.byref(exited),
+                                        ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        # FILETIME: 100ns ticks since 1601-01-01; 11644473600s to the epoch.
+        return time.time() - (ticks / 1e7 - 11644473600.0)
+    except Exception:
+        return None
 
 
 def _llm_init(box: dict) -> None:
     t = time.time()
     try:
+        from monitor.decider import set_llm_client
         client, provider = configure_llm()
         set_llm_client(client)
         box["provider"] = provider
@@ -41,6 +74,7 @@ def _choose_storage() -> str:
 
 def _make_live_sink(settings: Settings):
     if _choose_storage() == "supabase":
+        from monitor.supabase_sink import SupabaseSink
         return SupabaseSink(settings=settings)
     from monitor.local_sink import LocalSink
     local = LocalSink(settings=settings)
@@ -49,6 +83,7 @@ def _make_live_sink(settings: Settings):
     if supa_mirror.enabled():
         try:
             from monitor.dual_sink import DualSink
+            from monitor.supabase_sink import SupabaseSink
             print("[boot] Supabase mirroring ON (local is primary)")
             return DualSink(local, SupabaseSink(settings=settings))
         except Exception as e:
@@ -65,6 +100,7 @@ def _storage_init(box: dict, settings: Settings, *, want_writes: bool) -> None:
             box["backend"] = _choose_storage()
         else:
             # trace/testing: no writes; read categories from Supabase if configured
+            from monitor.supabase_sink import SupabaseSink, NullSink
             try:
                 sink = NullSink(read_sink=SupabaseSink(settings=settings))
             except Exception:
@@ -201,7 +237,12 @@ def run_dashboard_only() -> None:
 
 def run(settings: Settings | None = None) -> None:
     boot_start = time.time()
+    age = _process_age()
     print(f"\n{'='*50}\n  project-cft starting up...\n{'='*50}\n")
+    if age is not None:
+        # Everything before this line — the exe unpacking itself, the
+        # package imports, run.py's mirror kick-off — happened in silence.
+        print(f"[boot] process age at run()         {age:.2f}s")
 
     t = time.time()
     load_env(override=True)
@@ -222,6 +263,21 @@ def run(settings: Settings | None = None) -> None:
     llm_thread.start()
     supabase_thread.start()
     print("[boot] llm + storage init dispatched in background...")
+
+    # --- Tray + timer card + local dashboard (live mode only) ---
+    # First, not last: none of it needs the LLM client or the sink. The card
+    # sliding out is how the user knows the monitor started, and the local
+    # API answering is what tells an open dashboard tab to stop showing the
+    # "isn't running" banner — both used to wait behind the storage preload
+    # and, on a slow morning, the whole network round trip to Supabase.
+    shutdown = threading.Event()
+    tray_icon = None
+    if not testing_mode:
+        t = time.time()
+        tray_icon = _start_tray(settings, shutdown)
+        _start_beeminder(shutdown)
+        _start_email_report(shutdown)
+        print(f"[boot] ui + local api               {time.time() - t:.2f}s")
 
     # --- Cheap main-thread work while those run ---
     t = time.time()
@@ -250,16 +306,9 @@ def run(settings: Settings | None = None) -> None:
     print(f"[boot] storage ({supabase_box.get('backend','?')}) + reads     {supabase_box['elapsed']:.2f}s  "
           f"(cats={len(supabase_box['categories'])} corrections={len(supabase_box['corrections'])} priors={len(supabase_box['prior_classifications'])})")
 
-    # --- Tray + local dashboard (live mode only) ---
-    shutdown = threading.Event()
-    tray_icon = None
-    if not testing_mode:
-        tray_icon = _start_tray(settings, shutdown)
-        _start_beeminder(shutdown)
-        _start_email_report(shutdown)
-
     print(f"\n[boot] === INIT COMPLETE in {time.time() - boot_start:.2f}s ===\n")
 
+    from monitor.runner import run_monitor_loop
     try:
         run_monitor_loop(
             event_src=event_src,

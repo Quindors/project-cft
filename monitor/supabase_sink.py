@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import os
 from dataclasses import dataclass
@@ -100,8 +101,13 @@ class SupabaseSink:
         self.last_flush_time = time.time()
         self._categories_cache: Optional[List[Dict]] = None
 
-        # Sweep transient error verdicts left by older builds. Best-effort:
-        # a failed purge should never block startup.
+        # Sweep transient error verdicts left by older builds. Best-effort,
+        # and off the boot path: this is a network round trip, and the
+        # storage preload (and so the first decision) used to wait on it.
+        threading.Thread(target=self._purge_error_rows, daemon=True,
+                         name="supabase-purge").start()
+
+    def _purge_error_rows(self) -> None:
         try:
             res = (self.sb.table("focus_logs").delete()
                    .in_("category_name", ["[ERROR]", "[PARSE_ERROR]"])
