@@ -137,6 +137,47 @@ def parse_recipients(raw) -> List[str]:
     return out
 
 
+# Providers print app passwords in groups of four so they can be read aloud:
+# Google's "abcd efgh ijkl mnop" is really sixteen characters. The grouping is
+# decoration, and nothing on the page that hands it to you says so - so the
+# spaces come off here rather than being a rule the user has to know.
+#
+# Deliberately narrow. Only evenly-grouped alphanumerics are unspaced; a real
+# passphrase with spaces in it ("correct horse battery staple") has uneven
+# words and is left exactly as typed, because for a custom mail server those
+# spaces may well be part of the secret.
+_GROUPED_SECRET = re.compile(r"^[A-Za-z0-9]{4}(?: [A-Za-z0-9]{4})+$")
+
+
+def parse_app_password(raw) -> str:
+    """An app password as the provider printed it, as the server wants it."""
+    value = str(raw if raw is not None else "").strip()
+    # Tabs and non-breaking spaces ride along with a copy-paste too.
+    collapsed = re.sub(r"\s+", " ", value)
+    if _GROUPED_SECRET.match(collapsed):
+        return collapsed.replace(" ", "")
+    return value
+
+
+def parse_sender(raw, *, field: str = "Send from") -> str:
+    """The From address, checked the same way recipients are.
+
+    The SMTP login never looks at this value, so an unchecked one passes
+    every setup check and fails at the first real send - after the settings
+    have been written. Checking it here keeps the failure where the typo is.
+    """
+    addr = str(raw if raw is not None else "").strip()
+    if not addr:
+        return ""
+    if not _ADDR_RE.match(addr):
+        raise UserError(
+            f"\u201c{addr}\u201d isn't an email address, so the report has "
+            f"nowhere to send from.",
+            f"Put the address the mail should come from in \u201c{field}\u201d "
+            f"\u2014 usually the same one you log in to the mail server with.")
+    return addr
+
+
 def parse_day(raw) -> int:
     """'mon' / 'Monday' / 0 -> 0. Raises ValueError on anything else."""
     s = str(raw if raw is not None else "").strip().lower()
@@ -219,10 +260,12 @@ def config() -> Config:
         smtp_host=_env("REPORT_SMTP_HOST"),
         smtp_port=port,
         smtp_user=user,
-        smtp_password=_env("REPORT_SMTP_PASSWORD"),
+        smtp_password=parse_app_password(_env("REPORT_SMTP_PASSWORD")),
         # The From address: explicit, else the login (what Gmail will stamp
-        # on it anyway).
-        sender=_env("REPORT_EMAIL_FROM") or user,
+        # on it anyway). A hand-edited .env with a bad one is reported and
+        # dropped rather than carried into every send.
+        sender=_lenient(parse_sender, _env("REPORT_EMAIL_FROM"), "",
+                        "REPORT_EMAIL_FROM") or user,
         security=security,
         day=_lenient(parse_day, _env("REPORT_DAY"), 0, "REPORT_DAY"),
         hour=_lenient(parse_hour, _env("REPORT_HOUR"), 9, "REPORT_HOUR"),
@@ -526,12 +569,42 @@ def _delta_sentence(report: Report) -> str:
     return "That is " + " and ".join(parts) + "."
 
 
+# Where the "these people have been introduced" list lives.
+INTRODUCED_KEY = "email_report_introduced"
+
+
+def unsubscribe_note(cfg: Config) -> str:
+    """Why this arrived and how to make it stop, in two sentences.
+
+    It names the sender's address rather than a name because that is the only
+    identity this app actually knows - and it is the address a reply reaches,
+    which is the whole point.
+    """
+    who = cfg.sender or "the person who set this up"
+    return (f"You are getting this because {who} set up a weekly focus report "
+            f"and added your address. Reply to this email and they will stop "
+            f"sending it.")
+
+
+def _unsubscribe_header(cfg: Config) -> str:
+    """RFC 2369 List-Unsubscribe, as a mailto.
+
+    Gmail and Apple Mail render their own Unsubscribe control from this. A
+    mailto rather than a link on purpose: the monitor is a desktop app that
+    is off half the time, so a URL into it would be dead more often than not.
+    The reply lands in the sender's inbox, which is always there.
+    """
+    target = cfg.sender or cfg.smtp_user
+    return f"<mailto:{target}?subject=Unsubscribe%20from%20the%20focus%20report>"
+
+
 def subject(report: Report) -> str:
     return (f"Focus report {_range_label(report)}: {_hours(report.productive_sec)} productive"
             + (f" ({report.pct}%)" if report.pct is not None else ""))
 
 
-def render_text(report: Report) -> str:
+def render_text(report: Report, cfg: Optional[Config] = None) -> str:
+    cfg = cfg or config()
     L: List[str] = []
     L.append(f"FOCUS REPORT  {_range_label(report)}, {report.start.year}")
     L.append("=" * 48)
@@ -581,6 +654,9 @@ def render_text(report: Report) -> str:
     L.append("How this is counted: each logged row is one decision interval at the")
     L.append("screen; a row is productive when its category is, or when it was the")
     L.append("declared work of a session. Corrections made in the review tab count.")
+    L.append("")
+    L.append("-- ")
+    L.append(unsubscribe_note(cfg))
     L.append(f"Sent by the cft monitor at {report.generated_at}.")
     return "\n".join(L) + "\n"
 
@@ -599,7 +675,8 @@ def _bar(pct: Optional[int], color: str = "#10b981") -> str:
             f'<div style="background:{color};border-radius:4px;height:8px;width:{width}%;"></div></div>')
 
 
-def render_html(report: Report) -> str:
+def render_html(report: Report, cfg: Optional[Config] = None) -> str:
+    cfg = cfg or config()
     e = html.escape
     tiles = [
         ("Productive time", _hm(report.productive_sec), "#059669"),
@@ -713,7 +790,9 @@ def render_html(report: Report) -> str:
   <p style="{_CSS_MUTED}line-height:1.5;">How this is counted: each logged row is one decision interval at the screen.
      A row is productive when its category is, or when it was the declared work of a focus session
      (a neutral category counts only while declared); real work done off-intent during a session is off-task.
-     Corrections made in the dashboard's review tab are reflected here.
+     Corrections made in the dashboard's review tab are reflected here.</p>
+  <p style="{_CSS_MUTED}line-height:1.5;border-top:1px solid #e2e8f0;padding-top:12px;">
+     {e(unsubscribe_note(cfg))}<br>
      Sent by the cft monitor at {e(report.generated_at)}.</p>
 </div>
 </body></html>
@@ -855,10 +934,155 @@ def compose(report: Report, cfg: Config) -> EmailMessage:
     msg["From"] = cfg.sender
     msg["To"] = ", ".join(cfg.to)
     msg["Message-ID"] = make_msgid(domain="cft.local")
-    msg.set_content(render_text(report))
-    msg.add_alternative(render_html(report), subtype="html")
+    msg["List-Unsubscribe"] = _unsubscribe_header(cfg)
+    msg.set_content(render_text(report, cfg))
+    msg.add_alternative(render_html(report, cfg), subtype="html")
     return msg
 
+
+# ------------------- the introduction -------------------
+
+def intro_subject(cfg: Config) -> str:
+    return f"{cfg.sender} would like to send you a weekly focus report"
+
+
+def render_intro_text(cfg: Config) -> str:
+    when = f"{DAY_NAMES[cfg.day]}s at {cfg.hour:02d}:00"
+    return (
+        f"Hello,\n\n"
+        f"{cfg.sender} uses an app called cft that keeps track of how their "
+        f"time at the computer is spent, and has set it up to send you a "
+        f"summary once a week.\n\n"
+        f"Each one is a single page: how many hours were productive, what "
+        f"share of the time that was, a line for each day, and the focus "
+        f"sessions they set themselves. Nothing else from their machine is "
+        f"shared, and nothing is asked of you.\n\n"
+        f"They go out on {when}, starting with the next one.\n\n"
+        f"If you would rather not have them, reply to this email and say so. "
+        f"It goes straight to {cfg.sender} \u2014 there is no service in the "
+        f"middle and no account to cancel.\n"
+    )
+
+
+def render_intro_html(cfg: Config) -> str:
+    e = html.escape
+    when = f"{DAY_NAMES[cfg.day]}s at {cfg.hour:02d}:00"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{e(intro_subject(cfg))}</title></head>
+<body style="margin:0;padding:24px;background:#f8fafc;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#0f172a;">
+<div style="max-width:560px;margin:0 auto;">
+  <div style="{_CSS_CARD}">
+    <p style="margin:0 0 12px 0;font-size:15px;">Hello,</p>
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#334155;">
+      <b>{e(cfg.sender)}</b> uses an app called cft that keeps track of how
+      their time at the computer is spent, and has set it up to send you a
+      summary once a week.
+    </p>
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#334155;">
+      Each one is a single page: how many hours were productive, what share of
+      the time that was, a line for each day, and the focus sessions they set
+      themselves. Nothing else from their machine is shared, and nothing is
+      asked of you.
+    </p>
+    <p style="margin:0 0 12px 0;font-size:14px;line-height:1.6;color:#334155;">
+      They go out on <b>{e(when)}</b>, starting with the next one.
+    </p>
+    <p style="margin:0;font-size:14px;line-height:1.6;color:#334155;">
+      If you would rather not have them, just reply to this email and say so.
+      It goes straight to {e(cfg.sender)} \u2014 there is no service in the
+      middle and no account to cancel.
+    </p>
+  </div>
+  <p style="{_CSS_MUTED}line-height:1.5;">Sent by the cft monitor on
+     {e(datetime.now().strftime(_TS_FMT))}.</p>
+</div>
+</body></html>
+"""
+
+
+def compose_intro(cfg: Config, to) -> EmailMessage:
+    msg = EmailMessage()
+    msg["Subject"] = intro_subject(cfg)
+    msg["From"] = cfg.sender
+    msg["To"] = ", ".join(to)
+    msg["Message-ID"] = make_msgid(domain="cft.local")
+    msg["List-Unsubscribe"] = _unsubscribe_header(cfg)
+    msg.set_content(render_intro_text(cfg))
+    msg.add_alternative(render_intro_html(cfg), subtype="html")
+    return msg
+
+
+def introduced() -> set:
+    """Addresses that have already had an introduction, lowercased."""
+    try:
+        raw = app_state.get_value(INTRODUCED_KEY)
+    except sqlite3.Error:
+        return set()
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return set()
+    return {str(a).lower() for a in data} if isinstance(data, list) else set()
+
+
+def _mark_introduced(addresses) -> None:
+    try:
+        app_state.set_value(INTRODUCED_KEY, json.dumps(
+            sorted(introduced() | {str(a).lower() for a in addresses})))
+    except sqlite3.Error as e:
+        print(f"[report] couldn't remember who has been introduced ({e})")
+
+
+def forget_introductions() -> None:
+    try:
+        app_state.delete_value(INTRODUCED_KEY)
+    except sqlite3.Error:
+        pass
+
+
+def newcomers(cfg: Optional[Config] = None) -> List[str]:
+    """Recipients who have never been written to."""
+    cfg = cfg or config()
+    seen = introduced()
+    return [a for a in cfg.to if a.lower() not in seen]
+
+
+def send_introductions(cfg: Optional[Config] = None) -> Optional[Problem]:
+    """Introduce whoever is new, once. Returns None when there is nothing to
+    do or it worked, else the problem.
+
+    Sent when an address is added rather than at the first report, so the
+    first thing a stranger reads is why they are hearing from anyone at all.
+    A failure here is not fatal to the setup: the settings are already saved
+    and the weekly report will still go.
+    """
+    cfg = cfg or config()
+    if not enabled(cfg):
+        return None
+    fresh = newcomers(cfg)
+    if not fresh:
+        return None
+    try:
+        server = _open_smtp(cfg)
+        try:
+            server.send_message(compose_intro(cfg, fresh))
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+    except Exception as err:
+        problem = _problem(err, cfg)
+        print(f"[report] could not introduce {', '.join(fresh)}: {problem}")
+        return problem
+    print(f"[report] introduced {', '.join(fresh)}")
+    _mark_introduced(fresh)
+    return None
+
+
+# ------------------- sending the report itself -------------------
 
 def send_report(report: Report, *, cfg: Optional[Config] = None,
                 record: bool = True) -> Optional[Problem]:
