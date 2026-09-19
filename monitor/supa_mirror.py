@@ -96,7 +96,8 @@ def mirror_correction_rows(changes) -> None:
     _run_async("correction-rule", op)
 
 
-_INTENTION_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status", "llm_category")
+_INTENTION_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status",
+                   "llm_category", "project_id")
 
 
 def _intention_payload(row) -> dict:
@@ -127,6 +128,50 @@ def mirror_intentions(rows) -> None:
             sb.table("intentions").upsert(payloads[i:i + 500], on_conflict="id").execute()
 
     _run_async(f"intentions-backfill({len(payloads)})", op)
+
+
+_PROJECT_COLS = ("id", "name", "description", "category", "status", "created_at", "archived_at")
+
+
+def _project_payload(row) -> dict:
+    return {k: row.get(k) for k in _PROJECT_COLS}
+
+
+def mirror_project(row) -> None:
+    """Upsert one project by its local id."""
+    if not enabled():
+        return
+    payload = _project_payload(row)
+
+    def op(sb):
+        sb.table("projects").upsert(payload, on_conflict="id").execute()
+
+    _run_async(f"project-{payload['id']}", op)
+
+
+def mirror_projects(rows) -> None:
+    """Bulk upsert — the startup backfill, idempotent like the intentions'."""
+    if not enabled() or not rows:
+        return
+    payloads = [_project_payload(r) for r in rows]
+
+    def op(sb):
+        for i in range(0, len(payloads), 500):
+            sb.table("projects").upsert(payloads[i:i + 500], on_conflict="id").execute()
+
+    _run_async(f"projects-backfill({len(payloads)})", op)
+
+
+def mirror_project_delete(project_id: int) -> None:
+    """A deleted project is gone from the cloud too: unlike categories, a
+    project row is a label, not history, so there is nothing to reassign."""
+    if not enabled():
+        return
+
+    def op(sb):
+        sb.table("projects").delete().eq("id", project_id).execute()
+
+    _run_async(f"project-delete-{project_id}", op)
 
 
 def mirror_category_add(name: str, description: str, is_productive) -> None:

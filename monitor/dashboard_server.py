@@ -70,6 +70,9 @@ Endpoints:
                                    when the credentials don't check out
     POST /api/beeminder/live    -> leaves dry-run mode (BEEMINDER_DRY_RUN=0)
     POST /api/beeminder/disconnect -> blanks the Beeminder credentials
+    POST /api/email-report      -> also answers {introduced: [...]}, the
+                                   addresses that were sent a one-off
+                                   introduction because they were new
     GET  /api/email-report      -> {configured, recipients, smtp_host, smtp_port,
                                     smtp_user, security, sender, day, hour,
                                     next_send, pending, last_sent, last_attempt,
@@ -118,7 +121,21 @@ Endpoints:
                                    never be reassigned into a productive one —
                                    that would retroactively count them as
                                    focused time
-    POST /api/intention         -> {text, duration_min, category?, confirm?}
+    GET  /api/projects          -> [{id, name, description, category, status,
+                                     created_at, archived_at, sessions, minutes}]
+                                   active projects (?all=1 adds archived ones)
+    POST /api/project           -> {name, description?, category?} adds a
+                                   project; the category, if given, must be a
+                                   real one that isn't marked unproductive
+    POST /api/project/update    -> {id, name?, description?, category?,
+                                   archived?} edits a project (category null
+                                   clears it; archived hides it from pickers)
+    POST /api/project/delete    -> {id} removes a project; its sessions stay,
+                                   with no project
+    POST /api/sessions/project  -> {id, project_id|null} files a finished
+                                   session under a project
+    POST /api/intention         -> {text, duration_min, category?, confirm?,
+                                   project_id?}
                                    starts a session intention (supersedes any
                                    active one). category is the user's pick:
                                    validated against the real categories (400
@@ -178,6 +195,7 @@ from monitor.paths import resource_path, data_dir
 from monitor.local_sink import CORRECTIONS_DAYS_BACK, _normalize_title
 from monitor import supa_mirror
 from monitor import intentions
+from monitor import projects
 from monitor import app_state
 from monitor import breaks
 from monitor import status as status_store
@@ -269,22 +287,43 @@ def _finished_sessions(conn, limit: int) -> list:
     still knows what it was, and a session declared as one thing but spent
     on another shows both.
     """
+    out = None
     try:
         rows = conn.execute(
             "SELECT i.id, i.text, i.started_at, i.ended_at, "
-            "       i.status, i.llm_category, "
+            "       i.status, i.llm_category, i.project_id, "
+            "       p.name AS project_name, "
             "       AVG(f.align_score) AS avg_align "
             "FROM intentions i "
+            "LEFT JOIN projects p ON p.id = i.project_id "
             "LEFT JOIN focus_logs f ON f.intention_id = i.id "
             "WHERE i.status IN ('completed', 'expired') "
             "GROUP BY i.id ORDER BY i.started_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
+        out = [dict(r) for r in rows]
     except sqlite3.OperationalError:
-        # No intentions table yet (no session was ever declared):
-        # an empty forest, not an error.
-        return []
-    out = [dict(r) for r in rows]
+        # Sessions from before projects existed (no projects table, or no
+        # project_id column yet): the same forest, with nothing filed.
+        try:
+            rows = conn.execute(
+                "SELECT i.id, i.text, i.started_at, i.ended_at, "
+                "       i.status, i.llm_category, "
+                "       AVG(f.align_score) AS avg_align "
+                "FROM intentions i "
+                "LEFT JOIN focus_logs f ON f.intention_id = i.id "
+                "WHERE i.status IN ('completed', 'expired') "
+                "GROUP BY i.id ORDER BY i.started_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # No intentions table yet (no session was ever declared):
+            # an empty forest, not an error.
+            return []
+        out = [dict(r) for r in rows]
+        for s in out:
+            s["project_id"] = None
+            s["project_name"] = None
     for s in out:
         s["top_category"] = None
         s["top_share"] = None
@@ -423,6 +462,16 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                                  "default_min": breaks.DEFAULT_BREAK_MIN})
             except Exception as e:
                 self._send_unexpected(e, "loading your break")
+            return
+
+        # Projects manage their own table too (monitor/projects.py).
+        if u.path == "/api/projects":
+            try:
+                flag = (qs.get("all", [""])[0] or "").strip().lower()
+                self._send_json(projects.list_all(
+                    include_archived=flag not in ("", "0", "false", "no")))
+            except Exception as e:
+                self._send_unexpected(e, "loading your projects")
             return
 
         # Beeminder setup state, so the dashboard's setup card knows whether
@@ -587,6 +636,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
+            "/api/project": self._post_project_add,
+            "/api/project/update": self._post_project_update,
+            "/api/project/delete": self._post_project_delete,
             "/api/beeminder": self._post_beeminder,
             "/api/beeminder/live": self._post_beeminder_live,
             "/api/beeminder/disconnect": self._post_beeminder_disconnect,
@@ -601,6 +653,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/category/update": self._post_category_update,
             "/api/category/delete": self._post_category_delete,
             "/api/sessions/category": self._post_session_category,
+            "/api/sessions/project": self._post_session_project,
         }
         handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
@@ -660,7 +713,33 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # the gate then merely CHECKS it, and says so once (409) when it
         # disagrees — unless the caller already confirmed. Nothing here needs
         # the LLM, so a dead key can't leave a session uncategorized.
+        # A session may be filed under a project. The project's home
+        # category, if it has one, stands in for a pick the user didn't make
+        # \u2014 and goes through exactly the checks a hand pick does below.
+        project = None
+        raw_pid = body.get("project_id")
+        if raw_pid not in (None, "", 0, "0"):
+            project = projects.get(raw_pid)
+            if project is None:
+                self._send_problem(
+                    "That project isn't there any more.",
+                    "Refresh the page and pick again \u2014 it may have been "
+                    "deleted since the page loaded \u2014 or start the session "
+                    "without a project.", status=404)
+                return
+            if project["status"] != projects.STATUS_ACTIVE:
+                self._send_problem(
+                    f"\u201c{project['name']}\u201d is archived, so new sessions "
+                    f"can't be filed under it.",
+                    "Bring it back on the Projects tab first, or start the "
+                    "session without a project.", status=409)
+                return
+
         picked = (body.get("category") or "").strip() or None
+        from_project = False
+        if picked is None and project is not None and project.get("category"):
+            picked = project["category"]
+            from_project = True
         confirmed = bool(body.get("confirm"))
         chosen = None
         if picked:
@@ -674,11 +753,19 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     ).fetchone()
                 finally:
                     conn.close()
-            if row is None:
+            if from_project and (row is None or row["is_productive"] == 0):
+                # The project's category was deleted or marked unproductive
+                # since it was set. A standing pick that no longer holds is
+                # not the user's fault right now: the gate decides instead.
+                print(f"[gate] project {project['name']!r} names "
+                      f"{picked!r}, which no longer qualifies; letting the gate decide")
+                row = None
+                picked = None
+            elif row is None:
                 self._send_json(problems.unknown_category(picked, action="start").as_json(),
                                 status=400)
                 return
-            if row["is_productive"] == 0:
+            elif row["is_productive"] == 0:
                 self._send_json({
                     "error": (f"\u201c{row['name']}\u201d isn't something you "
                               f"can declare a focus session for."),
@@ -691,7 +778,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     "reason": "picked category is marked unproductive",
                 }, status=422)
                 return
-            chosen = row["name"]
+            if row is not None:
+                chosen = row["name"]
 
         # The intention itself must be work: "scroll twitter for an hour"
         # would make every drift check score scrolling as on-intent.
@@ -738,11 +826,123 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 return
 
         try:
-            active = intentions.start(text, duration_min, llm_category=chosen)
+            active = intentions.start(
+                text, duration_min, llm_category=chosen,
+                project_id=project["id"] if project is not None else None)
         except (ValueError, TypeError) as e:
             self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, "active": active})
+
+    # ---------- projects ----------
+
+    def _resolve_project_category(self, label):
+        """A project's home category is a standing pick, so it gets the same
+        checks a session's pick does: it must exist and must not be marked
+        unproductive. Returns (exact name or None, (error json, status) or None)."""
+        label = (label or "").strip()
+        if not label:
+            return None, None
+        row = None
+        conn = _db_ro()
+        if conn is not None:
+            try:
+                row = conn.execute(
+                    "SELECT name, is_productive FROM categories "
+                    "WHERE lower(name) = lower(?)", (label,)
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return None, (problems.unknown_category(label, action="use").as_json(), 400)
+        if row["is_productive"] == 0:
+            return None, ({
+                "error": (f"“{row['name']}” can't be a project's home "
+                          f"category."),
+                "fix": ("It's marked as time that doesn't count, and a "
+                        "project's sessions are meant to. Pick the category "
+                        "the project's work belongs in — or, if it really "
+                        "is work for you, change that on the Categories tab."),
+                "rejected": True,
+                "category": row["name"],
+            }, 422)
+        return row["name"], None
+
+    def _post_project_add(self, body) -> None:
+        category, err = self._resolve_project_category(body.get("category"))
+        if err is not None:
+            self._send_json(*err)
+            return
+        try:
+            row = projects.create(body.get("name"), body.get("description"), category)
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        self._send_json({"ok": True, "project": row})
+
+    def _post_project_update(self, body) -> None:
+        """Only the fields present in the body change, so the dashboard can
+        archive a project without resending its description."""
+        kw = {}
+        if "name" in body:
+            kw["name"] = body.get("name")
+        if "description" in body:
+            kw["description"] = body.get("description")
+        if "category" in body:
+            category, err = self._resolve_project_category(body.get("category"))
+            if err is not None:
+                self._send_json(*err)
+                return
+            kw["category"] = category
+        if "archived" in body:
+            kw["archived"] = bool(body.get("archived"))
+        try:
+            row = projects.update(body.get("id"), **kw)
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        self._send_json({"ok": True, "project": row})
+
+    def _post_project_delete(self, body) -> None:
+        try:
+            row = projects.delete(body.get("id"))
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        self._send_json({"ok": True, "deleted": row["name"],
+                         "unlinked_sessions": row["unlinked_sessions"]})
+
+    def _post_session_project(self, conn, body) -> None:
+        """File a finished session under a project, or take it out of one —
+        the forest's relabel card, for the project half."""
+        try:
+            sid = int(body.get("id"))
+        except (TypeError, ValueError):
+            self._send_problem(
+                "The dashboard didn't send everything needed for filing a session under a project.",
+                "Refresh the page and try again — this usually means the "
+                "page and the monitor are different versions.")
+            return
+        raw = body.get("project_id")
+        pid = None
+        if raw not in (None, ""):
+            target = projects.get(raw)
+            if target is None:
+                self._send_problem(
+                    "That project isn't there any more.",
+                    "Refresh the Forest tab and pick again — it may have "
+                    "been deleted since the page loaded.", status=404)
+                return
+            pid = target["id"]
+        row = intentions.set_project(sid, pid)
+        if row is None:
+            self._send_problem(
+                "That focus session isn't there any more.",
+                "Refresh the Forest tab — it may have been removed since "
+                "the page loaded, and a running session is filed when it "
+                "starts, not from here.", status=404)
+            return
+        self._send_json({"ok": True, "session": row})
 
     def _post_session_category(self, conn, body) -> None:
         """Relabel a finished session — the honest fix for the sessions the
@@ -938,6 +1138,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             to = email_report.parse_recipients(body.get("to"))
             day = email_report.parse_day(body.get("day", "mon"))
             hour = email_report.parse_hour(body.get("hour", 9))
+            # Checked here, not after the SMTP login: the login never looks at
+            # the From address, so an unchecked one would save cleanly and
+            # then fail at the first send.
+            given_sender = email_report.parse_sender(body.get("sender"))
         except ValueError as e:
             self._send_json(problems.body(e), status=400)
             return
@@ -965,11 +1169,19 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 "those cover almost every provider.")
             return
         user = str(body.get("smtp_user") or "").strip()
-        password = str(body.get("smtp_password") or "").strip()
+        password = email_report.parse_app_password(body.get("smtp_password"))
         current = email_report.config()
         if not password and user and user == current.smtp_user:
             password = current.smtp_password   # editing: keep the stored one
-        sender = str(body.get("sender") or "").strip() or user
+        sender = given_sender
+        if not sender and user:
+            # Falling back to the login only works if the login is an address,
+            # which it usually is but does not have to be.
+            try:
+                sender = email_report.parse_sender(user, field="Mail server username")
+            except ValueError as e:
+                self._send_json(problems.body(e), status=400)
+                return
         if not sender:
             self._send_problem(
                 "The report has no address to send from.",
@@ -1010,10 +1222,25 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
 
         email_report.reset_health()
         email_report.start_background_scheduler()
+
+        # Anyone added here has never heard of this app. They get a short note
+        # saying who set it up and that a reply stops it, before any of their
+        # data - well, somebody else's data - arrives. Introducing on ADD
+        # rather than at the first report means a stranger's first contact is
+        # a sentence from a person, not a page of statistics.
+        fresh = email_report.newcomers(cfg)
+        intro_problem = email_report.send_introductions(cfg) if fresh else None
+
         if body.get("send_test"):
             # Bounded wait so the answer already says whether it landed.
             email_report.send_now().join(timeout=cfg.timeout_sec + 5)
-        self._send_json({"ok": True, **email_report.status()})
+        answer = {"ok": True, **email_report.status(),
+                  "introduced": [] if intro_problem else fresh}
+        if intro_problem:
+            # The settings are saved and the weekly report will still go; only
+            # the courtesy note failed, so this is a note, not a rejection.
+            answer["intro_problem"] = problems.problem_for_status(intro_problem)
+        self._send_json(answer)
 
     def _post_email_report_send(self, body) -> None:
         """Mail the last seven days to the configured recipients now."""
@@ -1042,6 +1269,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             os.environ.pop(name, None)
             _persist_env_var(name, "")
         email_report.clear_marker()
+        email_report.forget_introductions()
         email_report.reset_health()
         self._send_json({"ok": True, **email_report.status()})
 
@@ -1333,10 +1561,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         moved += conn.execute(
             "UPDATE focus_logs SET human_label = ? WHERE human_label = ?", (target, name)
         ).rowcount
+        # A project whose home category this was is left without one: its
+        # next session goes through the gate like an unfiled one would.
+        dropped_projects = projects.cascade_category(conn, name, None)
         conn.execute("DELETE FROM categories WHERE name = ?", (name,))
         conn.commit()
 
         supa_mirror.mirror_category_delete(name, target)
+        projects.mirror_rows(dropped_projects)
         self._send_json({"ok": True, "deleted": name, "reassigned_to": target,
                          "moved_log_rows": moved})
 
@@ -1392,10 +1624,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 "UPDATE focus_logs SET human_label = ? WHERE human_label = ?",
                 (new_name, name),
             ).rowcount
+        renamed_projects = (
+            projects.cascade_category(conn, name, new_name) if new_name != name else []
+        )
         conn.commit()
         supa_mirror.mirror_category_update(
             name, new_name, description, None if productive is None else bool(productive)
         )
+        projects.mirror_rows(renamed_projects)
         self._send_json({"ok": True, "name": new_name, "renamed_log_rows": renamed_logs})
 
 
@@ -1451,7 +1687,10 @@ _INTENTION_PAGE_SRC = """<!doctype html>
   textarea { width: 100%; min-height: 74px; resize: vertical; font: inherit;
              padding: 11px 13px; border-radius: 12px; color: var(--ink);
              background: #0b111f; border: 1px solid var(--line); }
-  textarea:focus, input:focus { outline: none; border-color: #10b981; }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: #10b981; }
+  select { width: 100%; font: inherit; padding: 10px 13px; border-radius: 12px;
+           color: var(--ink); background: #0b111f; border: 1px solid var(--line);
+           margin-top: 14px; }
   .chips { display: flex; gap: 7px; flex-wrap: wrap; margin: 16px 0 0; }
   .chips button { padding: 7px 14px; border-radius: 999px; font: inherit;
                   font-size: .88rem; cursor: pointer; color: var(--muted);
@@ -1495,7 +1734,16 @@ const R = 46, CIRC = 2 * Math.PI * R;
 
 let duration = PRESETS[0];
 let snap = null;        // last /api/status payload
-let form = {text: '', custom: ''};   // survives re-renders
+let form = {text: '', custom: '', project: ''};   // survives re-renders
+let projectsList = [];  // active projects, for the picker
+
+async function loadProjects() {
+  try {
+    const r = await fetch('/api/projects');
+    const d = await r.json();
+    if (Array.isArray(d)) projectsList = d;
+  } catch { /* monitor unreachable — keep the last list */ }
+}
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 // Same, but safe to drop inside a quoted HTML attribute.
@@ -1598,6 +1846,8 @@ function render(force) {
       <div class="dial">${ring()}
         <div><div class="time">${fmt(left ?? 0)}</div>
              <div class="sub">${esc(snap.label)}</div></div></div>
+      ${snap.intention && snap.intention.project ? `<p class="note">Part of
+        <strong>${esc(snap.intention.project.name)}</strong>.</p>` : ''}
       ${snap.category ? `<p class="note">Currently reading as
         <strong>${esc(snap.category)}</strong>.</p>` : ''}
       <div class="row">
@@ -1616,6 +1866,13 @@ function render(force) {
     <label for="text">What are you working on?</label>
     <textarea id="text" maxlength="300" placeholder="e.g. finish the migration write-up"
               oninput="form.text = this.value">${esc(form.text)}</textarea>
+    ${projectsList.length ? `<select id="project" aria-label="Project"
+              onchange="form.project = this.value">
+      <option value="">No project</option>
+      ${projectsList.map(p => `<option value="${p.id}"
+          ${String(p.id) === String(form.project) ? 'selected' : ''}>${esc(p.name)}${
+          p.category ? ' · ' + esc(p.category) : ''}</option>`).join('')}
+    </select>` : ''}
     <div class="chips">
       ${PRESETS.map(m => `<button onclick="pick(${m})"
           class="${m === duration ? 'sel' : ''}">${m}m</button>`).join('')}
@@ -1667,8 +1924,12 @@ async function start() {
   }
   const text = fieldValue('text') || form.text;
   if (!text.trim()) { showError('Say what you intend to work on first.'); return; }
-  if (await post('/api/intention', {text, duration_min: mins})) {
-    form = {text: '', custom: ''};
+  const body = {text, duration_min: mins};
+  const project = fieldValue('project') || form.project;
+  if (project) body.project_id = Number(project);
+  if (await post('/api/intention', body)) {
+    // The project stays picked: the next session is usually the same work.
+    form = {text: '', custom: '', project};
   }
 }
 async function endSession(status) { await post('/api/intention/end', {status}); }
@@ -1700,7 +1961,8 @@ async function post(url, body) {
 // monitor every few seconds to pick up changes made in the tray or widget.
 setInterval(() => { if (snap && snap.ends_at) render(); }, 1000);
 setInterval(refresh, 5000);
-refresh();
+setInterval(loadProjects, 60000);
+loadProjects().then(refresh);
 </script>
 </body>
 </html>

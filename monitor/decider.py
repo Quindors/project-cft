@@ -364,6 +364,37 @@ def _build_fewshot_prompt(
     return "\n".join(all_lines) if all_lines else ""
 
 
+def _project_context(intention: Optional[Dict]) -> str:
+    """Prompt lines for the project a session is filed under, or "".
+
+    The project is context for CATEGORY only — screens about the project's
+    subject belong in its home category rather than a site's default one.
+    It never touches ALIGN: the declared intention is still the only thing
+    alignment is scored against, so other work on the same project scores
+    exactly as it would without the project.
+    """
+    p = (intention or {}).get("project") or {}
+    name = (p.get("name") or "").strip()
+    if not name:
+        return ""
+    lines = [f'This session is part of the project "{name}".']
+    desc = (p.get("description") or "").strip()
+    if desc:
+        lines.append(f"About the project: {desc}")
+    cat = (p.get("category") or "").strip()
+    if cat:
+        lines.append(
+            f'Work on this project belongs in the category "{cat}" — prefer it '
+            f"over a site's default category when what is on screen is plainly "
+            f"about this project.")
+    lines.append(
+        "The project is context for CATEGORY only. It never raises ALIGN: "
+        "alignment is still judged against the declared intention alone, and "
+        "work on this project that is not the declared intention scores as it "
+        "would without the project.")
+    return "\n".join(lines) + "\n"
+
+
 def _intention_block(intention: Dict) -> str:
     """Prompt section for an active session intention.
 
@@ -372,7 +403,8 @@ def _intention_block(intention: Dict) -> str:
     """
     return (
         f'ACTIVE FOCUS SESSION (until {intention["ends_at"]}):\n'
-        f'The user declared: "{intention["text"]}"\n\n'
+        f'The user declared: "{intention["text"]}"\n'
+        f'{_project_context(intention)}\n'
         "In addition to the category, judge how well the CURRENT WINDOW serves this "
         "declared session intention. Add ALIGN as an extra field placed BEFORE "
         "REASON, so REASON stays last:\n"
@@ -602,6 +634,7 @@ def ask_gpt_vision_verdict(
     if intention:
         intent_header = (
             f'\nACTIVE FOCUS SESSION — the user declared: "{intention["text"]}"\n'
+            f'{_project_context(intention)}'
         )
         align_field = " | ALIGN=<0.0-1.0>"
         intent_rules = f"""

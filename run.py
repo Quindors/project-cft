@@ -40,8 +40,9 @@ if __name__ == "__main__":
     # (mirror credentials, LLM key) has to be loaded first — nothing below
     # sees it otherwise, and a silent "mirroring disabled" is the result.
     try:
-        from monitor import creds, intentions
+        from monitor import creds, intentions, projects
         creds.load_env()
+        projects.mirror_all()   # before the sessions that point at them
         intentions.mirror_all()
         # Sessions from before the intention gate get classified the way new
         # ones are, in the background (one LLM call each). Frozen only: source

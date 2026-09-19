@@ -3,6 +3,11 @@
   "configurations": [
     {
       "name": "cft-mobile-web",
+      "url": "http://localhost:8081",
+      "port": 8081
+    },
+    {
+      "name": "cft-mobile-web-start",
       "runtimeExecutable": "wsl",
       "runtimeArgs": ["-d", "Ubuntu", "bash", "/home/abl96/projects/cft-mobile/scripts/web-dev.sh"],
       "port": 8081

@@ -181,7 +181,53 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE intentions ADD COLUMN llm_category TEXT")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # The project the session was declared under (monitor/projects.py), or
+    # NULL for a session that stands on its own.
+    try:
+        conn.execute("ALTER TABLE intentions ADD COLUMN project_id INTEGER")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     return conn
+
+
+def _attach_project(row: Dict) -> Dict:
+    """Hang the session's project (id, name, description, category) on the
+    row as `project`, or None. Read by the classifier prompt and the status
+    snapshot; the mirror whitelists its own columns, so it never ships."""
+    row["project"] = None
+    if row.get("project_id") is not None:
+        try:
+            from monitor import projects
+            p = projects.get(row["project_id"])
+        except Exception as e:
+            print(f"[intention] project lookup failed ({e})")
+            p = None
+        if p is not None:
+            row["project"] = {k: p.get(k) for k in ("id", "name", "description", "category")}
+    return row
+
+
+def set_project(intention_id: int, project_id: Optional[int]) -> Optional[Dict]:
+    """File a FINISHED session under a project (None takes it out of one).
+
+    Same shape as set_category: an active session's project is set at the
+    start; this is for the forest's relabel card. Returns the row or None
+    when no finished session has that id.
+    """
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE intentions SET project_id = ? "
+            "WHERE id = ? AND status IN ('completed', 'expired')",
+            (project_id, intention_id),
+        ).rowcount == 1
+        row = conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (intention_id,)
+        ).fetchone() if changed else None
+    if row is None:
+        return None
+    row = dict(row)
+    _mirror(row)
+    return _attach_project(row)
 
 
 def get_active() -> Optional[Dict]:
@@ -198,7 +244,7 @@ def get_active() -> Optional[Dict]:
         if row is None:
             return None
         if row["ends_at"] > _now_str():
-            return dict(row)
+            return _attach_project(dict(row))
         # Past due. `AND status = 'active'` makes the flip single-shot: of the
         # threads that raced to read this row, only one gets rowcount 1 and so
         # only one starts the break.
@@ -250,11 +296,14 @@ def validate(text: str, duration_min) -> tuple:
     return text, duration_min
 
 
-def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> Dict:
+def start(text: str, duration_min: int, llm_category: Optional[str] = None,
+          project_id: Optional[int] = None) -> Dict:
     """Start a session intention, superseding any currently active one.
 
     llm_category is the home category the intention gate mapped the declared
-    work to; None when the gate was skipped or could not tell.
+    work to; None when the gate was skipped or could not tell. project_id
+    files the session under a project (monitor/projects.py); the caller has
+    already checked the project exists and is active.
     """
     text, duration_min = validate(text, duration_min)
 
@@ -282,9 +331,9 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
             (started_at,),
         )
         cur = conn.execute(
-            "INSERT INTO intentions (text, started_at, ends_at, status, llm_category) "
-            "VALUES (?,?,?, 'active', ?)",
-            (text, started_at, ends_at, llm_category),
+            "INSERT INTO intentions (text, started_at, ends_at, status, llm_category, project_id) "
+            "VALUES (?,?,?, 'active', ?, ?)",
+            (text, started_at, ends_at, llm_category, project_id),
         )
         active = {
             "id": cur.lastrowid,
@@ -294,6 +343,7 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
             "ended_at": None,
             "status": "active",
             "llm_category": llm_category,
+            "project_id": project_id,
         }
 
     for row in superseded:
@@ -301,7 +351,7 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None) -> D
         row["ended_at"] = started_at
         _mirror(row)
     _mirror(active)
-    return active
+    return _attach_project(active)
 
 
 def pause_active() -> Dict:
