@@ -13,6 +13,15 @@
       "port": 8081
     },
     {
+      "name": "intention-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 ./venv/bin/python tests/e2e/serve.py"
+      ],
+      "port": 47997
+    },
+    {
       "name": "focus-dashboard",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
