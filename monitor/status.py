@@ -101,6 +101,7 @@ STATE_OFF = "off"            # not doing it
 STATE_SESSION = "session"    # session running, no verdict yet
 STATE_PAUSED = "paused"      # session frozen for a minute; nothing watched
 STATE_IDLE = "idle"          # no session running
+STATE_TRACKING = "tracking"  # tracker mode, no session: logging, never alerting
 STATE_AWAY = "away"          # no input at all; monitoring stood down
 
 
@@ -133,7 +134,14 @@ def full_snapshot() -> Dict[str, Any]:
         except Exception:
             active_intention = None
 
+    # Alert mode, and whether anything may interrupt right now: tracker mode
+    # silences everything but a session filed under a project.
+    from monitor import app_state
+    mode = app_state.get_mode()
+
     out: Dict[str, Any] = {
+        "mode": mode,
+        "alerts": app_state.alerts_on(mode, active_intention),
         "break": active_break,
         "intention": active_intention,
         "tier": snap.get("tier"),
@@ -183,12 +191,15 @@ def full_snapshot() -> Dict[str, Any]:
         )
     else:
         # No session means no ALIGN, so the only drift signal left is the
-        # plain productive/not verdict — and only while it is fresh.
+        # plain productive/not verdict — and only while it is fresh. In
+        # tracker mode there is no signal to give: the card is just logging.
         off_task = snap.get("is_productive") is False and not snap.get("stale")
+        tracking = not out["alerts"]
         out.update(
             phase=PHASE_IDLE,
-            state=STATE_OFF if off_task else STATE_IDLE,
-            label="Focus",
+            state=(STATE_TRACKING if tracking
+                   else STATE_OFF if off_task else STATE_IDLE),
+            label="Tracking" if tracking else "Focus",
             started_at=None,
             ends_at=None,
             remaining_sec=None,

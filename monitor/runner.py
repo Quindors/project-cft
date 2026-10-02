@@ -111,6 +111,8 @@ def _run_live_loop(
     drift_tier: Optional[str] = None
     drift_since: Optional[float] = None
     last_drift_alert: Optional[float] = None
+    # Alert mode as of the last decision, only so a switch is logged once.
+    current_alert_mode: Optional[str] = None
     # What earned the current streak. A drift alert may fire during a later
     # no-signal hold (a System window keeps the streak alive), and when it
     # does, the popup names this — never the System window in front.
@@ -393,7 +395,26 @@ def _run_live_loop(
                 user_present = (idle_sec is None
                                 or idle_sec <= settings.idle.alert_recent_input_sec)
 
-                if intention is not None:
+                # Alert mode (dashboard or tray, read every decision so a
+                # switch applies on the next one). Tracker mode silences
+                # everything except a session filed under a project. Logging
+                # above is untouched either way. While alerts are off the
+                # drift streak is not kept, so switching back to focus never
+                # fires an alert for drift that happened while silenced.
+                try:
+                    alert_mode = app_state.get_mode()
+                except Exception as e:
+                    print(f"[runner] alert mode lookup failed ({e}); alerting as usual")
+                    alert_mode = app_state.DEFAULT_MODE
+                if alert_mode != current_alert_mode:
+                    current_alert_mode = alert_mode
+                    print(f"[runner] alert mode -> {alert_mode}")
+                alerts_on = app_state.alerts_on(alert_mode, intention)
+
+                if intention is not None and not alerts_on:
+                    drift_tier, drift_since = None, None
+                    drift_category, drift_window = None, ""
+                elif intention is not None:
                     now_t = time.time()
                     drift_tier, drift_since = _update_drift(tier, drift_tier, drift_since, now_t)
                     if tier in (INTENT_OFF, INTENT_PARTIAL):
@@ -421,7 +442,7 @@ def _run_live_loop(
                                        on_correct=_intent_correction_hook(intention, drift_window))
                             last_drift_alert = now_t
                 elif (decision.get("final_is_productive") is False
-                      and settings.popup.enabled and user_present):
+                      and alerts_on and settings.popup.enabled and user_present):
                     cat_name = decision.get("final_category_name", "Unknown")
                     reason = decision.get("final_reason", "")
                     msg = f"Unproductive: {cat_name}" + (f"\n{reason}" if reason else "")

@@ -95,6 +95,7 @@ PALETTE = {
     status.STATE_PAUSED:   ("#38bdf8", "#0f1a22", "#0c4a6e"),
     status.STATE_SESSION:  ("#34d399", "#0f1c19", "#14532d"),
     status.STATE_IDLE:     ("#94a3b8", "#111827", "#1e293b"),
+    status.STATE_TRACKING: ("#64748b", "#111827", "#1e293b"),
     status.STATE_AWAY:     ("#475569", "#0f141c", "#1e293b"),
 }
 _FALLBACK = PALETTE[status.STATE_IDLE]
@@ -590,10 +591,15 @@ class _TimerWidget:
         later. The full-screen alert still waits for sustained drift — this is
         the early word, not the intervention.
         """
-        state = (self._snapshot or {}).get("state")
+        snap = self._snapshot or {}
+        state = snap.get("state")
         previous, self._last_state = self._last_state, state
         if state != status.STATE_OFF or previous == status.STATE_OFF:
             return  # not a fresh drift
+        # A peek is an interruption: tracker mode has none, except inside a
+        # project session. The tab still turns red — that is information.
+        if snap.get("alerts") is False:
+            return
         # Hidden means the user does not want to see it, and mid-drag or
         # mid-menu means they are already busy with the card.
         if self.hidden or self._anim or self._busy():

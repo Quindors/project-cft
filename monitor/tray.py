@@ -16,7 +16,7 @@ import threading
 import webbrowser
 from typing import Callable, Optional
 
-from monitor import breaks, browser, intentions, status, timer_widget
+from monitor import app_state, breaks, browser, intentions, status, timer_widget
 
 # Same palette as the timer widget, so tray and widget always agree.
 _STATE_COLORS = {
@@ -27,6 +27,7 @@ _STATE_COLORS = {
     status.STATE_BREAK:    (56, 189, 248),
     status.STATE_PAUSED:   (56, 189, 248),
     status.STATE_IDLE:     (148, 163, 184),
+    status.STATE_TRACKING: (100, 116, 139),
     status.STATE_AWAY:     (71, 85, 105),
 }
 _ICON_REFRESH_SEC = 5.0
@@ -138,6 +139,23 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
     def _toggle_widget(icon, item):
         timer_widget.toggle_hidden()
 
+    def _toggle_tracker(icon, item):
+        # Same switch as the dashboard's Focus/Tracker toggle; the runner
+        # reads it on its next decision.
+        try:
+            now = app_state.get_mode()
+            app_state.set_mode(app_state.MODE_FOCUS if now == app_state.MODE_TRACKER
+                               else app_state.MODE_TRACKER)
+            print(f"[tray] alert mode -> {app_state.get_mode()}")
+        except Exception as e:
+            print(f"[tray] could not switch alert mode ({e})")
+
+    def _is_tracker(item) -> bool:
+        try:
+            return app_state.get_mode() == app_state.MODE_TRACKER
+        except Exception:
+            return False
+
     def _reset_widget(icon, item):
         """Recovery for a timer that ended up somewhere unreachable."""
         timer_widget.reset_position()
@@ -164,6 +182,9 @@ def start_tray(dashboard_url: Optional[str], intention_url: Optional[str], on_qu
         # A pause renders as a session (phase), so End Break stays greyed out;
         # this is its counterpart, live only while a pause runs.
         pystray.MenuItem("Resume Paused Session", _end_break, enabled=_is_paused),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Tracker Mode (alerts only for projects)", _toggle_tracker,
+                         checked=_is_tracker),
         pystray.MenuItem("Show Timer", _toggle_widget,
                          checked=lambda item: not timer_widget.is_hidden()),
         pystray.MenuItem("Reset Timer Position", _reset_widget),

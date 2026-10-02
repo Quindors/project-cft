@@ -121,6 +121,12 @@ Endpoints:
                                    never be reassigned into a productive one —
                                    that would retroactively count them as
                                    focused time
+    GET  /api/mode              -> {mode}  ("focus" | "tracker")
+    POST /api/mode              -> {mode} switches the alert mode. Tracker logs
+                                   exactly as focus does but fires nothing,
+                                   except inside a session filed under a
+                                   project; the runner applies it on its next
+                                   decision
     GET  /api/projects          -> [{id, name, description, category, status,
                                      created_at, archived_at, sessions, minutes}]
                                    active projects (?all=1 adds archived ones)
@@ -464,6 +470,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_unexpected(e, "loading your break")
             return
 
+        # Alert mode lives in app_state, same on-demand DB pattern.
+        if u.path == "/api/mode":
+            try:
+                self._send_json({"mode": app_state.get_mode()})
+            except Exception as e:
+                self._send_unexpected(e, "loading the alert mode")
+            return
+
         # Projects manage their own table too (monitor/projects.py).
         if u.path == "/api/projects":
             try:
@@ -636,6 +650,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
+            "/api/mode": self._post_mode,
             "/api/project": self._post_project_add,
             "/api/project/update": self._post_project_update,
             "/api/project/delete": self._post_project_delete,
@@ -833,6 +848,18 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             self._send_json(problems.body(e), status=400)
             return
         self._send_json({"ok": True, "active": active})
+
+    def _post_mode(self, body) -> None:
+        """Switch between focus (alerts on) and tracker (logging only, but a
+        session filed under a project still alerts). The runner picks it up
+        on its next decision."""
+        try:
+            mode = app_state.set_mode(body.get("mode"))
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        print(f"[api] alert mode -> {mode}")
+        self._send_json({"ok": True, "mode": mode})
 
     # ---------- projects ----------
 

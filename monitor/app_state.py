@@ -61,3 +61,53 @@ def delete_value(key: str) -> bool:
     """Remove a key. True if a row was actually deleted (single-shot guard)."""
     with _connect() as conn:
         return conn.execute("DELETE FROM app_state WHERE key = ?", (key,)).rowcount > 0
+
+
+# ---------- alert mode ----------
+# Two modes, and tracking is identical in both: every decision is classified
+# and logged the same way, so the hours, the forest and Beeminder never know
+# which mode was on.
+#
+#     focus    - alerts fire: off-task popups, session drift alerts, the
+#                timer widget's peek.
+#     tracker  - nothing fires, EXCEPT inside a session filed under a
+#                project. A project is the work you said you care about
+#                enough to be watched on, so it keeps its drift alerts
+#                whatever the mode.
+#
+# Stored under its own key: the old time-tracking mode (removed 2026-08-28)
+# kept its value under "mode", and a leftover row there must not quietly
+# switch alerts off after an upgrade.
+MODE_KEY = "alert_mode"
+MODE_FOCUS = "focus"
+MODE_TRACKER = "tracker"
+MODES = (MODE_FOCUS, MODE_TRACKER)
+DEFAULT_MODE = MODE_FOCUS
+
+
+def get_mode() -> str:
+    """The current alert mode; anything unknown or unreadable is focus."""
+    try:
+        value = get_value(MODE_KEY)
+    except sqlite3.Error:
+        return DEFAULT_MODE
+    return value if value in MODES else DEFAULT_MODE
+
+
+def set_mode(mode: str) -> str:
+    from monitor.problems import UserError
+    mode = (mode or "").strip().lower()
+    if mode not in MODES:
+        raise UserError(
+            "The monitor only knows two modes: focus and tracker.",
+            "Pick Focus to get alerts, or Tracker to log quietly — "
+            "sessions filed under a project still alert in Tracker.")
+    return set_value(MODE_KEY, mode)
+
+
+def alerts_on(mode: str, intention: Optional[dict]) -> bool:
+    """May anything interrupt right now? Focus: yes. Tracker: only inside a
+    session that belongs to a project."""
+    if mode != MODE_TRACKER:
+        return True
+    return bool(intention and intention.get("project_id") is not None)
