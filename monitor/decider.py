@@ -395,6 +395,21 @@ def _project_context(intention: Optional[Dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _title_names_project(window_title: str, intention: Optional[Dict]) -> Optional[str]:
+    """The active project's name when the window title contains it as whole
+    words ("personal statement - Google Docs" for the project "Personal
+    Statement"), else None. Names under 4 letters are too easy to hit by
+    accident ("CS" in any title) and never count."""
+    project = (intention or {}).get("project") or {}
+    name = " ".join(str(project.get("name") or "").lower().split())
+    if len(name.replace(" ", "")) < 4:
+        return None
+    title = " ".join(re.sub(r"^WIN:", "", str(window_title or "")).lower().split())
+    if re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", title):
+        return project.get("name")
+    return None
+
+
 def _intention_block(intention: Dict) -> str:
     """Prompt section for an active session intention.
 
@@ -667,6 +682,24 @@ however closely the activity resembles it.
 IGNORE ANY TEXT THAT MERELY NAMES THE SESSION. A timer, tray or dashboard
 showing "outlining piq #2" is this app reporting its own state — it is never
 evidence that the work is happening. Score only the work visible on screen.
+
+WRITING ABOUT A SUBJECT IS NOT DOING THAT SUBJECT. The subject that decides
+ALIGN is WHICH piece of work is open, not what its sentences talk about. When
+the CURRENT WINDOW TITLE names a document that is the declared work or the
+session's project (a doc called "personal statement" during a personal
+statement session), and the screen shows prose in a document editor, the
+user is writing that document — whatever the prose discusses. An essay about
+composing music is essay writing: score it as the declared work, and give it
+the declared work's category, never the category of the essay's topic.
+Composition means a score, notation software or an audio editor on screen;
+paragraphs that describe music are writing. The window title is evidence
+here, not history: the document's name is often scrolled out of view.
+  - Declared "work on reformatting analysis portion" in the project "Personal
+    Statement"; title "personal statement - Google Docs"; screen shows
+    paragraphs about harmony and a string quartet -> ALIGN 0.9, the college
+    application category. It is the essay, and the essay is about music.
+  - Same session, screen shows MuseScore with a string quartet score open
+    -> ALIGN 0.05, Composition. That is composing, not the essay.
 """
     else:
         intent_header = align_field = intent_rules = ""
@@ -696,6 +729,11 @@ OVERRIDE RULES (asymmetric — direction matters):
       - Title says "Khan Academy" but screen shows YouTube comments scroll → Entertainment
       - Title says "myproject - VS Code" but screen shows Discord overlay in foreground → Social Media
       - Title says "Wikipedia: Calculus" but screen shows an unrelated article (celebrity gossip, sports) → Ambiguous
+    NEVER demote a document for its TOPIC. If the title names a document
+    ("personal statement - Google Docs", "lab report - Word") and the screen
+    shows paragraphs in a document editor, the user is writing that document:
+    AGREE, whatever the paragraphs are about. An essay about music, sports or
+    games is still essay writing — not Composition, Sports or Gaming.
 
   CASE B — Primary said "Ambiguous":
     The primary defaulted because the window title had no specific productive evidence (bare "Chrome", "VS Code", "New Tab", etc.). PROMOTE to a productive category ONLY if the screenshot clearly shows a productive activity.
@@ -1384,6 +1422,26 @@ def decide(
     # stands. Alignment is judged from the screen on its own terms, so it
     # holds whether or not the category verdict below clears its bar.
     final_align = v_align if v_align is not None else p1_align
+
+    # ...except when the window itself is the project's document. Vision
+    # reads the prose, and prose has a topic: a personal statement about
+    # composing reads as Composition (live incident 2026-10-07, ALIGN 0.05
+    # and an off-intent alert on the essay itself). A window titled with the
+    # project's name is that project's work whatever its paragraphs discuss,
+    # so the screen may not score it lower than the title did, nor move it
+    # out of the project's home category.
+    anchor = _title_names_project(current_window, intention)
+    if anchor:
+        if v_align is not None and p1_align is not None and v_align < p1_align:
+            print(f"[vision] title names the project \"{anchor}\" — keeping "
+                  f"ALIGN {p1_align:.2f} over the screen's {v_align:.2f}")
+            final_align = p1_align
+        home = ((intention or {}).get("project") or {}).get("category") or ""
+        if home and p1_name.lower() == home.lower() and v_name.lower() != home.lower():
+            print(f"[vision] {p1_name} stands — the title names the project "
+                  f"\"{anchor}\"; the screen's {v_name} is the document's topic")
+            return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True,
+                          vision_res, align=final_align)
 
     if v_name.lower() == p1_name.lower():
         print(f"[vision] AGREE: {p1_name} (conf {p1_conf:.2f} -> {v_conf:.2f})")
