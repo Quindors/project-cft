@@ -63,6 +63,18 @@ def _finished(intention: Dict, status: str, *, start_break: bool = True) -> None
     except Exception as e:
         print(f"[intention] beeminder push skipped ({e})")
 
+    _pop(f"session {status}")
+
+
+def _pop(reason: str) -> None:
+    """Bring the dashboard forward for a transition (monitor/browser.py). A
+    browser problem is logged, never raised into the session bookkeeping."""
+    try:
+        from monitor import browser
+        browser.pop_dashboard_async(reason)
+    except Exception as e:
+        print(f"[intention] pop-out skipped ({e})")
+
 
 def _mirror(row: Dict) -> None:
     """Push one intention row to the cloud mirror, if configured. Never raises:
@@ -351,6 +363,7 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None,
         row["ended_at"] = started_at
         _mirror(row)
     _mirror(active)
+    _pop("session started")
     return _attach_project(active)
 
 

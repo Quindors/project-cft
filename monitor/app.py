@@ -134,6 +134,14 @@ def _start_tray(settings: Settings, shutdown: threading.Event):
     # The intention page is always served by the local API, not the hosted site.
     intention_url = (local_url.rstrip("/") + "/intention") if local_url else None
 
+    # Session and break transitions pop the dashboard (monitor/browser.py) —
+    # at the same address the tray opens.
+    try:
+        from monitor import browser
+        browser.set_pop_url(dashboard_url)
+    except Exception as e:
+        print(f"[boot] pop-out not wired ({e})")
+
     # Auto-open the dashboard on startup (opt out with CFT_OPEN_DASHBOARD=0),
     # but only if one isn't already open — the autostart task relaunches this
     # exe at every logon, and a fresh tab each time piles up. Deferred to a
