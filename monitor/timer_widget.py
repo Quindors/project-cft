@@ -255,6 +255,10 @@ class _TimerWidget:
         # Last state we reacted to, so the drift peek fires on the transition
         # into off-intent rather than every tick it stays there.
         self._last_state: Optional[str] = self._snapshot.get("state")
+        # ... and the last session and break seen, so the card can slide out
+        # the moment a session starts or ends, or a break runs out.
+        self._last_intention_id = (self._snapshot.get("intention") or {}).get("id")
+        self._last_on_break = self._snapshot.get("break") is not None
 
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
@@ -264,7 +268,7 @@ class _TimerWidget:
         self.canvas.bind("<Enter>", self._on_enter)
         self.canvas.bind("<Leave>", self._on_leave)
 
-        self._place(prefs.get("x"), prefs.get("y"))
+        self._place(*self._toggled_origin(True, prefs.get("x"), prefs.get("y")))
         if self.hidden:
             self.win.withdraw()
         self._render()
@@ -442,6 +446,21 @@ class _TimerWidget:
             return best
         return current
 
+    def _toggled_origin(self, to_tab: bool, x, y):
+        """Origin for the other form so that it meets the arrow's end.
+
+        The collapse arrow sits at the right end of a top- or bottom-docked
+        card, so the tab it points at goes under that end, and opening again
+        grows the card leftward out of the tab. On the left and right edges
+        the two forms share a top, which already lines up with the arrow.
+        Saved positions are always the CARD's origin, whichever form was
+        dropped, so a restart puts it back where it was.
+        """
+        if x is None or y is None or self.side not in ("top", "bottom"):
+            return x, y
+        dx = self.card_w - self.long
+        return (x + dx if to_tab else x - dx), y
+
     def _place(self, x=None, y=None) -> None:
         """Put the current form at (x, y): pinned to its edge, inside the
         work area, with the window's origin on the form's."""
@@ -526,6 +545,33 @@ class _TimerWidget:
         if switched or (time.time() - self._shown_at) >= AUTO_COLLAPSE_SEC:
             self.toggle_collapsed(animate=True, remember=False)
 
+    def _peek_on_transition(self) -> None:
+        """Slide the card out when a session starts or ends, or a break
+        starts or ends.
+
+        Those are the moments the timer has something new to say — a fresh
+        countdown, the break prompt, "back to it" — and a tab at the edge of
+        the screen is easy to miss. Like the drift peek it is a courtesy: the
+        card puts itself away again, and the resting form you chose stays
+        what it was. A pause is a break under the hood, so pausing and
+        resuming count too.
+        """
+        snap = self._snapshot or {}
+        intention_id = (snap.get("intention") or {}).get("id")
+        on_break = snap.get("break") is not None
+        session_turned = intention_id != self._last_intention_id
+        break_turned = on_break != self._last_on_break
+        self._last_intention_id, self._last_on_break = intention_id, on_break
+        if not (session_turned or break_turned):
+            return
+        # Hidden means the user does not want to see it, and mid-drag or
+        # mid-menu means they are already busy with the card.
+        if self.hidden or self._anim or self._busy():
+            return
+        if self.collapsed:
+            self.toggle_collapsed(animate=True, remember=False)
+        self._note_shown()
+
     def _peek_on_drift(self) -> None:
         """Slide the card out the moment a decision lands off-intent.
 
@@ -560,6 +606,7 @@ class _TimerWidget:
             self._ticks += 1
             if self._ticks % REFRESH_EVERY_TICKS == 0:
                 self._snapshot = status.full_snapshot()
+                self._peek_on_transition()
                 self._peek_on_drift()
             if not self.hidden:
                 self._maybe_auto_collapse()
@@ -597,8 +644,9 @@ class _TimerWidget:
         if remember:
             _save_prefs(collapsed=target)
         if not animate:
+            x, y = self._toggled_origin(target, self._x, self._y)
             self.collapsed = target
-            self._relayout(self._x, self._y)
+            self._relayout(x, y)
             self._note_shown()
             return
 
@@ -606,7 +654,8 @@ class _TimerWidget:
         # space, and the window — never resized — glides along underneath
         # it. A card parked mid-screen tucks itself all the way to its edge.
         start = self._geometry_for(self.collapsed, self.side, self._x, self._y)
-        end = self._geometry_for(target, self.side, self._x, self._y)
+        end = self._geometry_for(target, self.side,
+                                 *self._toggled_origin(target, self._x, self._y))
         self._anim = {
             "t0": time.time(), "target": target,
             "end": (end[0], end[1]),
@@ -1043,7 +1092,9 @@ class _TimerWidget:
             ox, oy = self._origin_for(gx, gy, self.side)
             self._drag = None
             self._relayout(ox, oy)
-            _save_prefs(x=self._x, y=self._y, side=self.side)
+            cx, cy = (self._toggled_origin(False, self._x, self._y)
+                      if self.collapsed else (self._x, self._y))
+            _save_prefs(x=cx, y=cy, side=self.side)
             self._note_shown()
             return
         self._drag = None

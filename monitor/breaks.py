@@ -69,26 +69,9 @@ def get_active() -> Optional[Dict]:
     if data is None:
         return None
     if data["ends_at"] <= _now_str():
-        # delete_value is the single-shot gate: every thread reads the stale
-        # break, one of them clears it, and only that one pops the dashboard.
-        if app_state.delete_value(_KEY):
-            _pop(_over(data))
+        app_state.delete_value(_KEY)
         return None
     return _decorate(data)
-
-
-def _over(data: Dict) -> str:
-    return "pause ended" if data.get("source") == "pause" else "break ended"
-
-
-def _pop(reason: str) -> None:
-    """Bring the dashboard forward (monitor/browser.py); a browser problem is
-    logged, never raised into the break bookkeeping."""
-    try:
-        from monitor import browser
-        browser.pop_dashboard_async(reason)
-    except Exception as e:
-        print(f"[break] pop-out skipped ({e})")
 
 
 def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
@@ -147,7 +130,6 @@ def end() -> Optional[Dict]:
     if not app_state.delete_value(_KEY):
         return None
     print("[break] break ended early — monitoring resumes")
-    _pop(_over(data))
     unused = data.get("remaining_sec", 0)
     if data.get("source") == "pause" and data.get("intention_id") and unused > 0:
         try:

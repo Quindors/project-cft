@@ -22,9 +22,7 @@ cannot raise an existing window.
 """
 from __future__ import annotations
 
-import os
 import sys
-import threading
 import time
 import webbrowser
 from typing import Optional
@@ -156,98 +154,3 @@ def open_dashboard_if_absent(url: str, *, grace_sec: float = 5.0) -> str:
     print(f"[browser] opened dashboard: {url}")
     return "opened"
 
-
-# --- Pop-out on session and break transitions --------------------------------
-#
-# A session starting or ending, or a break running out, is the moment the
-# dashboard is wanted: the session card, the countdown, the break prompt. From
-# outside the browser a background tab cannot be raised (a window title names
-# only its active tab), so a pop is: nothing when the dashboard is already the
-# front window; raise its window when it is the active tab of some window;
-# otherwise open a fresh tab. The page keeps that from piling up — the
-# dashboard's singleTab closes the older copy when a new one announces itself.
-# Opt out with CFT_POPOUT=0.
-
-_pop_url: Optional[str] = None
-
-
-def set_pop_url(url: Optional[str]) -> None:
-    """Where a pop opens the dashboard (app.py: DASHBOARD_URL or the local copy)."""
-    global _pop_url
-    _pop_url = (url or "").strip() or None
-
-
-def _pop_enabled() -> bool:
-    return os.getenv("CFT_POPOUT", "1").strip().lower() not in ("0", "false", "no")
-
-
-def _default_pop_url() -> Optional[str]:
-    env = os.getenv("DASHBOARD_URL", "").strip()
-    if env:
-        return env
-    try:
-        from monitor.dashboard_server import _api_port
-        return f"http://127.0.0.1:{_api_port()}/"
-    except Exception:
-        return None
-
-
-def dashboard_in_foreground() -> bool:
-    """Is the dashboard the active tab of the window the user is looking at?"""
-    if sys.platform != "win32":
-        return False
-    import ctypes
-
-    user32 = ctypes.WinDLL("user32", use_last_error=True)
-    try:
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return False
-        length = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        return DASHBOARD_TITLE in buf.value.lower()
-    except Exception as e:
-        print(f"[browser] foreground check failed ({e})")
-        return False
-
-
-def pop_dashboard(reason: str, url: Optional[str] = None) -> str:
-    """Bring the dashboard forward for a transition.
-
-    Returns what happened: "disabled", "foreground" (already in front),
-    "raised", "opened" or "no-url".
-    """
-    if not _pop_enabled():
-        print(f"[browser] pop-out disabled ({reason})")
-        return "disabled"
-    if dashboard_in_foreground():
-        print(f"[browser] dashboard already in front ({reason})")
-        return "foreground"
-    url = url or _pop_url or _default_pop_url()
-    if not url:
-        print(f"[browser] no dashboard URL to pop ({reason})")
-        return "no-url"
-    how = open_dashboard(url)
-    if how == "opened":
-        # The browser puts the new tab in front of its window, but Windows may
-        # keep that window behind whatever the user is typing into. Once the
-        # tab has loaded, its title is on the window — raise it ourselves.
-        deadline = time.time() + 4.0
-        while time.time() < deadline:
-            time.sleep(0.25)
-            if dashboard_in_foreground():
-                break
-            if focus_existing():
-                how = "opened+raised"
-                break
-    print(f"[browser] popped dashboard ({reason}): {how}")
-    return how
-
-
-def pop_dashboard_async(reason: str) -> None:
-    """pop_dashboard on a thread of its own: transitions are noticed on the
-    runner loop or inside an API request, and neither should wait on a window
-    scan or a browser launch."""
-    threading.Thread(target=pop_dashboard, args=(reason,), daemon=True,
-                     name="pop-dashboard").start()
