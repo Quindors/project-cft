@@ -244,13 +244,6 @@ class _TimerWidget:
         self._drag: Optional[Dict] = None
         self._last_error = (None, 0.0)
         self._anim: Optional[Dict] = None
-        # The stand-in window that covers resizes (see _resize_seamless).
-        self._veil = None
-        self._veil_canvas = None
-        # Where each form sits inside the resident (union) window; kept by
-        # _place/_relayout so drawing and hit-testing can offset by them.
-        self._card_rect = None
-        self._tab_rect = None
         self._hover_chevron = False
         self._pointer_in = False
         self._menu_open = False
@@ -346,29 +339,33 @@ class _TimerWidget:
             except Exception:
                 pass
 
+    # The window is ONE fixed size — room for either form in any orientation
+    # — allocated once and never resized. Everything after that is a move or
+    # a repaint. A layered window's freshly allocated surface composites as
+    # opaque black until something paints it, and no amount of alpha
+    # juggling or stand-in windows hid that reliably: the black boxes, the
+    # frames of a half-cropped card, and a card that refused to be dragged
+    # downward all traced back to a window that was being resized to the
+    # union of the card and its edge tab on every drop. The window now sits
+    # at the current form's origin; the spare space hangs off to the right
+    # and below — off-screen when docked there — transparent and
+    # click-through.
+
     def _size_for(self, collapsed: bool, side: str) -> Tuple[int, int]:
+        """The FORM's size: what is drawn, not the window."""
         if not collapsed:
             return self.card_w + 2 * self.margin, self.card_h + 2 * self.margin
         if side in ("left", "right"):
             return self.thick + self.margin, self.long + 2 * self.margin
         return self.long + 2 * self.margin, self.thick + self.margin
 
-    def _size(self):
-        """The WINDOW's current size — the union rect, not the drawn form.
-
-        The window permanently holds both forms (see _layout), so opening and
-        closing never resize it. That is the entire fix for the animation
-        flashes: a resize of a layered window cannot be made atomically
-        invisible against DWM's composition clock, so the only winning move
-        is not to resize.
-        """
-        try:
-            w, h = self.win.winfo_width(), self.win.winfo_height()
-            if w > 1 and h > 1:
-                return w, h
-        except Exception:
-            pass
+    def _form_size(self) -> Tuple[int, int]:
         return self._size_for(self.collapsed, self.side)
+
+    def _window_size(self) -> Tuple[int, int]:
+        """Fixed for the life of the window: the largest form in each axis."""
+        return (max(self.card_w, self.long) + 2 * self.margin,
+                max(self.card_h, self.long) + 2 * self.margin)
 
     def _geometry_for(self, collapsed: bool, side: str, x, y) -> Tuple[int, int, int, int]:
         """Where a form would sit: pinned to its edge and inside the work area."""
@@ -394,7 +391,7 @@ class _TimerWidget:
 
     def _shape_rect(self, collapsed: bool, side: str,
                     x: float, y: float, w: float, h: float):
-        """Absolute rect of the drawn shape for a window at (x, y, w, h).
+        """Absolute rect of the drawn shape for a form at (x, y, w, h).
 
         The card is inset by the margin on every side. The tab deliberately
         overhangs its screen edge so the overhang is clipped and it sits flush
@@ -412,19 +409,21 @@ class _TimerWidget:
             return (x + m, y - t, x + m + ln, y + t)
         return (x + m, y + m, x + m + ln, y + m + 2 * t)   # bottom
 
-    def _apply_geometry(self, x, y, w, h) -> None:
-        self.win.geometry(f"{int(w)}x{int(h)}+{int(x)}+{int(y)}")
-        self.canvas.configure(width=int(w), height=int(h))
+    def _apply_geometry(self, x, y) -> None:
+        """Move the window. Its size is fixed, so this is only ever a move."""
+        w, h = self._window_size()
+        self.win.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
         self._x, self._y = int(x), int(y)
 
     def _edge_gaps(self, x: float, y: float) -> Dict[str, float]:
+        """Distance from a form at (x, y) to each working edge."""
         wl, wt, wr, wb = self._work_area()
-        w, h = self._size()
+        w, h = self._form_size()
         return {"left": x - wl, "right": wr - (x + w),
                 "top": y - wt, "bottom": wb - (y + h)}
 
     def _nearest_side(self, x: float, y: float) -> str:
-        """Which working edge is this window closest to?"""
+        """Which working edge is this form closest to?"""
         gaps = self._edge_gaps(x, y)
         return min(gaps, key=gaps.get)
 
@@ -443,76 +442,22 @@ class _TimerWidget:
             return best
         return current
 
-    def _layout(self, side: str, x, y):
-        """The resident window and both form rects for an anchor.
-
-        The window is the union of the card and the tab at this anchor, so
-        both forms — and every frame of the slide between them — fit inside
-        it without a geometry change. Each form rect is clamped to the work
-        area on its own, so their union is too.
-        """
-        card = self._geometry_for(False, side, x, y)
-        tab = self._geometry_for(True, side, card[0], card[1])
-        x1, y1 = min(card[0], tab[0]), min(card[1], tab[1])
-        x2 = max(card[0] + card[2], tab[0] + tab[2])
-        y2 = max(card[1] + card[3], tab[1] + tab[3])
-        return (x1, y1, x2 - x1, y2 - y1), card, tab
-
-    def _form_offset(self) -> Tuple[int, int]:
-        """Where the current form sits inside the resident window."""
-        rect = self._tab_rect if self.collapsed else self._card_rect
-        if rect is None:
-            return 0, 0
-        return rect[0] - self._x, rect[1] - self._y
-
-    def _snapshot_draw(self):
-        """A closure that repaints exactly what is on screen right now.
-
-        Captured BEFORE side/anchor/rects change, for the veil to reproduce
-        the old appearance while the window is reshaped behind it.
-        """
-        state = (self._card_rect, self._tab_rect, self._x, self._y,
-                 self.side, self.collapsed)
-
-        def draw():
-            saved = (self._card_rect, self._tab_rect, self._x, self._y,
-                     self.side, self.collapsed)
-            (self._card_rect, self._tab_rect, self._x, self._y,
-             self.side, self.collapsed) = state
-            try:
-                self._render()
-            finally:
-                (self._card_rect, self._tab_rect, self._x, self._y,
-                 self.side, self.collapsed) = saved
-        return draw
-
     def _place(self, x=None, y=None) -> None:
-        """Anchor the resident window, clamped to the work area."""
-        win, self._card_rect, self._tab_rect = self._layout(self.side, x, y)
-        self._apply_geometry(*win)
+        """Put the current form at (x, y): pinned to its edge, inside the
+        work area, with the window's origin on the form's."""
+        x, y, _w, _h = self._geometry_for(self.collapsed, self.side, x, y)
+        self._apply_geometry(x, y)
         self._keep_on_top()
 
-    def _relayout(self, x, y, draw_old=None) -> None:
-        """Re-anchor after a side or position change and repaint.
+    def _relayout(self, x, y) -> None:
+        """Re-anchor after a side or form change and repaint."""
+        self._place(x, y)
+        self._render()
 
-        Same-size changes (the overwhelmingly common case) are a plain move.
-        A genuine size change — an orientation flip, a drop far from the old
-        spot — is the one place a resize still exists, and it goes behind
-        the veil.
-        """
-        snap = draw_old if draw_old is not None else self._snapshot_draw()
-        win, self._card_rect, self._tab_rect = self._layout(self.side, x, y)
-        if (win[2], win[3]) == tuple(self._size()):
-            self._apply_geometry(*win)
-            self._render()
-        else:
-            self._resize_seamless(win, draw_current=snap, draw_new=self._render)
-        self._keep_on_top()
-
-    def _clamped_origin(self, x, y) -> Tuple[int, int, int, int]:
-        """Move-only clamp for mid-drag frames: current size, pinned edge."""
+    def _clamped_origin(self, x, y) -> Tuple[int, int]:
+        """Mid-drag frame: keep the FORM inside the work area, tab pinned."""
         wl, wt, wr, wb = self._work_area()
-        w, h = self._size()
+        w, h = self._form_size()
         x, y = int(x), int(y)
         if self.collapsed:
             if self.side == "left":
@@ -525,7 +470,7 @@ class _TimerWidget:
                 y = wb - h
         x = max(wl, min(x, wr - w))
         y = max(wt, min(y, wb - h))
-        return x, y, w, h
+        return x, y
 
     def _set_alpha(self, value: float) -> None:
         try:
@@ -657,22 +602,17 @@ class _TimerWidget:
             self._note_shown()
             return
 
-        # The window already holds both forms — it is the union of their
-        # rects at all times (_layout) — so the slide is DRAWING ONLY. Not
-        # one geometry call from here to the end of the animation: a layered
-        # window resize cannot be hidden from DWM's composition clock, and
-        # every flash this animation ever produced (the black box, then the
-        # blink that cured it) came from trying.
-        if self._card_rect is None or self._tab_rect is None:
-            self._place(self._x, self._y)
-        start = self._tab_rect if self.collapsed else self._card_rect
-        end = self._card_rect if self.collapsed else self._tab_rect
-
+        # The shape travels from one form's rect to the other's in SCREEN
+        # space, and the window — never resized — glides along underneath
+        # it. A card parked mid-screen tucks itself all the way to its edge.
+        start = self._geometry_for(self.collapsed, self.side, self._x, self._y)
+        end = self._geometry_for(target, self.side, self._x, self._y)
         self._anim = {
             "t0": time.time(), "target": target,
-            # Animate the SHAPES, not the window rects: the tab's shape
+            "end": (end[0], end[1]),
+            # Animate the SHAPES, not the form rects: the tab's shape
             # overhangs its edge while the card's is inset, and interpolating
-            # window rects alone leaves a gap along the edge at the tab end.
+            # form rects alone leaves a gap along the edge at the tab end.
             "shape_from": self._shape_rect(self.collapsed, self.side, *start),
             "shape_to": self._shape_rect(target, self.side, *end),
         }
@@ -685,9 +625,12 @@ class _TimerWidget:
             return
         try:
             p = _ease((time.time() - anim["t0"]) / (ANIM_MS / 1000.0))
-            ux, uy = self._x, self._y   # shapes are absolute; window is fixed
             x1, y1, x2, y2 = (_lerp(a, b, p)
                               for a, b in zip(anim["shape_from"], anim["shape_to"]))
+            # Window origin a margin outside the shape, so the shape sits at
+            # (margin, margin) in canvas coordinates whatever its size.
+            ux, uy = x1 - self.margin, y1 - self.margin
+            self._apply_geometry(ux, uy)
             self._render_morph(x1 - ux, y1 - uy, x2 - ux, y2 - uy,
                                p if anim["target"] else 1.0 - p)
 
@@ -695,7 +638,7 @@ class _TimerWidget:
                 self._finish_anim(anim)
                 return
         except Exception as e:
-            # Never strand the widget mid-slide at the union size.
+            # Never strand the widget mid-slide.
             self._log_once(f"animation failed ({type(e).__name__}: {e})")
             try:
                 self._finish_anim(anim)
@@ -704,131 +647,16 @@ class _TimerWidget:
             return
         self.win.after(ANIM_FRAME_MS, self._animate)
 
-    # ---------- seamless resizes ----------
-    #
-    # Two facts conspire against resizing this window in view. A layered
-    # (-transparentcolor) window's newly allocated memory is uninitialized
-    # and composites as opaque BLACK until something paints it — the black
-    # box once seen when the card opened. And the first cure, blanking the
-    # window (alpha 0) around the resize, just traded the box for a blink:
-    # the widget vanished for a frame at the start and end of every slide,
-    # because the blanking happened to the window the user was looking at.
-    #
-    # So: all invisible-surface work now happens behind a stand-in. A second
-    # window (the veil) is painted with the SAME pixels off-screen, faded in
-    # over the widget — two identical images stacked, nothing to see — and
-    # only then does the real window hide, resize, repaint and return, all of
-    # it behind the veil. At no instant is there a frame without the widget
-    # drawn on it.
-
-    def _ensure_veil(self):
-        import tkinter as tk
-
-        if self._veil is not None:
-            return
-        veil = tk.Toplevel(tk_host.root())
-        veil.overrideredirect(True)
-        veil.attributes("-topmost", True)
-        veil.configure(bg=CHROMA)
-        try:
-            veil.attributes("-transparentcolor", CHROMA)
-        except Exception:
-            veil.configure(bg="#111827")
-        veil.withdraw()
-        canvas = tk.Canvas(veil, highlightthickness=0, bd=0, bg=CHROMA)
-        canvas.pack(fill="both", expand=True)
-        self._veil = veil
-        self._veil_canvas = canvas
-
-    def _flush(self, win) -> None:
-        try:
-            win.update_idletasks()
-        except Exception:
-            pass
-
-    def _on_veil(self, draw) -> None:
-        """Run one of the self.canvas renderers onto the veil's canvas."""
-        real = self.canvas
-        self.canvas = self._veil_canvas
-        try:
-            draw()
-        finally:
-            self.canvas = real
-
-    def _resize_seamless(self, rect, draw_current, draw_new) -> None:
-        """Change the window's geometry without a visible frame of anything.
-
-        draw_current must repaint what is on screen RIGHT NOW (it renders
-        onto the veil); draw_new paints the post-resize content. Every
-        mapped-but-unpainted surface moment happens at alpha 0, and every
-        alpha-0 moment happens while the other window still shows the same
-        pixels.
-        """
-        alpha = 1.0 if self._pointer_in else 0.96
-        try:
-            self._ensure_veil()
-            veil = self._veil
-            # Stand-in first: painted invisibly at the current geometry...
-            veil.geometry(f"{self.win.winfo_width()}x{self.win.winfo_height()}"
-                          f"+{self._x}+{self._y}")
-            try:
-                veil.attributes("-alpha", 0.0)
-            except Exception:
-                pass
-            veil.deiconify()
-            # To the top of the topmost band: covering is its entire job, and
-            # a veil that maps beneath some other topmost window covers
-            # nothing.
-            try:
-                veil.lift()
-            except Exception:
-                pass
-            self._veil_canvas.delete("all")
-            self._on_veil(draw_current)
-            self._flush(veil)
-            # ...then faded in over identical pixels.
-            try:
-                veil.attributes("-alpha", alpha)
-            except Exception:
-                pass
-            self._flush(veil)
-            covered = True
-        except Exception as e:
-            self._log_once(f"veil unavailable ({type(e).__name__}: {e})")
-            covered = False
-
-        # The real window's turn, entirely behind the veil (or, if the veil
-        # failed, degraded to the old blink rather than showing black).
-        if covered:
-            self.win.withdraw()
-        else:
-            self._set_alpha(0.0)
-        self.canvas.delete("all")
-        self._apply_geometry(*rect)
-        self._flush(self.win)
-        try:
-            draw_new()
-        except Exception as e:
-            self._log_once(f"resize draw failed ({type(e).__name__}: {e})")
-        if covered:
-            self._set_alpha(0.0)
-            self.win.deiconify()
-        self._flush(self.win)
-        self._set_alpha(alpha)
-        self._flush(self.win)
-        if covered:
-            try:
-                self._veil.withdraw()
-            except Exception:
-                pass
-
     def _finish_anim(self, anim: Dict) -> None:
-        """Swap the final frame for the real content. No geometry involved:
-        the slide ended exactly on the destination form's shape, inside the
-        same window it started in, so this is one repaint that adds the text.
+        """Swap the final frame for the real content.
+
+        The slide ended exactly on the destination form's shape; moving the
+        window onto that form's origin and painting the form puts the same
+        pixels back on screen, plus the text.
         """
         self._anim = None
         self.collapsed = anim["target"]
+        self._apply_geometry(*anim["end"])
         self._render()
         self._keep_on_top()
         self._note_shown()
@@ -837,10 +665,9 @@ class _TimerWidget:
                       toward_tab: float) -> None:
         """The in-between frame: just the shape, morphing card -> tab.
 
-        Coordinates are the shape itself in canvas-local space — the window
-        stays put at the union rect while the shape travels inside it, and at
-        the tab end the shape runs past the window edge exactly as the real
-        tab does, so it finishes flush with no seam along the edge.
+        Coordinates are the shape in canvas-local space. At the tab end the
+        shape runs past the screen edge exactly as the real tab does, so it
+        finishes flush with no seam along the edge.
 
         No text during the slide. Interpolating a layout of glyphs at 60fps
         looks like a squash; a shape that shrinks into the edge reads as the
@@ -853,6 +680,7 @@ class _TimerWidget:
         radius = _lerp(self._px(16), self._px(6), toward_tab)
         self._round_rect(x1, y1, max(x1 + 1, x2), max(y1 + 1, y2),
                          radius, fill=fill, outline=edge)
+        self._clip_to_work_area()
 
     def _note_shown(self) -> None:
         """Restart the auto-collapse clock and remember the window in front."""
@@ -860,6 +688,28 @@ class _TimerWidget:
         self._fg_at_show = _foreground_window()
 
     # ---------- drawing ----------
+
+    def _clip_to_work_area(self) -> None:
+        """Knock out everything drawn outside the work area.
+
+        The window used to be clamped inside the work area, so a tab's
+        overhang past its edge was clipped by the window itself. The window
+        now hangs off the screen (and over the taskbar) wherever its spare
+        space falls, so the clip is drawn: chroma rectangles — transparent
+        and click-through — over the parts of the canvas that lie outside
+        the work area.
+        """
+        wl, wt, wr, wb = self._work_area()
+        W, H = self._window_size()
+        big = max(W, H) * 4
+        for x1, y1, x2, y2 in (
+            (wr - self._x, -big, big, big),      # right of the work area
+            (-big, wb - self._y, big, big),      # below it
+            (-big, -big, wl - self._x, big),     # left of it
+            (-big, -big, big, wt - self._y),     # above it
+        ):
+            if x2 > x1 and y2 > y1:
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill=CHROMA, outline="")
 
     def _round_rect(self, x1, y1, x2, y2, r, **kw):
         pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r,
@@ -878,17 +728,14 @@ class _TimerWidget:
         """Repaint. Never raises: a bad frame is not worth a dead clock."""
         try:
             self.canvas.delete("all")
+            # The window's origin is the form's, so the renderers' form-local
+            # coordinates are canvas coordinates. The tab's deliberate
+            # off-window overhang clips flush against the screen edge.
             if self.collapsed:
                 self._render_tab()
             else:
                 self._render_card()
-            # The renderers draw in form-local coordinates; one shift moves
-            # the whole drawing to the form's place inside the resident
-            # window. The tab's deliberate off-window overhang survives the
-            # shift, so it still clips flush against the screen edge.
-            ox, oy = self._form_offset()
-            if ox or oy:
-                self.canvas.move("all", ox, oy)
+            self._clip_to_work_area()
         except Exception as e:
             self._log_once(f"render failed ({type(e).__name__}: {e})")
 
@@ -1089,11 +936,8 @@ class _TimerWidget:
     def _over_chevron(self, x: float) -> bool:
         if self.collapsed:
             return False
-        # Pointer x is window-local; the zone is card-local, and the card
-        # sits at an offset inside the resident window.
-        ox, _oy = self._form_offset()
         gx1, gx2 = self._chevron_zone()
-        return gx1 <= x - ox <= gx2
+        return gx1 <= x <= gx2
 
     def _on_motion(self, event) -> None:
         hover = self._over_chevron(event.x)
@@ -1115,11 +959,11 @@ class _TimerWidget:
             self._render()
 
     def _on_press(self, event) -> None:
-        # Remember where in the widget you took hold of it, as a fraction of
+        # Remember where in the form you took hold of it, as a fraction of
         # its size. Turning sideways changes those dimensions, and anchoring
         # by fraction keeps the spot you grabbed under the cursor instead of
         # letting the tab jump out from under it.
-        w0, h0 = self._size()
+        w0, h0 = self._form_size()
         self._drag = {
             "fx": min(1.0, max(0.0, (event.x_root - self._x) / max(1, w0))),
             "fy": min(1.0, max(0.0, (event.y_root - self._y) / max(1, h0))),
@@ -1140,13 +984,13 @@ class _TimerWidget:
         self._drag_target = (float(event.x_root), float(event.y_root))
 
     def _origin_for(self, grab_x: float, grab_y: float, side: str):
-        """Window origin that puts the grabbed fraction under (grab_x, grab_y).
+        """Form origin that puts the grabbed fraction under (grab_x, grab_y).
 
-        Fractions of the resident window: after an orientation flip has
-        swapped its dimensions, the same fractions keep the grabbed spot
-        under the cursor.
+        Fractions of the form: after an orientation flip has swapped its
+        dimensions, the same fractions keep the grabbed spot under the
+        cursor.
         """
-        w, h = self._size()
+        w, h = self._size_for(self.collapsed, side)
         return grab_x - self._drag["fx"] * w, grab_y - self._drag["fy"] * h
 
     def _drag_follow(self) -> None:
@@ -1172,17 +1016,14 @@ class _TimerWidget:
             if self.collapsed:
                 side = self._pick_side(ox, oy, self.side)
                 if side != self.side:
-                    # Turning sideways is the one mid-drag size change; it
-                    # goes behind the veil, with the old orientation captured
-                    # first so the veil can reproduce it.
-                    snap = self._snapshot_draw()
+                    # Turning sideways: the window keeps its size, so this is
+                    # a move and a repaint like any other frame.
                     self.side = side
                     ox, oy = self._origin_for(gx, gy, side)
-                    self._relayout(ox, oy, draw_old=snap)
+                    self._relayout(ox, oy)
                     self.win.after(ANIM_FRAME_MS, self._drag_follow)
                     return
-            # Ordinary drag frame: a pure move. The window keeps its size, so
-            # no surface is ever reallocated while the user watches.
+            # Ordinary drag frame: a pure move.
             self._apply_geometry(*self._clamped_origin(ox, oy))
         except Exception as e:
             self._log_once(f"drag failed ({type(e).__name__}: {e})")
@@ -1198,11 +1039,10 @@ class _TimerWidget:
             # drop, so the arrow is allowed to move now. _origin_for still
             # needs self._drag, so it is cleared only once we are done.
             gx, gy = self._drag_target
-            snap = self._snapshot_draw()
             self.side = self._nearest_side(*self._origin_for(gx, gy, self.side))
             ox, oy = self._origin_for(gx, gy, self.side)
             self._drag = None
-            self._relayout(ox, oy, draw_old=snap)
+            self._relayout(ox, oy)
             _save_prefs(x=self._x, y=self._y, side=self.side)
             self._note_shown()
             return
@@ -1221,12 +1061,11 @@ class _TimerWidget:
         and drops it at the default corner of the work area.
         """
         self._anim = None
-        snap = self._snapshot_draw()
         self.hidden = False
         self.collapsed = False
         self.side = "right"
         self.win.deiconify()
-        self._relayout(None, None, draw_old=snap)
+        self._relayout(None, None)
         self._note_shown()
         _save_prefs(hidden=False, collapsed=False, side="right",
                     x=self._x, y=self._y)
@@ -1333,12 +1172,10 @@ class _TimerWidget:
         self._refresh_now()
 
     def destroy(self) -> None:
-        for win in (self._veil, self.win):
-            try:
-                if win is not None:
-                    win.destroy()
-            except Exception:
-                pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
 
 
 # ---------- public API (safe to call from any thread) ----------
