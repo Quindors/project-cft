@@ -1466,7 +1466,11 @@ def decide(
     # Vision errored → primary stands
     if v_name in ("[ERROR]", "[PARSE_ERROR]"):
         print(f"[vision] Error ({v_reason}) — primary stands.")
-        return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res, align=p1_align)
+        result = mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True, vision_res, align=p1_align)
+        # The verdict survives; the failure still has to reach the runner so
+        # a screen check that has been dead for an hour gets reported.
+        result["vision_error"] = v_reason if v_name == "[ERROR]" else "[PARSE_ERROR]"
+        return result
 
     # Vision saw the screen; its ALIGN wins when present, else the primary's
     # stands. Alignment is judged from the screen on its own terms, so it

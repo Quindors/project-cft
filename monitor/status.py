@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # How long a published decision stays meaningful. Past this the monitor is
 # either wedged or between runs, and the UI should fall back to "no signal"
@@ -64,6 +64,68 @@ def set_away(away: bool) -> None:
             _state["drift_since"] = None
 
 
+# ---------- pipeline problems ----------
+# A stage of the classify -> log pipeline that is failing right now, keyed
+# by stage ("classifier", "vision", "storage", "mirror", "corrections").
+# None of these stop the monitor — an error verdict is simply not logged —
+# which is exactly why they need a place other than cft.log: an account
+# that ran out of credits at noon otherwise reads as a quiet afternoon.
+#
+# The runner reports a stage once its failures form a pattern and clears it
+# on the next success, so the dashboard shows only what is failing NOW.
+_problems: Dict[str, Dict[str, Any]] = {}
+
+
+def report_problem(stage: str, err: object, *, count: Optional[int] = None) -> None:
+    """Record that `stage` is failing with `err` (anything problems.of takes).
+
+    A repeat of the same message keeps its original `since`, so the banner
+    can say how long this has been going on; a different message restarts it.
+    """
+    from monitor import problems
+    problem = problems.of(err)
+    now = time.time()
+    with _lock:
+        cur = _problems.get(stage)
+        if cur is not None and cur["message"] == problem.message:
+            cur["at"] = now
+            cur["count"] = count if count is not None else cur["count"] + 1
+            return
+        _problems[stage] = {
+            "stage": stage,
+            "message": problem.message,
+            "fix": problem.fix,
+            "since": now,
+            "at": now,
+            "count": count if count is not None else 1,
+        }
+
+
+def clear_problem(stage: str) -> None:
+    with _lock:
+        _problems.pop(stage, None)
+
+
+def clear_problems() -> None:
+    with _lock:
+        _problems.clear()
+
+
+def problems_list() -> List[Dict[str, Any]]:
+    """Current problems, oldest first, without duplicates: when the title call
+    and the screen check fail the same way, one box says it once."""
+    with _lock:
+        items = sorted((dict(p) for p in _problems.values()), key=lambda p: p["since"])
+    seen = set()
+    out = []
+    for p in items:
+        if p["message"] in seen:
+            continue
+        seen.add(p["message"])
+        out.append(p)
+    return out
+
+
 def get() -> Dict[str, Any]:
     """A copy of the current state, with stale decisions blanked out."""
     with _lock:
@@ -74,13 +136,6 @@ def get() -> Dict[str, Any]:
         snap["tier"] = None
         snap["drift_since"] = None
     return snap
-
-
-def drift_seconds() -> Optional[float]:
-    """How long the current drift streak has run, or None if not drifting."""
-    snap = get()
-    since = snap.get("drift_since")
-    return None if since is None else max(0.0, time.time() - since)
 
 
 # ---------- the one view every UI renders ----------
@@ -151,6 +206,7 @@ def full_snapshot() -> Dict[str, Any]:
         "stale": snap.get("stale"),
         "paused": active_break is not None,
         "away": bool(snap.get("away")),
+        "problems": problems_list(),
     }
 
     # Untimed (stopwatch) sessions: what the clock shows and when "Done"

@@ -31,6 +31,8 @@ suggest, the fix says where to look — cft.log — which is still an action.
 """
 from __future__ import annotations
 
+import os
+import re
 from typing import Dict, Optional
 
 
@@ -113,11 +115,6 @@ def unexpected(err: Exception, doing: str) -> Problem:
     return Problem(message, LOOK_IN_THE_LOG)
 
 
-def missing(field_label: str, fix: str) -> Problem:
-    """A required value nobody filled in, named the way the UI names it."""
-    return Problem(f"{field_label} is missing.", fix)
-
-
 def unknown_category(name: str, *, action: str = "use") -> Problem:
     """The single most common rejection in this app: a label that is not a
     category. Always worth saying where categories come from."""
@@ -126,6 +123,141 @@ def unknown_category(name: str, *, action: str = "use") -> Problem:
         f"There's no category called “{shown}”, so it can't be {action}d.",
         "Pick one from the list, or add it first on the Categories tab.",
     )
+
+
+# ---------- the classifier's provider ----------
+# The LLM behind every verdict is a hosted service the user pays for, chosen
+# by LLM_PROVIDER. When it refuses, the refusal has to be translated into
+# THEIR provider's words: an OpenAI user must not be sent to OpenRouter's
+# credits page. Anything not listed here gets generic wording that still says
+# what to do.
+
+_PROVIDERS: Dict[str, Dict[str, str]] = {
+    "openrouter": {
+        "label": "OpenRouter",
+        "key_var": "OPENROUTER_API_KEY",
+        "credits": "Add credits at openrouter.ai/settings/credits.",
+        "model_example": "openai/gpt-4o-mini",
+        "status_page": "status.openrouter.ai",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "key_var": "OPENAI_API_KEY",
+        "credits": "Add credit at platform.openai.com/settings/organization/billing.",
+        "model_example": "gpt-4o-mini",
+        "status_page": "status.openai.com",
+    },
+}
+
+_STATUS_CODE = re.compile(r"\b(?:Error code|status(?: code)?):?\s*(\d{3})\b", re.I)
+_QUOTED_MESSAGE = re.compile(r"""['"]message['"]\s*:\s*['"]([^'"]{1,240})['"]""")
+_NETWORK_WORDS = ("connection error", "connect", "timed out", "timeout",
+                  "getaddrinfo", "name or service", "network is unreachable",
+                  "remote end closed", "eof occurred")
+
+# Every fix that ends with the classifier picking itself back up says so:
+# the loop retries on every check, so a top-up or a network coming back is
+# noticed without a restart — and people should not go restarting things
+# that will fix themselves.
+_RESUMES = "Classification resumes on its own at the next check; no restart needed."
+
+
+def _provider_info(provider: Optional[str]) -> Dict[str, str]:
+    name = (provider or os.getenv("LLM_PROVIDER", "openrouter") or "").lower()
+    if name in _PROVIDERS:
+        return _PROVIDERS[name]
+    label = name.capitalize() if name else "The AI provider"
+    return {
+        "label": label,
+        "key_var": "the API key",
+        "credits": f"Top up your {label} account.",
+        "model_example": "",
+        "status_page": "",
+    }
+
+
+def _status_code_of(err: object) -> Optional[int]:
+    code = getattr(err, "status_code", None)
+    if isinstance(code, int):
+        return code
+    m = _STATUS_CODE.search(str(err))
+    return int(m.group(1)) if m else None
+
+
+def _provider_said(err: object) -> str:
+    """The provider's own sentence, dug out of the SDK's repr of its JSON."""
+    m = _QUOTED_MESSAGE.search(str(err))
+    if m:
+        return " ".join(m.group(1).split())
+    return " ".join(str(err).split())[:160]
+
+
+def llm(err: object, consequence: str = "", *, provider: Optional[str] = None,
+        model: str = "") -> Problem:
+    """A classifier (or screen-check) failure as a Problem, in the words of
+    the provider the user actually set up.
+
+    `err` is an SDK exception or the string the decider stored in its
+    [ERROR] verdict's reason. `consequence` is what the failure means for
+    this app, appended to the refusal — "Nothing is being classified or
+    logged until then." — because the same 402 means something different
+    for the title call than for the screen check.
+    """
+    info = _provider_info(provider)
+    label = info["label"]
+    text = str(err)
+    lower = text.lower()
+    code = _status_code_of(err)
+    said = _provider_said(err)
+
+    def out(message: str, fix: str) -> Problem:
+        return Problem(f"{message} {consequence}".strip(), fix)
+
+    if text.strip() == "[PARSE_ERROR]" or "parse_error" in lower:
+        return out(
+            "The model answered in a shape the app couldn't read.",
+            "That is usually a one-off. If it keeps happening, the model named "
+            "by LLM_MODEL in the .env next to the app isn't following the "
+            "format" + (f"; {info['model_example']} does." if info["model_example"]
+                        else "."))
+
+    if code == 402 or "insufficient credits" in lower or "insufficient_quota" in lower \
+            or "exceeded your current quota" in lower:
+        return out(f"{label} has run out of credits.",
+                   f"{info['credits']} {_RESUMES}")
+
+    if code in (401, 403) or "invalid api key" in lower or "incorrect api key" in lower:
+        return out(
+            f"{label} rejected the API key.",
+            f"Check {info['key_var']} in the .env next to the app — it may have "
+            f"been revoked, or pasted with a character missing — then restart "
+            f"the monitor from the tray.")
+
+    if code == 404 or "model not found" in lower or "does not exist" in lower:
+        which = f"“{model}”" if model else "the model in LLM_MODEL"
+        example = (f" ({info['model_example']} works)" if info["model_example"] else "")
+        return out(
+            f"{label} doesn't offer {which}.",
+            f"Set LLM_MODEL in the .env next to the app to a model {label} "
+            f"lists{example}, then restart the monitor from the tray.")
+
+    if code == 429:
+        return out(
+            f"{label} is rate-limiting this app.",
+            f"It said: {said}. This normally clears by itself within a minute. "
+            f"{_RESUMES}")
+
+    if code is not None and code >= 500:
+        where = f" Check {info['status_page']} if it lasts." if info["status_page"] else ""
+        return out(f"{label} is having an outage (it answered {code}).",
+                   f"Nothing to fix on this PC.{where} {_RESUMES}")
+
+    if code is None and any(w in lower for w in _NETWORK_WORDS):
+        return out(f"Can't reach {label}.",
+                   f"Check this PC's internet connection. {_RESUMES}")
+
+    return out(f"{label} returned an error the app doesn't recognise.",
+               f"It said: {said}. {LOOK_IN_THE_LOG}")
 
 
 def problem_for_status(err: Optional[object]) -> Optional[Dict[str, str]]:

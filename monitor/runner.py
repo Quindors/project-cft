@@ -21,6 +21,41 @@ from monitor import breaks as breaks_store
 from monitor import status as status_store
 from monitor import alerts as alerts_module
 from monitor import idle as idle_module
+from monitor import problems
+
+
+class _FailureStreak:
+    """Consecutive failures of one pipeline stage, reported to the status
+    snapshot once they form a pattern and withdrawn on the next success.
+
+    One failed call is weather — a dropped packet, a hiccup at the provider —
+    and a box for every hiccup would teach people to ignore the box. Two in
+    a row is a state, and a state with a fix belongs on the dashboard
+    (monitor/status.py). `count` rides along so the banner can say how many
+    checks have been lost.
+    """
+
+    def __init__(self, stage: str, *, after: int = 2):
+        self.stage = stage
+        self.after = max(1, after)
+        self.count = 0
+
+    def fail(self, problem: problems.Problem) -> None:
+        self.count += 1
+        if self.count >= self.after:
+            status_store.report_problem(self.stage, problem, count=self.count)
+
+    def ok(self) -> None:
+        if self.count:
+            status_store.clear_problem(self.stage)
+        self.count = 0
+
+
+# What a failure at each stage means for the person, appended to the
+# provider's refusal so the box reads as one sentence about THEIR app.
+CLASSIFIER_CONSEQUENCE = "Nothing is being classified or logged until it's sorted."
+VISION_CONSEQUENCE = ("The screen check is off, so verdicts are going by window "
+                      "title alone.")
 
 
 def run_monitor_loop(
@@ -147,6 +182,15 @@ def _run_live_loop(
     except ValueError:
         corrections_refresh_sec = 120.0
     last_corrections_reload = time.time()
+
+    # Failures that don't stop the loop but do have to become visible: an
+    # account out of credits otherwise reads as a quiet afternoon.
+    provider = os.getenv("LLM_PROVIDER", "openrouter")
+    classifier_health = _FailureStreak("classifier")
+    vision_health = _FailureStreak("vision")
+    storage_health = _FailureStreak("storage", after=1)
+    corrections_health = _FailureStreak("corrections")
+    status_store.clear_problems()
 
     print(f"\n[runner] Starting LIVE monitoring loop")
     if idle_threshold > 0:
@@ -294,8 +338,14 @@ def _run_live_loop(
                     # Priors move with corrections: a label just written also
                     # changes which rows count as uncorrected precedent.
                     prior_classifications = sink.load_prior_classifications()
+                    corrections_health.ok()
                 except Exception as e:
                     print(f"[runner] corrections refresh failed ({e}); keeping current set")
+                    corrections_health.fail(problems.Problem(
+                        "Corrections made on the dashboard aren't reaching the "
+                        "classifier, so it keeps using the labels it had.",
+                        f"The app reported: {' '.join(str(e).split())[:160]}. "
+                        f"It retries at every check. {problems.LOOK_IN_THE_LOG}"))
                     if edited:
                         # The edit never reached `corrections`. Put the signal
                         # back so the next tick retries, and hold the forced
@@ -368,18 +418,47 @@ def _run_live_loop(
                 # Log to console
                 _log_decision(decision, settings)
 
-                # Error verdicts (LLM/parse failures) are transient noise, not
-                # activity — keep them out of the log entirely.
-                if decision.get("final_category_name") in ("[ERROR]", "[PARSE_ERROR]"):
+                # Error verdicts (LLM/parse failures) are not activity — keep
+                # them out of the log. They are not silent either: two in a
+                # row puts the provider's refusal, and the fix, on the
+                # dashboard, since nothing else in the app would show it.
+                cat = decision.get("final_category_name")
+                if cat in ("[ERROR]", "[PARSE_ERROR]"):
                     print("[runner] error verdict - not logged")
+                    err = decision.get("final_reason", "") if cat == "[ERROR]" else "[PARSE_ERROR]"
+                    classifier_health.fail(problems.llm(
+                        err, CLASSIFIER_CONSEQUENCE, provider=provider, model=settings.model))
                     time.sleep(settings.poll_interval)
                     continue
+                classifier_health.ok()
+
+                # The screen check failing leaves a verdict, just a weaker
+                # one. A cached replay carries the old failure, not a new one.
+                if not from_cache:
+                    if decision.get("vision_error"):
+                        vision_health.fail(problems.llm(
+                            decision["vision_error"], VISION_CONSEQUENCE,
+                            provider=provider, model=settings.critic.vision_model))
+                    elif decision.get("vision_ran"):
+                        vision_health.ok()
 
                 # Write to sheets
                 t = time.time()
                 record = _build_record(decision, events_buffer, typed_text, now_dt, intention=intention)
-                sink.enqueue_record(record)
-                flush_result = sink.flush_if_needed()
+                try:
+                    sink.enqueue_record(record)
+                    flush_result = sink.flush_if_needed()
+                    storage_health.ok()
+                except Exception as e:
+                    print(f"[runner] could not save this verdict ({e})")
+                    flush_result = None
+                    storage_health.fail(problems.Problem(
+                        "Your activity can't be saved to the local database, "
+                        "so this time is being lost.",
+                        f"The app reported: {' '.join(str(e).split())[:160]}. "
+                        f"Check that the disk isn't full and that focus.db in "
+                        f"%LOCALAPPDATA%\\cft isn't open in another program, "
+                        f"then restart the monitor from the tray."))
                 sheets_time = time.time() - t
                 if flush_result:
                     print(f"[runner] Flushed to sheets ({sheets_time:.2f}s, appended={flush_result.appended}, updated={flush_result.updated})")

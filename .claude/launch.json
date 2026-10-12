@@ -22,6 +22,15 @@
       "port": 47997
     },
     {
+      "name": "pipeline-problems-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e", "bash", "-c",
+        "cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47998 CFT_E2E_PROBLEMS=1 ./venv/bin/python tests/e2e/serve.py"
+      ],
+      "port": 47998
+    },
+    {
       "name": "focus-dashboard",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [

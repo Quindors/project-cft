@@ -42,12 +42,21 @@ class DualSink:
 
     def _mirror_flush(self, batch: List[Dict[str, Any]]) -> None:
         # _flushing was acquired by flush_if_needed; release when done.
+        from monitor import problems, status
         try:
             for record in batch:
                 self.mirror.enqueue_record(record)
             self.mirror.flush(force=True)
+            status.clear_problem("mirror")
         except Exception as e:
             print(f"[mirror] flush failed, {len(batch)} rows not mirrored (local data intact): {e}")
+            status.report_problem("mirror", problems.Problem(
+                "Your activity isn't reaching the cloud copy, so the hosted "
+                "dashboard will show stale numbers whenever this PC is off.",
+                f"Everything is safe in the local database. Supabase said: "
+                f"{' '.join(str(e).split())[:160]}. Check SUPABASE_URL and "
+                f"SUPABASE_KEY in the .env next to the app and this PC's "
+                f"internet connection; it retries on the next flush."))
         finally:
             self._flushing.release()
 
