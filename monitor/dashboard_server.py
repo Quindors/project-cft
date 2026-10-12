@@ -1950,15 +1950,15 @@ function render(force) {
       <span class="chip"><i></i>${CHIP[snap.state] || CHIP.session}</span>
       <div class="dial">${ring()}
         <div><div class="time">${fmt(secsWorked())}</div>
-             <div class="sub">${esc(snap.label)} · stopwatch</div></div></div>
+             <div class="sub">${esc(snap.label)} · marathon</div></div></div>
       ${snap.intention && snap.intention.project ? `<p class="note">Part of
         <strong>${esc(snap.intention.project.name)}</strong>.</p>` : ''}
       <div class="row">
         <button class="primary" onclick="endSession('completed')" ${wait ? 'disabled' : ''}
-                title="${wait ? 'Untimed sessions can be finished after 20 minutes of work' : 'Finish and take your break'}">
+                title="${wait ? 'A marathon can be finished after 20 minutes of work' : 'Finish and take your break'}">
           ${wait ? `Done in ${fmt(wait)}` : 'Done — take a break'}</button>
         <button class="ghost" onclick="pauseSession(${snap.pause_max_min || 5})"
-                title="Stop the stopwatch and monitoring for up to ${snap.pause_max_min || 5} minutes">Break ${snap.pause_max_min || 5}m</button>
+                title="Pause the marathon clock and monitoring for up to ${snap.pause_max_min || 5} minutes">Break ${snap.pause_max_min || 5}m</button>
         <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
       </div>`;
       return;
@@ -2000,8 +2000,9 @@ function render(force) {
           class="${m === duration ? 'sel' : ''}">${m}m</button>`).join('')}
       <button onclick="pick('custom')" class="${duration === 'custom' ? 'sel' : ''}">Custom</button>
       <button onclick="pick('stopwatch')" class="${duration === 'stopwatch' ? 'sel' : ''}"
-              title="Untimed: a stopwatch instead of a countdown. Finish after 20 minutes of work; breaks of up to 5 minutes along the way">Stopwatch</button>
+              title="No clock to beat: it counts up while you work">Marathon</button>
     </div>
+    <p class="note">${durationHint()}</p>
     <div class="customrow ${duration === 'custom' ? 'show' : ''}">
       <input id="custom" type="number" min="${MIN_MIN}" max="${MAX_MIN}" placeholder="120"
              value="${escAttr(form.custom)}" aria-label="Custom session length in minutes"
@@ -2014,6 +2015,22 @@ function render(force) {
 
   const t = document.getElementById('text');
   if (t && document.activeElement !== t) t.focus();
+}
+
+// The line under the length chips: what the choice means for your break.
+function durationHint() {
+  if (duration === 'stopwatch') {
+    return 'Marathon: no clock to beat \u2014 it counts up while you work. Finish any time '
+      + 'after 20 minutes of work, take breaks of up to 5 minutes whenever you need '
+      + '(the clock waits for you), and your break afterwards is half your time under '
+      + '30 minutes, 15 after that.';
+  }
+  if (duration === 'custom') {
+    return `Under 30 minutes, your break is half the session; from 30 minutes up it's ${BREAK_MIN}.`;
+  }
+  return duration < 30
+    ? `Under 30 minutes, your break is half the session: ${Math.floor(duration / 2)} minutes after this one.`
+    : `A ${BREAK_MIN}-minute break follows when you finish.`;
 }
 
 function pick(m) {

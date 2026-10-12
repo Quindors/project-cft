@@ -343,7 +343,7 @@ def validate(text: str, duration_min, untimed: bool = False) -> tuple:
             f"A focus session has to run between {MIN_DURATION_MIN} and "
             f"{MAX_DURATION_MIN} minutes.",
             "Pick one of the preset lengths, or type anything in that range "
-            "\u2014 or start an untimed session on a stopwatch instead.")
+            "\u2014 or start a marathon, which has no clock to beat.")
     return text, duration_min
 
 
@@ -444,16 +444,16 @@ def pause_active(minutes=None) -> Dict:
             length = -1
         if not (1 <= length <= UNTIMED_PAUSE_MAX_MIN):
             raise UserError(
-                f"A break inside an untimed session can be 1 to "
+                f"A break during a marathon can be 1 to "
                 f"{UNTIMED_PAUSE_MAX_MIN} minutes.",
                 f"Pick a shorter break \u2014 take as many as you need. The "
-                f"stopwatch stands still while it runs.")
+                f"marathon clock waits while it runs.")
     else:
         if minutes not in (None, "", PAUSE_MIN, str(PAUSE_MIN)):
             raise UserError(
                 f"A timed session can only pause for {PAUSE_MIN} minute.",
                 "Use the pause for the door or the kettle. For a longer break, "
-                "finish the session \u2014 or start an untimed one next time, "
+                "finish the session \u2014 or start a marathon next time, "
                 "which allows breaks of up to five minutes.")
         length = PAUSE_MIN
 
@@ -547,7 +547,7 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
         if worked < UNTIMED_FINISH_MIN * 60:
             more = UNTIMED_FINISH_MIN * 60 - worked
             raise UserError(
-                f"An untimed session can be finished after {UNTIMED_FINISH_MIN} "
+                f"A marathon can be finished after {UNTIMED_FINISH_MIN} "
                 f"minutes of work \u2014 this one has {worked // 60}.",
                 f"Keep going for about {max(1, -(-more // 60))} more minute"
                 f"{'' if -(-more // 60) == 1 else 's'}, or abandon it if you're "

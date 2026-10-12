@@ -101,9 +101,9 @@ def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
         active = intentions.get_active()
         if active is not None and active.get("untimed"):
             raise UserError(
-                "You're in an untimed session, so a full break would end it.",
+                "You're on a marathon, so a full break would end it.",
                 f"Take a break of up to {intentions.UNTIMED_PAUSE_MAX_MIN} minutes "
-                f"inside the session instead \u2014 the stopwatch waits for you "
+                f"inside the marathon instead \u2014 its clock waits for you "
                 f"\u2014 or finish or abandon the session first.")
         try:
             intentions.end_active("completed", fire_hook=False)
