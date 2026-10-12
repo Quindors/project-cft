@@ -471,6 +471,52 @@ def _parse_align(content: str) -> Optional[float]:
     return min(max(float(m.group(1)), 0.0), 1.0)
 
 
+def _productivity_label(is_productive) -> str:
+    if is_productive is True:
+        return "PRODUCTIVE"
+    if is_productive is False:
+        return "NOT PRODUCTIVE"
+    return "NEUTRAL"
+
+
+# prompt-main.txt was written for the starter categories, and names their four
+# off-task buckets as fixed text in rule (b) and rule 4. The user's own
+# categories, and every neutral one, were invisible to those rules, so a title
+# that clearly fit a neutral category (Music) was pushed into the nearest
+# named bucket (Entertainment). The list is rebuilt from the real categories.
+_STARTER_OFF_TASK = "(Social Media, Gaming, Entertainment, Shopping)"
+_CLASSIFIER_BUCKETS = {"ambiguous", "system"}
+
+
+def _fit_rules_to_categories(prompt: str, categories: List[Dict]) -> str:
+    if not categories:
+        return prompt
+    named = [c for c in categories if (c.get("name") or "").lower() not in _CLASSIFIER_BUCKETS]
+    off_task = [c["name"] for c in named if c.get("is_productive") is False]
+    neutral = [c["name"] for c in named if c.get("is_productive") is None]
+    specific = off_task + neutral
+    if specific and _STARTER_OFF_TASK in prompt:
+        prompt = prompt.replace(
+            "specific off-task category " + _STARTER_OFF_TASK,
+            "specific off-task or neutral category (" + ", ".join(specific) + ")")
+        prompt = prompt.replace(_STARTER_OFF_TASK, "(" + ", ".join(specific) + ")")
+    if neutral:
+        names = ", ".join(f'"{n}"' for n in neutral)
+        prompt += (
+            "\n\nNEUTRAL CATEGORIES: " + names + " are neither productive nor "
+            "off-task. Each is a specific answer, held to the same standard as an "
+            "off-task category: use it when the CURRENT WINDOW TITLE plainly shows "
+            "the activity its description names. When it does, the neutral "
+            "category beats Ambiguous, and it beats any off-task category that "
+            "only resembles the activity — follow the category descriptions, "
+            "not the nearest platform rule. The title does not have to name a "
+            "platform: a window titled with a piece or song and its composer or "
+            "performers, the way music players title what they are playing "
+            "(\"Symphony No. 5 • Beethoven, Berliner Philharmoniker\"), shows "
+            "listening to music as plainly as \"Spotify\" does.")
+    return prompt
+
+
 def build_prompt(
     events: List[Tuple[str, str]],
     categories: List[Dict] = None,
@@ -489,9 +535,12 @@ def build_prompt(
         )
 
     if categories:
+        # Three labels, as the screen check prints them. A neutral category
+        # printed as NOT PRODUCTIVE looked exactly like Entertainment, so
+        # "listening to Mahler" landed in Entertainment (2026-10-07).
         category_list = "\n".join([
             f"- \"{cat['name']}\": {cat['description']} "
-            f"({'PRODUCTIVE' if cat.get('is_productive') else 'NOT PRODUCTIVE'})"
+            f"({_productivity_label(cat.get('is_productive'))})"
             for cat in categories
         ])
     else:
@@ -500,6 +549,7 @@ def build_prompt(
     filled = template
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", activity_str)
+    filled = _fit_rules_to_categories(filled, categories or [])
 
     # Inject few-shot examples (corrections + prior classifications)
     if events:

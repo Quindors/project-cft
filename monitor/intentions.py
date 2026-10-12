@@ -32,12 +32,24 @@ from monitor.problems import UserError
 _TS_FMT = "%Y-%m-%d %H:%M:%S"
 
 MAX_TEXT_LEN = 300
-# A focus session is a real block of work: half an hour is the floor. Anything
-# shorter is not a session, it's an interruption with a label on it.
-MIN_DURATION_MIN = 30
+# A focus session is a real block of work: twenty minutes is the floor (the
+# user asked for 20-minute sessions on 2026-10-11; they earn a 10-minute
+# break, see breaks.break_minutes_after). Anything shorter is not a session,
+# it's an interruption with a label on it.
+MIN_DURATION_MIN = 20
 MAX_DURATION_MIN = 8 * 60
 # A pause is one minute: enough for the door or the kettle, not for a scroll.
 PAUSE_MIN = 1
+
+# Untimed sessions run on a stopwatch instead of a countdown. They can be
+# finished ("Done", which earns a break and counts as a session) only after
+# UNTIMED_FINISH_MIN minutes of WORKED time — breaks don't count — and
+# abandoned at any time. Breaks inside one may run up to UNTIMED_PAUSE_MAX_MIN
+# minutes each, as many as needed; the stopwatch stands still while they run.
+# ends_at still exists, as a hard cap: an untimed session left running expires
+# like any other once it reaches MAX_DURATION_MIN.
+UNTIMED_FINISH_MIN = 20
+UNTIMED_PAUSE_MAX_MIN = 5
 
 
 def _finished(intention: Dict, status: str, *, start_break: bool = True) -> None:
@@ -187,7 +199,44 @@ def _connect() -> sqlite3.Connection:
         conn.execute("ALTER TABLE intentions ADD COLUMN project_id INTEGER")
     except sqlite3.OperationalError:
         pass  # column already exists
+    # untimed: 1 for a stopwatch session. paused_sec: seconds spent in
+    # in-session breaks/pauses so far, so worked time = elapsed - paused_sec.
+    for col in ("untimed INTEGER NOT NULL DEFAULT 0", "paused_sec INTEGER NOT NULL DEFAULT 0"):
+        try:
+            conn.execute(f"ALTER TABLE intentions ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     return conn
+
+
+def _ts(s: Optional[str]) -> Optional[datetime]:
+    try:
+        return datetime.strptime(s, _TS_FMT) if s else None
+    except ValueError:
+        return None
+
+
+def worked_sec(row: Dict, *, now: Optional[datetime] = None, pause_left_sec: int = 0) -> int:
+    """Seconds of the session spent working: from its start to its end (or
+    now), minus its breaks. paused_sec already includes a pause's full length
+    from the moment it starts, so while one is still running, pass its
+    remaining seconds back in (pause_left_sec) to get the frozen stopwatch."""
+    start = _ts(row.get("started_at"))
+    if start is None:
+        return 0
+    end = _ts(row.get("ended_at")) or now or datetime.now()
+    paused = int(row.get("paused_sec") or 0) - int(pause_left_sec or 0)
+    return max(0, int((end - start).total_seconds()) - max(0, paused))
+
+
+def planned_min(row: Dict) -> Optional[int]:
+    """A timed session's length as declared, in minutes; None for untimed."""
+    if row.get("untimed"):
+        return None
+    start, ends = _ts(row.get("started_at")), _ts(row.get("ends_at"))
+    if start is None or ends is None:
+        return None
+    return max(0, round(((ends - start).total_seconds() - int(row.get("paused_sec") or 0)) / 60))
 
 
 def _attach_project(row: Dict) -> Dict:
@@ -265,11 +314,12 @@ def get_active() -> Optional[Dict]:
     return None
 
 
-def validate(text: str, duration_min) -> tuple:
+def validate(text: str, duration_min, untimed: bool = False) -> tuple:
     """Normalize and bounds-check a would-be intention -> (text, duration_min).
 
     Split out of start() so the HTTP layer can reject bad input before
-    spending an LLM call on the intention gate.
+    spending an LLM call on the intention gate. An untimed session has no
+    duration to check: duration_min comes back None.
     """
     text = " ".join((text or "").split())
     if not text:
@@ -285,19 +335,20 @@ def validate(text: str, duration_min) -> tuple:
             "Shorten it to the one thing you're working on \u2014 a whole "
             "to-do list is harder to judge your screen against than a single "
             "aim.")
+    if untimed:
+        return text, None
     duration_min = int(duration_min)
     if not (MIN_DURATION_MIN <= duration_min <= MAX_DURATION_MIN):
         raise UserError(
             f"A focus session has to run between {MIN_DURATION_MIN} and "
             f"{MAX_DURATION_MIN} minutes.",
-            "Pick one of the preset lengths, or type anything in that range. "
-            "You can finish early \u2014 the session counts what you actually "
-            "sat through.")
+            "Pick one of the preset lengths, or type anything in that range "
+            "\u2014 or start an untimed session on a stopwatch instead.")
     return text, duration_min
 
 
-def start(text: str, duration_min: int, llm_category: Optional[str] = None,
-          project_id: Optional[int] = None) -> Dict:
+def start(text: str, duration_min, llm_category: Optional[str] = None,
+          project_id: Optional[int] = None, *, untimed: bool = False) -> Dict:
     """Start a session intention, superseding any currently active one.
 
     llm_category is the home category the intention gate mapped the declared
@@ -305,11 +356,13 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None,
     files the session under a project (monitor/projects.py); the caller has
     already checked the project exists and is active.
     """
-    text, duration_min = validate(text, duration_min)
+    text, duration_min = validate(text, duration_min, untimed)
 
     now = datetime.now()
     started_at = now.strftime(_TS_FMT)
-    ends_at = (now + timedelta(minutes=duration_min)).strftime(_TS_FMT)
+    # An untimed session's ends_at is only its hard cap (see UNTIMED_*).
+    ends_at = (now + timedelta(minutes=MAX_DURATION_MIN if untimed else duration_min)
+               ).strftime(_TS_FMT)
 
     # A lingering pause belongs to the session about to be superseded; without
     # this it would sit on the new session as a stale "Paused" for up to a
@@ -331,9 +384,9 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None,
             (started_at,),
         )
         cur = conn.execute(
-            "INSERT INTO intentions (text, started_at, ends_at, status, llm_category, project_id) "
-            "VALUES (?,?,?, 'active', ?, ?)",
-            (text, started_at, ends_at, llm_category, project_id),
+            "INSERT INTO intentions (text, started_at, ends_at, status, llm_category, "
+            "project_id, untimed, paused_sec) VALUES (?,?,?, 'active', ?, ?, ?, 0)",
+            (text, started_at, ends_at, llm_category, project_id, int(bool(untimed))),
         )
         active = {
             "id": cur.lastrowid,
@@ -344,6 +397,8 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None,
             "status": "active",
             "llm_category": llm_category,
             "project_id": project_id,
+            "untimed": int(bool(untimed)),
+            "paused_sec": 0,
         }
 
     for row in superseded:
@@ -354,8 +409,9 @@ def start(text: str, duration_min: int, llm_category: Optional[str] = None,
     return _attach_project(active)
 
 
-def pause_active() -> Dict:
-    """Freeze the active session for PAUSE_MIN minute(s).
+def pause_active(minutes=None) -> Dict:
+    """Freeze the active session for PAUSE_MIN minute(s) — or, in an untimed
+    session, for 1 to UNTIMED_PAUSE_MAX_MIN minutes (default the maximum).
 
     A pause is a break in all but name — implemented AS one (source="pause")
     so the runner's hard stop (no polling, no keystrokes, no classification,
@@ -381,16 +437,37 @@ def pause_active() -> Dict:
             "Start one first \u2014 pausing only holds a session that's "
             "already going.")
 
+    if active.get("untimed"):
+        try:
+            length = UNTIMED_PAUSE_MAX_MIN if minutes in (None, "") else int(minutes)
+        except (TypeError, ValueError):
+            length = -1
+        if not (1 <= length <= UNTIMED_PAUSE_MAX_MIN):
+            raise UserError(
+                f"A break inside an untimed session can be 1 to "
+                f"{UNTIMED_PAUSE_MAX_MIN} minutes.",
+                f"Pick a shorter break \u2014 take as many as you need. The "
+                f"stopwatch stands still while it runs.")
+    else:
+        if minutes not in (None, "", PAUSE_MIN, str(PAUSE_MIN)):
+            raise UserError(
+                f"A timed session can only pause for {PAUSE_MIN} minute.",
+                "Use the pause for the door or the kettle. For a longer break, "
+                "finish the session \u2014 or start an untimed one next time, "
+                "which allows breaks of up to five minutes.")
+        length = PAUSE_MIN
+
     old_ends = active["ends_at"]
     new_ends = (
-        datetime.strptime(old_ends, _TS_FMT) + timedelta(minutes=PAUSE_MIN)
+        datetime.strptime(old_ends, _TS_FMT) + timedelta(minutes=length)
     ).strftime(_TS_FMT)
     with _connect() as conn:
         # Single-shot, like every other transition: if the session ended
         # between the read above and this write, pause nothing.
         won = conn.execute(
-            "UPDATE intentions SET ends_at = ? WHERE id = ? AND status = 'active'",
-            (new_ends, active["id"]),
+            "UPDATE intentions SET ends_at = ?, paused_sec = paused_sec + ? "
+            "WHERE id = ? AND status = 'active'",
+            (new_ends, length * 60, active["id"]),
         ).rowcount == 1
     if not won:
         raise UserError(
@@ -398,17 +475,19 @@ def pause_active() -> Dict:
             "Refresh the dashboard to see where things stand.")
 
     try:
-        pause = breaks.start(PAUSE_MIN, source="pause", intention_id=active["id"])
+        pause = breaks.start(length, source="pause", intention_id=active["id"])
     except Exception:
         # No pause means no frozen minute to compensate for — put it back.
         with _connect() as conn:
             conn.execute(
-                "UPDATE intentions SET ends_at = ? WHERE id = ? AND status = 'active'",
-                (old_ends, active["id"]),
+                "UPDATE intentions SET ends_at = ?, paused_sec = paused_sec - ? "
+                "WHERE id = ? AND status = 'active'",
+                (old_ends, length * 60, active["id"]),
             )
         raise
 
     active["ends_at"] = new_ends
+    active["paused_sec"] = int(active.get("paused_sec") or 0) + length * 60
     _mirror(active)
     return {"active": active, "pause": pause}
 
@@ -429,9 +508,11 @@ def shift_active_ends(intention_id: int, delta_sec: int) -> bool:
         new_ends = (
             datetime.strptime(row["ends_at"], _TS_FMT) + timedelta(seconds=delta_sec)
         ).strftime(_TS_FMT)
+        # The handed-back seconds were never spent paused, either.
         won = conn.execute(
-            "UPDATE intentions SET ends_at = ? WHERE id = ? AND status = 'active'",
-            (new_ends, intention_id),
+            "UPDATE intentions SET ends_at = ?, "
+            "paused_sec = MAX(0, paused_sec + ?) WHERE id = ? AND status = 'active'",
+            (new_ends, delta_sec, intention_id),
         ).rowcount == 1
         full = dict(conn.execute(
             "SELECT * FROM intentions WHERE id = ?", (intention_id,)
@@ -458,6 +539,19 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
     active = get_active()
     if active is None:
         return None
+    if status == "completed" and active.get("untimed"):
+        from monitor import breaks
+        pause = breaks.get_active()
+        left = pause.get("remaining_sec", 0) if pause and pause.get("source") == "pause" else 0
+        worked = worked_sec(active, pause_left_sec=left)
+        if worked < UNTIMED_FINISH_MIN * 60:
+            more = UNTIMED_FINISH_MIN * 60 - worked
+            raise UserError(
+                f"An untimed session can be finished after {UNTIMED_FINISH_MIN} "
+                f"minutes of work \u2014 this one has {worked // 60}.",
+                f"Keep going for about {max(1, -(-more // 60))} more minute"
+                f"{'' if -(-more // 60) == 1 else 's'}, or abandon it if you're "
+                f"stopping for good. Breaks don't count toward the {UNTIMED_FINISH_MIN}.")
     with _connect() as conn:
         # Single-shot, same as expiry: two "Done" clicks must not both count.
         won = conn.execute(

@@ -96,6 +96,27 @@ def mirror_correction_rows(changes) -> None:
     _run_async("correction-rule", op)
 
 
+def mirror_intent_rows(changes) -> None:
+    """Apply intent rulings from the Review tab to the matching Supabase rows.
+
+    `changes` is [(timestamp, current_window, human_align-or-None), ...], the
+    rows the local UPDATE touched, matched by the same natural key as
+    corrections. Needs migrations/2026-10-11_intent_review.sql; before it is
+    applied this fails, harmlessly, in the background."""
+    if not enabled() or not changes:
+        return
+
+    def op(sb):
+        for timestamp, current_window, human_align in changes:
+            (sb.table("focus_logs")
+               .update({"human_align": human_align})
+               .eq("timestamp", timestamp)
+               .eq("current_window", current_window)
+               .execute())
+
+    _run_async("intent-review", op)
+
+
 _INTENTION_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status",
                    "llm_category", "project_id")
 

@@ -106,7 +106,11 @@ class LocalSink:
                 """
             )
             # Migrate pre-intention databases in place.
-            for col, typ in (("intention_id", "INTEGER"), ("align_score", "REAL")):
+            # human_align: the user's after-the-fact ruling on a session row
+            # (1 on-intent, 0 off-intent), which readers take over align_score
+            # — see monitor/intent_review.py.
+            for col, typ in (("intention_id", "INTEGER"), ("align_score", "REAL"),
+                             ("human_align", "INTEGER")):
                 try:
                     self._conn.execute(f"ALTER TABLE focus_logs ADD COLUMN {col} {typ}")
                 except sqlite3.OperationalError:

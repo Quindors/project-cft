@@ -500,8 +500,13 @@ class _TimerWidget:
     # ---------- state ----------
 
     def _remaining(self) -> Optional[int]:
-        """Seconds left, recomputed locally between DB refreshes."""
-        return status.seconds_until(self._snapshot.get("ends_at"))
+        """The seconds the clock shows, recomputed locally between DB
+        refreshes: time left on a countdown, or time worked on an untimed
+        session's stopwatch (frozen at its value while a break runs)."""
+        snap = self._snapshot
+        if snap.get("untimed") and snap.get("state") != status.STATE_PAUSED:
+            return status.seconds_since(snap.get("stopwatch_from"))
+        return status.seconds_until(snap.get("ends_at"))
 
     def _colors(self):
         return PALETTE.get(self._snapshot.get("state"), _FALLBACK)
@@ -960,10 +965,16 @@ class _TimerWidget:
                                           tags="chevron")
 
     def _render_progress(self, x1: float, y: float, x2: float) -> None:
-        """Thin bar: how much of the session or break has been used up."""
+        """Thin bar: how much of the session or break has been used up — or,
+        on a stopwatch, how close the session is to being finishable."""
         remaining = status.seconds_until(self._snapshot.get("ends_at"))
         started = self._snapshot.get("started_at")
         used = 0.0
+        if self._snapshot.get("untimed") and self._snapshot.get("state") != status.STATE_PAUSED:
+            worked = self._remaining() or 0
+            need = worked + int(self._snapshot.get("finish_in_sec") or 0)
+            used = 1.0 if need <= 0 else min(1.0, worked / max(1, need))
+            started, remaining = None, None
         if started and remaining is not None:
             from datetime import datetime
             try:
@@ -1168,15 +1179,24 @@ class _TimerWidget:
                 # session and hands back the unused part of the minute.
                 menu.add_command(label="Resume session now", command=self._end_break)
             if snap.get("intention"):
-                menu.add_command(label="Finish session (start break)",
-                                 command=lambda: self._end_session("completed"))
+                if snap.get("untimed") and snap.get("state") != status.STATE_PAUSED:
+                    menu.add_command(
+                        label=f"Take a {snap.get('pause_max_min') or 5}-minute break",
+                        command=self._pause_session)
+                finishable = not snap.get("untimed") or not snap.get("finish_in_sec")
+                menu.add_command(
+                    label="Finish session (start break)" if finishable else
+                    f"Finish session — available in {max(1, -(-int(snap.get('finish_in_sec')) // 60))} min",
+                    command=lambda: self._end_session("completed"),
+                    state="normal" if finishable else "disabled")
                 menu.add_command(label="Abandon session",
                                  command=lambda: self._end_session("abandoned"))
             else:
                 menu.add_command(label="Start a focus session…",
                                  command=self._open_intention)
-            menu.add_command(label=f"Take a {breaks.DEFAULT_BREAK_MIN}-minute break",
-                             command=self._start_break)
+            if not snap.get("untimed"):
+                menu.add_command(label=f"Take a {breaks.DEFAULT_BREAK_MIN}-minute break",
+                                 command=self._start_break)
         menu.add_separator()
         menu.add_command(label="Expand" if self.collapsed else "Collapse",
                          command=self.toggle_collapsed)
@@ -1205,6 +1225,14 @@ class _TimerWidget:
             breaks.start(breaks.DEFAULT_BREAK_MIN)
         except Exception as e:
             print(f"[timer] could not start break ({e})")
+        self._refresh_now()
+
+    def _pause_session(self) -> None:
+        from monitor import intentions
+        try:
+            intentions.pause_active(intentions.UNTIMED_PAUSE_MAX_MIN)
+        except Exception as e:
+            print(f"[timer] could not start the in-session break ({e})")
         self._refresh_now()
 
     def _end_break(self) -> None:

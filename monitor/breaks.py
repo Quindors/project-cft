@@ -96,6 +96,15 @@ def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
     from monitor import intentions
 
     if source == "manual":
+        # An untimed session can't be closed by a break: it is only finished
+        # after its work minimum, and it has breaks of its own.
+        active = intentions.get_active()
+        if active is not None and active.get("untimed"):
+            raise UserError(
+                "You're in an untimed session, so a full break would end it.",
+                f"Take a break of up to {intentions.UNTIMED_PAUSE_MAX_MIN} minutes "
+                f"inside the session instead \u2014 the stopwatch waits for you "
+                f"\u2014 or finish or abandon the session first.")
         try:
             intentions.end_active("completed", fire_hook=False)
         except Exception as e:
@@ -152,6 +161,23 @@ def clear_pause() -> bool:
     return False
 
 
+def break_minutes_after(intention: Dict) -> int:
+    """How long a finished session's break runs.
+
+    A session under half an hour earns half its length (a 20-minute session,
+    10 minutes); anything longer earns the standard DEFAULT_BREAK_MIN. A timed
+    session is measured by its declared length, an untimed one by the work
+    it logged on the stopwatch (its breaks don't count).
+    """
+    from monitor import intentions
+    minutes = intentions.planned_min(intention)
+    if minutes is None:
+        minutes = intentions.worked_sec(intention) // 60
+    if minutes < 30:
+        return max(MIN_BREAK_MIN, minutes // 2)   # 20 -> 10, 25 -> 12, 29 -> 14
+    return DEFAULT_BREAK_MIN
+
+
 def after_session_end(intention: Dict, status: str) -> None:
     """Session-end hook: a finished session rolls straight into a break.
 
@@ -166,6 +192,6 @@ def after_session_end(intention: Dict, status: str) -> None:
     if get_active() is not None:
         return
     try:
-        start(DEFAULT_BREAK_MIN, source=status)
+        start(break_minutes_after(intention), source=status)
     except Exception as e:
         print(f"[break] auto-break after session {status} failed ({e})")

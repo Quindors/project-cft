@@ -442,10 +442,12 @@ def _sessions(start: date, end: date, cfg: Config) -> List[SessionStats]:
             counts: Dict[int, sqlite3.Row] = {}
             if rows:
                 marks = ",".join("?" * len(rows))
+                from monitor.intent_review import align_sql
+                align = align_sql(conn)  # a Review-tab ruling wins
                 for c in conn.execute(
                     "SELECT intention_id, COUNT(*) AS n, "
-                    "       SUM(align_score IS NOT NULL) AS scored, "
-                    "       SUM(CASE WHEN align_score >= ? THEN 1 ELSE 0 END) AS on_intent "
+                    f"       SUM({align} IS NOT NULL) AS scored, "
+                    f"       SUM(CASE WHEN {align} >= ? THEN 1 ELSE 0 END) AS on_intent "
                     f"FROM focus_logs WHERE intention_id IN ({marks}) "
                     "GROUP BY intention_id",
                     [OFF_INTENT_MAX] + [r["id"] for r in rows],

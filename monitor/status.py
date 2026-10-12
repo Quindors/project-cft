@@ -153,6 +153,28 @@ def full_snapshot() -> Dict[str, Any]:
         "away": bool(snap.get("away")),
     }
 
+    # Untimed (stopwatch) sessions: what the clock shows and when "Done"
+    # becomes available. stopwatch_from is the instant the stopwatch would
+    # read zero if it had never stopped — clients count up from it locally,
+    # so it ticks smoothly between polls. While a pause runs it is frozen:
+    # worked_sec already leaves the pause out.
+    if active_intention is not None and active_intention.get("untimed"):
+        from datetime import datetime, timedelta
+        from monitor import intentions
+        left = active_break.get("remaining_sec", 0) if is_pause else 0
+        worked = intentions.worked_sec(active_intention, pause_left_sec=left)
+        out.update(
+            untimed=True,
+            elapsed_sec=worked,
+            finish_in_sec=max(0, intentions.UNTIMED_FINISH_MIN * 60 - worked),
+            stopwatch_from=None if is_pause else
+            (datetime.now() - timedelta(seconds=worked)).strftime("%Y-%m-%d %H:%M:%S"),
+            pause_max_min=intentions.UNTIMED_PAUSE_MAX_MIN,
+        )
+    else:
+        out.update(untimed=False, elapsed_sec=None, finish_in_sec=0,
+                   stopwatch_from=None, pause_max_min=None)
+
     if is_pause and active_intention is not None:
         # A paused session is still a session — the card keeps the intention,
         # and the countdown is the pause's own: when monitoring comes back.
@@ -181,13 +203,16 @@ def full_snapshot() -> Dict[str, Any]:
             "partial-intent": STATE_PARTIAL,
             "off-intent": STATE_OFF,
         }.get(snap.get("tier") or "", STATE_SESSION)
+        untimed = bool(active_intention.get("untimed"))
         out.update(
             phase=PHASE_SESSION,
             state=tier_state,
             label=active_intention.get("text") or "Focus session",
             started_at=active_intention.get("started_at"),
-            ends_at=active_intention.get("ends_at"),
-            remaining_sec=seconds_until(active_intention.get("ends_at")),
+            # A stopwatch has nothing to count down to; its ends_at is only
+            # the hard cap, so it is not handed out as a deadline.
+            ends_at=None if untimed else active_intention.get("ends_at"),
+            remaining_sec=None if untimed else seconds_until(active_intention.get("ends_at")),
         )
     else:
         # No session means no ALIGN, so the only drift signal left is the
@@ -213,6 +238,18 @@ def full_snapshot() -> Dict[str, Any]:
         if out["phase"] == PHASE_IDLE:
             out["label"] = "Away"
     return out
+
+
+def seconds_since(stamp: Optional[str]) -> Optional[int]:
+    """Seconds elapsed since a naive local "YYYY-MM-DD HH:MM:SS" stamp."""
+    if not stamp:
+        return None
+    from datetime import datetime
+    try:
+        then = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return max(0, int((datetime.now() - then).total_seconds()))
 
 
 def seconds_until(stamp: Optional[str]) -> Optional[int]:

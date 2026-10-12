@@ -121,6 +121,11 @@ Endpoints:
                                    never be reassigned into a productive one —
                                    that would retroactively count them as
                                    focused time
+    POST /api/intent-review     -> {ids, aligned: true|false|null} rules logged
+                                   session rows on/off intent (human_align,
+                                   which readers take over align_score) and
+                                   pins the window for that intention; null
+                                   clears both
     GET  /api/mode              -> {mode}  ("focus" | "tracker")
     POST /api/mode              -> {mode} switches the alert mode. Tracker logs
                                    exactly as focus does but fires nothing,
@@ -140,7 +145,7 @@ Endpoints:
                                    with no project
     POST /api/sessions/project  -> {id, project_id|null} files a finished
                                    session under a project
-    POST /api/intention         -> {text, duration_min, category?, confirm?,
+    POST /api/intention         -> {text, duration_min | untimed: true, category?, confirm?,
                                    project_id?}
                                    starts a session intention (supersedes any
                                    active one). category is the user's pick:
@@ -160,7 +165,10 @@ Endpoints:
                                    clears); 404 if no such finished session
     POST /api/intention/end     -> {status?: completed|abandoned} ends the active one;
                                    completing one rolls into the post-session break
-    POST /api/intention/pause   -> pauses the active session for 1 minute: the
+    POST /api/intention/pause   -> {minutes?} pauses the active session — 1
+                                   minute in a timed session, 1-5 (default 5)
+                                   in an untimed one, whose stopwatch stands
+                                   still meanwhile. In a timed session: the
                                    countdown freezes (ends_at moves out by the
                                    same minute) and monitoring stops, exactly
                                    like a short break; resumes by itself when
@@ -294,12 +302,16 @@ def _finished_sessions(conn, limit: int) -> list:
     on another shows both.
     """
     out = None
+    # A Review-tab ruling wins over the model's score, so a session the
+    # model misjudged waters its tree once the user has said so.
+    from monitor.intent_review import align_sql
+    align = align_sql(conn, "f")
     try:
         rows = conn.execute(
             "SELECT i.id, i.text, i.started_at, i.ended_at, "
             "       i.status, i.llm_category, i.project_id, "
             "       p.name AS project_name, "
-            "       AVG(f.align_score) AS avg_align "
+            f"       AVG({align}) AS avg_align "
             "FROM intentions i "
             "LEFT JOIN projects p ON p.id = i.project_id "
             "LEFT JOIN focus_logs f ON f.intention_id = i.id "
@@ -315,7 +327,7 @@ def _finished_sessions(conn, limit: int) -> list:
             rows = conn.execute(
                 "SELECT i.id, i.text, i.started_at, i.ended_at, "
                 "       i.status, i.llm_category, "
-                "       AVG(f.align_score) AS avg_align "
+                f"       AVG({align}) AS avg_align "
                 "FROM intentions i "
                 "LEFT JOIN focus_logs f ON f.intention_id = i.id "
                 "WHERE i.status IN ('completed', 'expired') "
@@ -560,10 +572,13 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 # the declared work of a session — which the page applies
                 # itself (focus-dashboard's useFocusData), so the pie can
                 # show that time as a slice of its own.
+                # align_score is the EFFECTIVE alignment (a Review-tab
+                # ruling wins), so the in-session slice matches Beeminder.
+                from monitor.intent_review import align_sql
                 cols = ("SELECT timestamp, "
                         "COALESCE(NULLIF(TRIM(human_label), ''), category_name) AS category_name, "
                         "category_name AS ai_category, confidence, "
-                        "intention_id, align_score FROM focus_logs ")
+                        f"intention_id, {align_sql(conn)} AS align_score FROM focus_logs ")
                 since = (qs.get("since", [""])[0] or "").strip()
                 if since:
                     rows = conn.execute(
@@ -580,14 +595,32 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     limit = min(max(int(qs.get("limit", ["100"])[0]), 1), 1000)
                 except ValueError:
                     limit = 100
-                rows = conn.execute(
+                # align_score stays the MODEL's score here and human_align
+                # carries the ruling, so the Review tab can show both and
+                # undo cleanly. intention_text names the session a row was
+                # judged against.
+                from monitor.intent_review import _has_column
+                ruled = "human_align" if _has_column(conn, "focus_logs", "human_align") \
+                    else "NULL AS human_align"
+                rows = [dict(r) for r in conn.execute(
                     "SELECT id, timestamp, current_window, category_name, confidence, "
-                    "human_label, reason, intention_id, align_score FROM focus_logs "
+                    f"human_label, reason, intention_id, align_score, {ruled} FROM focus_logs "
                     "WHERE current_window IS NOT NULL "
                     "ORDER BY timestamp DESC LIMIT ?",
                     (limit,),
-                ).fetchall()
-                self._send_json([dict(r) for r in rows])
+                ).fetchall()]
+                iids = sorted({r["intention_id"] for r in rows if r["intention_id"] is not None})
+                texts = {}
+                if iids:
+                    try:
+                        texts = {t[0]: t[1] for t in conn.execute(
+                            f"SELECT id, text FROM intentions WHERE id IN ({','.join('?' * len(iids))})",
+                            iids)}
+                    except sqlite3.OperationalError:
+                        texts = {}
+                for r in rows:
+                    r["intention_text"] = texts.get(r["intention_id"])
+                self._send_json(rows)
             elif u.path == "/api/corrections":
                 # One rule per exact window title, defined by its newest
                 # corrected row, over the same recency window the decider's
@@ -669,6 +702,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/category/delete": self._post_category_delete,
             "/api/sessions/category": self._post_session_category,
             "/api/sessions/project": self._post_session_project,
+            "/api/intent-review": self._post_intent_review,
         }
         handler = no_conn_handlers.get(u.path) or handlers.get(u.path)
         if handler is None:
@@ -715,9 +749,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _post_intention_start(self, body) -> None:
         from monitor import intent_gate
 
+        # untimed: a stopwatch session (no duration; finishable after
+        # intentions.UNTIMED_FINISH_MIN minutes of work).
+        untimed = bool(body.get("untimed"))
         try:
             text, duration_min = intentions.validate(
-                body.get("text") or "", body.get("duration_min") or 0
+                body.get("text") or "", body.get("duration_min") or 0, untimed
             )
         except (ValueError, TypeError) as e:
             self._send_json(problems.body(e), status=400)
@@ -843,7 +880,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         try:
             active = intentions.start(
                 text, duration_min, llm_category=chosen,
-                project_id=project["id"] if project is not None else None)
+                project_id=project["id"] if project is not None else None,
+                untimed=untimed)
         except (ValueError, TypeError) as e:
             self._send_json(problems.body(e), status=400)
             return
@@ -999,6 +1037,29 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 "removed since the page loaded.", status=404)
             return
         self._send_json({"ok": True, "session": row})
+
+    def _post_intent_review(self, conn, body) -> None:
+        """Rule logged session rows on- or off-intent from the Review tab.
+
+        Fixes the rows already logged (focus_logs.human_align, which every
+        reader takes over the model's score) and pins the window for that
+        intention so the next decision agrees. aligned null clears both.
+        """
+        from monitor import intent_review
+        raw = body.get("aligned")
+        if raw is not None and not isinstance(raw, bool):
+            self._send_problem(
+                "The dashboard sent a ruling the monitor doesn't understand.",
+                "Refresh the page and try again — this usually means the "
+                "page and the monitor are different versions.")
+            return
+        try:
+            result = intent_review.apply(conn, body.get("ids"), raw)
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        supa_mirror.mirror_intent_rows(result.pop("changes"))
+        self._send_json({"ok": True, **result})
 
     def _post_intent_correct(self, body) -> None:
         """Rule a window on/off-intent for the active session's intention.
@@ -1303,7 +1364,7 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _post_intention_pause(self, body) -> None:
         """Freeze the active session for a minute — no time lost, nothing watched."""
         try:
-            result = intentions.pause_active()
+            result = intentions.pause_active(body.get("minutes"))
         except ValueError as e:
             self._send_json(problems.body(e), status=400)
             return
@@ -1786,12 +1847,26 @@ function secsLeft() {
   const ends = parseStamp(snap && snap.ends_at);
   return ends ? Math.max(0, Math.round((ends - Date.now()) / 1000)) : null;
 }
+// An untimed session counts UP from stopwatch_from (null while a break runs).
+function secsWorked() {
+  const from = parseStamp(snap && snap.stopwatch_from);
+  return from ? Math.max(0, Math.round((Date.now() - from) / 1000)) : (snap && snap.elapsed_sec) || 0;
+}
+function finishIn() {
+  if (!snap || !snap.untimed) return 0;
+  const need = (snap.elapsed_sec || 0) + (snap.finish_in_sec || 0);
+  return Math.max(0, need - secsWorked());
+}
 function fmt(secs) {
   const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60), s = secs%60;
   return h ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
            : `${m}:${String(s).padStart(2,'0')}`;
 }
 function usedFraction() {
+  if (snap && snap.untimed && snap.state !== 'paused') {
+    const need = (snap.elapsed_sec || 0) + (snap.finish_in_sec || 0);
+    return need > 0 ? Math.min(1, secsWorked() / need) : 1;
+  }
   const started = parseStamp(snap && snap.started_at), ends = parseStamp(snap && snap.ends_at);
   if (!started || !ends) return 0;
   const span = ends - started;
@@ -1861,11 +1936,31 @@ function render(force) {
           <div><div class="time">${fmt(left ?? 0)}</div>
                <div class="sub">until the session resumes</div></div></div>
         <p class="note">${esc(snap.label)}<br>
-           Timer and monitoring are frozen — no session time is lost.</p>
+           ${snap.untimed ? `Stopwatch stopped at ${fmt(snap.elapsed_sec || 0)} and monitoring is off.`
+                          : 'Timer and monitoring are frozen — no session time is lost.'}</p>
         <div class="row">
           <button class="primary" onclick="resumeSession()">Resume now</button>
           <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
         </div>`;
+      return;
+    }
+    if (snap.untimed) {
+      const wait = finishIn();
+      card.innerHTML = `
+      <span class="chip"><i></i>${CHIP[snap.state] || CHIP.session}</span>
+      <div class="dial">${ring()}
+        <div><div class="time">${fmt(secsWorked())}</div>
+             <div class="sub">${esc(snap.label)} · stopwatch</div></div></div>
+      ${snap.intention && snap.intention.project ? `<p class="note">Part of
+        <strong>${esc(snap.intention.project.name)}</strong>.</p>` : ''}
+      <div class="row">
+        <button class="primary" onclick="endSession('completed')" ${wait ? 'disabled' : ''}
+                title="${wait ? 'Untimed sessions can be finished after 20 minutes of work' : 'Finish and take your break'}">
+          ${wait ? `Done in ${fmt(wait)}` : 'Done — take a break'}</button>
+        <button class="ghost" onclick="pauseSession(${snap.pause_max_min || 5})"
+                title="Stop the stopwatch and monitoring for up to ${snap.pause_max_min || 5} minutes">Break ${snap.pause_max_min || 5}m</button>
+        <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
+      </div>`;
       return;
     }
     card.innerHTML = `
@@ -1904,6 +1999,8 @@ function render(force) {
       ${PRESETS.map(m => `<button onclick="pick(${m})"
           class="${m === duration ? 'sel' : ''}">${m}m</button>`).join('')}
       <button onclick="pick('custom')" class="${duration === 'custom' ? 'sel' : ''}">Custom</button>
+      <button onclick="pick('stopwatch')" class="${duration === 'stopwatch' ? 'sel' : ''}"
+              title="Untimed: a stopwatch instead of a countdown. Finish after 20 minutes of work; breaks of up to 5 minutes along the way">Stopwatch</button>
     </div>
     <div class="customrow ${duration === 'custom' ? 'show' : ''}">
       <input id="custom" type="number" min="${MIN_MIN}" max="${MAX_MIN}" placeholder="120"
@@ -1951,7 +2048,7 @@ async function start() {
   }
   const text = fieldValue('text') || form.text;
   if (!text.trim()) { showError('Say what you intend to work on first.'); return; }
-  const body = {text, duration_min: mins};
+  const body = duration === 'stopwatch' ? {text, untimed: true} : {text, duration_min: mins};
   const project = fieldValue('project') || form.project;
   if (project) body.project_id = Number(project);
   if (await post('/api/intention', body)) {
@@ -1960,7 +2057,7 @@ async function start() {
   }
 }
 async function endSession(status) { await post('/api/intention/end', {status}); }
-async function pauseSession() { await post('/api/intention/pause', {}); }
+async function pauseSession(minutes) { await post('/api/intention/pause', minutes ? {minutes} : {}); }
 // A pause is a break under the hood, so resuming early is ending the break.
 async function resumeSession() { await post('/api/break/end', {}); }
 async function startBreak() { await post('/api/break', {duration_min: BREAK_MIN}); }
@@ -1986,7 +2083,7 @@ async function post(url, body) {
 
 // Tick locally every second so the countdown is smooth, and re-read the
 // monitor every few seconds to pick up changes made in the tray or widget.
-setInterval(() => { if (snap && snap.ends_at) render(); }, 1000);
+setInterval(() => { if (snap && (snap.ends_at || snap.stopwatch_from)) render(); }, 1000);
 setInterval(refresh, 5000);
 setInterval(loadProjects, 60000);
 loadProjects().then(refresh);
@@ -2003,7 +2100,7 @@ _INTENTION_PAGE = (
     # Presets start at the real minimum, so the page can never offer a length
     # the monitor will reject.
     .replace("__PRESETS__", json.dumps(
-        [m for m in (30, 45, 60, 90, 120) if intentions.MIN_DURATION_MIN <= m <= intentions.MAX_DURATION_MIN]
+        [m for m in (20, 30, 45, 60, 90, 120) if intentions.MIN_DURATION_MIN <= m <= intentions.MAX_DURATION_MIN]
     ))
 )
 

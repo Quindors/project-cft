@@ -74,6 +74,8 @@ def _status_text(item=None) -> str:
         text = snap.get("label") or ""
         if len(text) > 34:
             text = text[:31] + "..."
+        if snap.get("untimed"):
+            return f"{text} — {int(snap.get('elapsed_sec') or 0) // 60}m worked"
         return f"{text} — {mins}m left"
     return "No focus session"
 

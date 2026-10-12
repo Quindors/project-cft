@@ -173,15 +173,18 @@ _LABEL = "COALESCE(NULLIF(TRIM(f.human_label), ''), f.category_name)"
 # real category and not one of NEVER_DECLARED. Such rows never score as
 # off-intent either way, so the two flags cannot both be set.
 _NEVER_DECLARED_SQL = ", ".join(f"'{name}'" for name in NEVER_DECLARED)
+# {ALIGN} is the row's EFFECTIVE alignment: a ruling made on the Review tab
+# (focus_logs.human_align) wins over the model's align_score, the same way a
+# human label wins over the classifier's category (monitor/intent_review.py).
 _DAY_QUERY = f"""
     SELECT {_LABEL} AS label, c.is_productive AS productive,
            (f.intention_id IS NOT NULL
-            AND f.align_score IS NOT NULL
-            AND f.align_score < ?) AS off_intent,
+            AND {{ALIGN}} IS NOT NULL
+            AND {{ALIGN}} < ?) AS off_intent,
            (c.name IS NOT NULL AND c.is_productive IS NULL
             AND f.intention_id IS NOT NULL
-            AND f.align_score IS NOT NULL
-            AND f.align_score >= ?
+            AND {{ALIGN}} IS NOT NULL
+            AND {{ALIGN}} >= ?
             AND LOWER({_LABEL}) NOT IN ({_NEVER_DECLARED_SQL})) AS declared,
            COUNT(*) AS n
       FROM focus_logs f
@@ -207,9 +210,11 @@ def label_rows(start: str, end: str) -> List[sqlite3.Row]:
     inbox is the number Beeminder was sent. Raises sqlite3.Error when the
     database cannot be read; callers decide what an empty answer means.
     """
+    from monitor.intent_review import align_sql
     with _connect() as conn:
+        query = _DAY_QUERY.replace("{ALIGN}", align_sql(conn, "f"))
         return conn.execute(
-            _DAY_QUERY, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
+            query, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
         ).fetchall()
 
 
