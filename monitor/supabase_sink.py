@@ -81,10 +81,7 @@ class NullSink:
                 print(f"[warn] NullSink: read_sink.load_prior_classifications failed ({e})")
         return []
 
-    def has_review_column(self): return False
     def load_labeled(self, days_back=None): return []
-    def load_reviewable(self, limit=30, days_back=None): return []
-    def save_review(self, row_id, human_label): return False
 
 class SupabaseSink:
     def __init__(self, settings):
@@ -280,15 +277,7 @@ class SupabaseSink:
         print(f"[info] Loaded {len(result_list)} prior classifications from last {days_back} days")
         return result_list
 
-    # ------------------- learning loop: review + accuracy -------------------
-
-    def has_review_column(self) -> bool:
-        """True if the reviewed_at column exists (i.e. the migration was run)."""
-        try:
-            self.sb.table("focus_logs").select("reviewed_at").limit(1).execute()
-            return True
-        except Exception:
-            return False
+    # ------------------- learning loop: accuracy scoring -------------------
 
     def load_labeled(self, days_back: Optional[int] = None) -> List[Dict]:
         """Every human-labeled row (confirmations AND corrections), for scoring.
@@ -313,47 +302,6 @@ class SupabaseSink:
             print(f"[error] Failed to load labeled rows: {e}")
             return []
         return [dict(r) for r in result.data]
-
-    def load_reviewable(self, limit: int = 30, days_back: Optional[int] = None) -> List[Dict]:
-        """Recent UNreviewed rows (no human_label yet), newest first, for review.py.
-
-        Returns dicts with id, timestamp, current_window, category_name,
-        confidence, reason, events.
-        """
-        try:
-            q = (
-                self.sb.table("focus_logs")
-                .select("id, timestamp, current_window, category_name, confidence, reason, events")
-                .is_("human_label", "null")
-                .not_.is_("current_window", "null")
-                .order("timestamp", desc=True)
-                .limit(limit)
-            )
-            if days_back is not None:
-                cutoff = (datetime.now() - timedelta(days=days_back)).isoformat()
-                q = q.gte("timestamp", cutoff)
-            result = q.execute()
-        except Exception as e:
-            print(f"[error] Failed to load reviewable rows: {e}")
-            return []
-        return [dict(r) for r in result.data]
-
-    def save_review(self, row_id: int, human_label: str) -> bool:
-        """Record a human review: set human_label and stamp reviewed_at.
-
-        Returns True on success. Requires the reviewed_at column (migration).
-        """
-        try:
-            (
-                self.sb.table("focus_logs")
-                .update({"human_label": human_label, "reviewed_at": datetime.now().isoformat()})
-                .eq("id", row_id)
-                .execute()
-            )
-            return True
-        except Exception as e:
-            print(f"[error] Failed to save review for row {row_id}: {e}")
-            return False
 
     # ------------------- internal -------------------
 

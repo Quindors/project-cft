@@ -26,7 +26,6 @@ import argparse
 import json
 import os
 import sys
-from collections import defaultdict
 from datetime import datetime
 
 from monitor.creds import load_env, configure_llm

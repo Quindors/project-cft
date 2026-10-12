@@ -3,7 +3,7 @@
 # Build:
 #   pyinstaller cft.spec --noconfirm
 #
-# Produces dist/cft/cft.exe (onedir). Distribute via installer.iss.
+# Produces dist/cft/cft.exe (onedir).
 
 import os
 from PyInstaller.utils.hooks import collect_submodules
@@ -15,7 +15,6 @@ block_cipher = None
 # Format: (source_path, dest_subdir_in_bundle)
 datas = [
     ('prompt-main.txt',   '.'),
-    ('prompt-critic.txt', '.'),
 ]
 
 # The focus-dashboard production build, if build.ps1 staged it into ./dashboard.
@@ -32,7 +31,6 @@ hiddenimports += collect_submodules('supabase')
 hiddenimports += collect_submodules('supabase_auth')
 hiddenimports += collect_submodules('supabase_functions')
 hiddenimports += collect_submodules('postgrest')
-hiddenimports += collect_submodules('gotrue')
 hiddenimports += collect_submodules('storage3')
 hiddenimports += collect_submodules('realtime')
 hiddenimports += collect_submodules('openai')
@@ -51,10 +49,6 @@ a = Analysis(
     excludes=[
         # NOT excluded: tkinter. The floating timer widget and the full-screen
         # focus alert (monitor/tk_host.py) are Tk, so the build needs it.
-        'matplotlib',
-        'pytest',
-        'IPython',
-        'jupyter',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

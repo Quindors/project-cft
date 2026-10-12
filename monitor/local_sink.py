@@ -300,10 +300,7 @@ class LocalSink:
                 out[entry["normalized_title"]] = entry
         return list(out.values())
 
-    # ------------------- learning loop: review + accuracy -------------------
-
-    def has_review_column(self) -> bool:
-        return True
+    # ------------------- learning loop: accuracy scoring -------------------
 
     def load_labeled(self, days_back: Optional[int] = None) -> List[Dict]:
         q = ("SELECT current_window, category_name, human_label, confidence, timestamp "
@@ -316,32 +313,6 @@ class LocalSink:
         with self._lock:
             rows = self._conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
-
-    def load_reviewable(self, limit: int = 30, days_back: Optional[int] = None) -> List[Dict]:
-        q = ("SELECT id, timestamp, current_window, category_name, confidence, reason, events "
-             "FROM focus_logs WHERE human_label IS NULL AND current_window IS NOT NULL")
-        params: list = []
-        if days_back is not None:
-            q += " AND timestamp >= ?"
-            params.append((datetime.now() - timedelta(days=days_back)).isoformat())
-        q += " ORDER BY timestamp DESC LIMIT ?"
-        params.append(limit)
-        with self._lock:
-            rows = self._conn.execute(q, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
-
-    def save_review(self, row_id, human_label: str) -> bool:
-        try:
-            with self._lock:
-                self._conn.execute(
-                    "UPDATE focus_logs SET human_label = ?, reviewed_at = ? WHERE id = ?",
-                    (human_label, datetime.now().isoformat(), row_id),
-                )
-                self._conn.commit()
-            return True
-        except Exception as e:
-            print(f"[error] save_review failed: {e}")
-            return False
 
     # ------------------- internal -------------------
 

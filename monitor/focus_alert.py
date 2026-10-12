@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional
 
 from monitor import tk_host
 from monitor.window_capture import PLATFORM

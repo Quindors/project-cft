@@ -145,8 +145,4 @@ def take_screenshot_b64() -> Optional[str]:
     if data:
         return base64.b64encode(data).decode("utf-8")
     return None
-
-
-def get_screenshot_mode() -> str:
-    """Return a string describing the screenshot capture mode."""
     return _mode

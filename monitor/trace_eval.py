@@ -61,7 +61,6 @@ def build_trace_settings(
         base.trace,
         use_trace_file=True,
         upload_to_sheets=False,
-        replay_realtime=False,
         trace_win_path=win_path or base.trace.trace_win_path,
         trace_key_path=key_path or base.trace.trace_key_path,
     )

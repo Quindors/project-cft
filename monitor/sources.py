@@ -53,7 +53,6 @@ class EventSource:
 class KeystrokeSource:
     def start(self) -> None: ...
     def stop(self) -> None: ...
-    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str: ...
     def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str: ...
 
 
@@ -147,25 +146,6 @@ class LiveKeystrokeSource(KeystrokeSource):
     def stop(self) -> None:
         if self._listener:
             self._listener.stop()
-
-    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
-        """Summarize recent keystrokes for the LLM prompt."""
-        cutoff = now_dt - timedelta(seconds=window_seconds)
-
-        with self._lock:
-            recent = [(dt, k) for dt, k in self._buffer if dt >= cutoff]
-
-        if not recent:
-            return "Idle (0 keys)"
-
-        count = len(recent)
-        special_keys = set()
-        for _, k in recent:
-            if len(k) > 1 or k.startswith("Key."):
-                special_keys.add(k)
-
-        special_str = ", ".join(list(special_keys)[:5])
-        return f"{count} keys typed. Special: [{special_str}]"
 
     def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
         """Reconstruct typed text between two timestamps."""
@@ -269,14 +249,6 @@ class TraceKeystrokeSource(KeystrokeSource):
 
     def stop(self) -> None:
         return
-
-    def summary(self, now_dt: datetime, window_seconds: int = 60) -> str:
-        window_start = now_dt - timedelta(seconds=window_seconds)
-        keys = [k for (dt, k) in self.session.trace.keys if window_start <= dt <= now_dt]
-        if not keys:
-            return "Idle (0 keys)"
-        specials = {k for k in keys if (len(str(k)) > 1 or str(k).startswith("Key."))}
-        return f"{len(keys)} keys typed. Special: [{', '.join(list(specials)[:5])}]"
 
     def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
         keys = [k for (dt, k) in self.session.trace.keys if start_dt < dt <= end_dt]

@@ -2134,7 +2134,3 @@ def start_local_server() -> Optional[str]:
     print(f"[api] local API on http://127.0.0.1:{port} "
           f"(static={'bundled' if _STATIC_ROOT else 'hosted'}, allowed origins={sorted(allowed) or 'none'})")
     return f"http://127.0.0.1:{port}/"
-
-
-# Back-compat alias for older callers.
-serve_bundled_dashboard = start_local_server

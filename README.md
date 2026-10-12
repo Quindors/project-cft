@@ -29,7 +29,6 @@ The system uses a two-pass approach: a primary model classifies the activity fro
    python win-log.py
    python monitor-sheets.py
    ```
-   Or use `startup_launch.vbs` to run both silently on startup.
 
 ## Category System
 
@@ -142,7 +141,6 @@ Update this file whenever your projects change. The AI reads it fresh each time 
 project cft/
 ├── monitor/
 │   ├── __init__.py
-│   ├── __main__.py        # Entry point: python -m monitor
 │   ├── app.py             # Initialization (env, creds, sources, sink)
 │   ├── runner.py           # Main monitoring loop
 │   ├── decider.py          # LLM calls, parsing, the vision second look
@@ -152,7 +150,6 @@ project cft/
 │   ├── sources.py          # Window event and keystroke sources
 │   └── alerts.py           # Popup alerts
 ├── prompt-main.txt         # Primary LLM prompt template
-├── prompt-critic.txt       # Critic LLM prompt template
 ├── user_goals.txt          # Your current projects and goals
 ├── monitor-sheets.py       # Entry point: python monitor-sheets.py
 ├── win-log.py              # Active window logger
@@ -161,7 +158,6 @@ project cft/
 ├── analysis-sheets-live.py # Live dashboard (Dash + Plotly)
 ├── run-monitor.bat         # Windows batch launcher
 ├── run-winlog.bat          # Windows batch launcher
-├── startup_launch.vbs      # Silent startup launcher
 ├── developer notes.md      # Migration checklist and todo
 └── logs/                   # Daily JSONL log files (gitignored)
 ```
@@ -179,7 +175,6 @@ Key settings:
 | `decision_interval` | `60.0` | Seconds between classification decisions |
 | `context_window_size` | `10` | Number of recent events sent to LLM |
 | `min_events` | `1` | Minimum events before first decision |
-| `off_threshold` | `0.60` | OFF_SCORE threshold |
 | `critic.vision_enabled` | `True` | Let a vision model check the screen behind productive, low-confidence and Ambiguous calls |
 | `critic.override_min_conf` | `0.70` | Vision confidence needed to overturn a specific category (`CFT_VISION_OVERRIDE_CONF`) |
 | `critic.override_ambiguous_min_conf` | `0.85` | Vision confidence needed to leave Ambiguous or overrule an open correction (`CFT_VISION_OVERRIDE_AMBIGUOUS_CONF`) |

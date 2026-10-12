@@ -88,7 +88,6 @@ def build_base_settings(win_path: str, key_path: str):
         DEFAULT_SETTINGS.trace,
         use_trace_file=True,
         upload_to_sheets=False,
-        replay_realtime=False,
         trace_win_path=win_path,
         trace_key_path=key_path,
     )

@@ -7,7 +7,6 @@
 #   1. Ensure a Windows venv exists at .\build-venv\
 #   2. pip install -r requirements-build.txt
 #   3. pyinstaller cft.spec  ->  .\dist\cft\
-#   4. (optional) iscc installer.iss  ->  .\dist\cft-setup.exe
 #
 # The app talks to a hosted LLM (OpenRouter or OpenAI). On first launch it
 # prompts for an API key and saves it to the .env next to the exe.
@@ -125,16 +124,5 @@ if ($envBackup) {
     }
 }
 
-# --- 3. Inno Setup (optional) ----------------------------------------------
-$iscc = Get-Command 'iscc.exe' -ErrorAction SilentlyContinue
-if (-not $iscc) { $iscc = Get-Command 'ISCC.exe' -ErrorAction SilentlyContinue }
-if ($iscc) {
-    Write-Host "[inno] compiling installer..."
-    Invoke-Native $iscc.Source 'installer.iss' -What 'Inno Setup'
-    Write-Host "[done] installer at .\dist\cft-setup.exe"
-} else {
-    Write-Host "[warn] Inno Setup (iscc.exe) not on PATH - skipping installer step."
-    Write-Host "       Onedir build is at .\dist\cft\cft.exe"
-}
-
+Write-Host "[done] onedir build at .\dist\cft\cft.exe"
 Write-Host "[ok  ] build complete."

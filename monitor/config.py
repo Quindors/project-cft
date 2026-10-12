@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from typing import List, Optional
 
 from monitor.paths import is_frozen as _is_frozen
 
@@ -16,9 +15,6 @@ class PopupSettings:
     """Settings for off-task popup alerts."""
     enabled: bool = True
     duration: int = 5  # seconds to show popup
-    sound_enabled: bool = True
-    repeat_while_offtask: bool = True
-    cooldown_sec: float = 5.0   # re-alert every 5s while OFF-TASK
     # Breathing room after an alert is dismissed before deciding again, so the
     # verdict is about where the user went, not the moment they closed it.
     resume_grace_sec: float = 2.0
@@ -107,13 +103,6 @@ class TraceSettings:
     trace_key_path: str = r"tests/traces/trace_key.jsonl"
     trace_speed: float = 1.0
     upload_to_sheets: bool = False     # testing mode: don't write to database
-    replay_realtime: bool = False      # False = run as fast as possible
-
-@dataclass(frozen=True)
-class ScreenshotSettings:
-    enabled: bool = True
-    capture_interval: float = 10.0   # seconds between captures
-    buffer_size: int = 12            # keep last N screenshots in memory
 
 @dataclass(frozen=True)
 class Settings:
@@ -128,9 +117,6 @@ class Settings:
     context_window_size: int = 10  # Number of recent events to keep
     min_events: int = 1  # Minimum events before making first decision
 
-    # OFF-TASK threshold (used by LLM parsing)
-    off_threshold: float = 0.60
-
     critic: CriticSettings = field(default_factory=CriticSettings)
     supabase: SupabaseSettings = field(default_factory=SupabaseSettings)
     trace: TraceSettings = field(default_factory=TraceSettings)
@@ -143,7 +129,6 @@ DEFAULT_SETTINGS = Settings(
     trace=TraceSettings(
         use_trace_file=tracing,
         upload_to_sheets=not tracing,
-        replay_realtime=not tracing,
     ),
 )
 
