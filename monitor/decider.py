@@ -395,18 +395,61 @@ def _project_context(intention: Optional[Dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Words that say nothing about WHICH piece of work a window holds: the verbs
+# an intention starts with, the nouns every document title carries, the app
+# names. A title and a project that share only these are not the same work.
+_ANCHOR_NOISE = frozenset("""
+about after again before being between chrome continue continuing could doing
+draft drafts during essay essays extra files final finish finishing first
+google maybe might more notes other paper papers portion prep project projects
+revise revising revisit section start starting stuff these things think
+through today tonight under until using where which while would work working
+write writing written
+""".split())
+
+
+def _anchor_words(phrase) -> set:
+    """The distinctive words of a phrase: 5+ letters and not noise."""
+    return {w for w in re.findall(r"[a-z0-9]+", str(phrase or "").lower())
+            if len(w) >= 5 and w not in _ANCHOR_NOISE}
+
+
+def _same_stem(a: str, b: str) -> bool:
+    """"supplement", "supplements" and "supplementals" are one word: a shared
+    prefix of 5+ letters that covers all but a short suffix of the shorter."""
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n >= 5 and n >= min(len(a), len(b)) - 2
+
+
 def _title_names_project(window_title: str, intention: Optional[Dict]) -> Optional[str]:
-    """The active project's name when the window title contains it as whole
-    words ("personal statement - Google Docs" for the project "Personal
-    Statement"), else None. Names under 4 letters are too easy to hit by
-    accident ("CS" in any title) and never count."""
+    """What in the window title says this window IS the session's work: the
+    active project's name as whole words ("personal statement - Google Docs"
+    for the project "Personal Statement"), or a distinctive word the title
+    shares with the project's name or the declared intention ("supplements
+    prep" and "Continuing supplementals work" for the project "Supplement
+    essays" — live incident 2026-10-12, where the exact name never matched
+    and the essay's topic decided ALIGN). Returns a label for the log, or
+    None. Names under 4 letters are too easy to hit by accident ("CS" in any
+    title) and never count; the word match needs 5 letters for the same
+    reason."""
     project = (intention or {}).get("project") or {}
-    name = " ".join(str(project.get("name") or "").lower().split())
-    if len(name.replace(" ", "")) < 4:
-        return None
+    pname = str(project.get("name") or "")
+    name = " ".join(pname.lower().split())
     title = " ".join(re.sub(r"^WIN:", "", str(window_title or "")).lower().split())
-    if re.search(r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", title):
-        return project.get("name")
+    if len(name.replace(" ", "")) >= 4 and re.search(
+            r"(?<![a-z0-9])" + re.escape(name) + r"(?![a-z0-9])", title):
+        return f'the project "{pname}"'
+    title_words = sorted(_anchor_words(title))
+    for source, words in ((f'the project "{pname}"', _anchor_words(pname)),
+                          ("the intention", _anchor_words((intention or {}).get("text")))):
+        for w in sorted(words):
+            hit = next((t for t in title_words if _same_stem(w, t)), None)
+            if hit:
+                return f"{source} ({w})" if hit == w else f"{source} ({w} ~ {hit})"
     return None
 
 
@@ -735,10 +778,13 @@ evidence that the work is happening. Score only the work visible on screen.
 
 WRITING ABOUT A SUBJECT IS NOT DOING THAT SUBJECT. The subject that decides
 ALIGN is WHICH piece of work is open, not what its sentences talk about. When
-the CURRENT WINDOW TITLE names a document that is the declared work or the
-session's project (a doc called "personal statement" during a personal
-statement session), and the screen shows prose in a document editor, the
-user is writing that document — whatever the prose discusses. An essay about
+the CURRENT WINDOW TITLE names a document that is the declared work or belongs
+to the session's project — by the project's name, or plainly by subject (a doc
+called "personal statement" during a personal statement session; a doc called
+"supplements prep" or a chat called "Continuing supplementals work" in the
+project "Supplement essays") — and the screen shows prose in a document
+editor, or a chat about that prose, the user is working on that document —
+whatever the prose discusses. An essay about
 composing music is essay writing: score it as the declared work, and give it
 the declared work's category, never the category of the essay's topic.
 Composition means a score, notation software or an audio editor on screen;
@@ -750,6 +796,10 @@ here, not history: the document's name is often scrolled out of view.
     application category. It is the essay, and the essay is about music.
   - Same session, screen shows MuseScore with a string quartet score open
     -> ALIGN 0.05, Composition. That is composing, not the essay.
+  - Declared "finish mit 1" in the project "Supplement essays"; title
+    "supplements prep - Google Docs"; screen shows a short answer about
+    composing a string quartet -> ALIGN 0.9, the college application
+    category. It is a supplemental essay, and the essay is about music.
 """
     else:
         intent_header = align_field = intent_rules = ""
@@ -1480,20 +1530,21 @@ def decide(
     # ...except when the window itself is the project's document. Vision
     # reads the prose, and prose has a topic: a personal statement about
     # composing reads as Composition (live incident 2026-10-07, ALIGN 0.05
-    # and an off-intent alert on the essay itself). A window titled with the
-    # project's name is that project's work whatever its paragraphs discuss,
-    # so the screen may not score it lower than the title did, nor move it
-    # out of the project's home category.
+    # and an off-intent alert on the essay itself; again 2026-10-12 on a
+    # "supplements prep" doc whose project is "Supplement essays"). A window
+    # titled as that project's work is that project's work whatever its
+    # paragraphs discuss, so the screen may not score it lower than the
+    # title did, nor move it out of the project's home category.
     anchor = _title_names_project(current_window, intention)
     if anchor:
         if v_align is not None and p1_align is not None and v_align < p1_align:
-            print(f"[vision] title names the project \"{anchor}\" — keeping "
+            print(f"[vision] title names {anchor} — keeping "
                   f"ALIGN {p1_align:.2f} over the screen's {v_align:.2f}")
             final_align = p1_align
         home = ((intention or {}).get("project") or {}).get("category") or ""
         if home and p1_name.lower() == home.lower() and v_name.lower() != home.lower():
-            print(f"[vision] {p1_name} stands — the title names the project "
-                  f"\"{anchor}\"; the screen's {v_name} is the document's topic")
+            print(f"[vision] {p1_name} stands — the title names {anchor}; "
+                  f"the screen's {v_name} is the document's topic")
             return mk_ret(p1_name, p1_prod, p1_off, p1_conf, p1_reason, True,
                           vision_res, align=final_align)
 
