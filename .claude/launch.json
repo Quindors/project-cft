@@ -9,14 +9,21 @@
     {
       "name": "cft-mobile-web-start",
       "runtimeExecutable": "wsl",
-      "runtimeArgs": ["-d", "Ubuntu", "bash", "/home/abl96/projects/cft-mobile/scripts/web-dev.sh"],
+      "runtimeArgs": [
+        "-d",
+        "Ubuntu",
+        "bash",
+        "/home/abl96/projects/cft-mobile/scripts/web-dev.sh"
+      ],
       "port": 8081
     },
     {
       "name": "intention-e2e",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47997 ./venv/bin/python tests/e2e/serve.py"
       ],
       "port": 47997
@@ -25,7 +32,9 @@
       "name": "pipeline-problems-e2e",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "cd ~/projects/project-cft && CFT_DATA_DIR=/tmp/cft-e2e CFT_API_PORT=47998 CFT_E2E_PROBLEMS=1 ./venv/bin/python tests/e2e/serve.py"
       ],
       "port": 47998
@@ -34,10 +43,34 @@
       "name": "focus-dashboard",
       "runtimeExecutable": "wsl",
       "runtimeArgs": [
-        "-e", "bash", "-c",
+        "-e",
+        "bash",
+        "-c",
         "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && npm run dev -- --mode test --port 5173 --strictPort"
       ],
       "port": 5173
+    },
+    {
+      "name": "project-forest-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "cd ~/projects/project-cft && rm -rf /tmp/cft-forest-e2e && export CFT_DATA_DIR=/tmp/cft-forest-e2e && ./venv/bin/python tests/e2e/seed_projects.py && ./venv/bin/python tests/e2e/seed_projects_health.py && ./venv/bin/python tests/e2e/seed_projects_landmarks.py && CFT_API_PORT=47996 CFT_ALLOWED_ORIGINS=http://localhost:5174 ./venv/bin/python tests/e2e/serve.py"
+      ],
+      "port": 47996
+    },
+    {
+      "name": "focus-dashboard-forest",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && VITE_API_BASE=http://127.0.0.1:47996 npm run dev -- --mode test --port 5174 --strictPort"
+      ],
+      "port": 5174
     }
   ]
 }
