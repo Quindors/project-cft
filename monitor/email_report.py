@@ -10,8 +10,9 @@ the .env names an SMTP server and at least one recipient.
 
 The numbers are not computed here. Every hour comes out of
 monitor/beeminder.py (label_rows/bucket): a human correction wins over the
-classifier, off-intent work during a session is off-task, a neutral category
-is productive only while declared. So the figure in the inbox is the figure
+classifier, off-intent work during a session counts as neither (real work,
+not the declared work), a neutral category is productive only while
+declared. So the figure in the inbox is the figure
 that was pushed to the goal, and relabelling a day in the review tab changes
 what next week's mail says about it.
 
@@ -414,7 +415,6 @@ def _totals(start: date, end: date, cfg: Config) -> DayStats:
         if kind == beeminder.PRODUCTIVE:
             stats.productive_sec += seconds
         elif kind == beeminder.DRIFTED:
-            stats.offtask_sec += seconds
             stats.drifted_sec += seconds
         elif kind == beeminder.OFFTASK:
             stats.offtask_sec += seconds
@@ -510,7 +510,7 @@ def build_report(period_end: date, *, days: int = 7, cfg: Optional[Config] = Non
         if kind == beeminder.PRODUCTIVE:
             key = (label, bool(row["declared"]))
             productive[key] = productive.get(key, 0.0) + seconds
-        elif kind in (beeminder.OFFTASK, beeminder.DRIFTED):
+        elif kind == beeminder.OFFTASK:
             offtask[label] = offtask.get(label, 0.0) + seconds
     report.productive_by_category = sorted(
         ((label, sec, declared) for (label, declared), sec in productive.items()),
@@ -612,8 +612,9 @@ def render_text(report: Report, cfg: Optional[Config] = None) -> str:
     L.append("=" * 48)
     L.append(f"Productive time   {_hm(report.productive_sec)}")
     L.append(f"Productivity rate {_pct_label(report.pct)} of {_hm(report.logged_sec)} at the screen")
-    L.append(f"Off-task time     {_hm(report.offtask_sec)}"
-             + (f" (of which off-intent {_hm(report.drifted_sec)})" if report.drifted_sec >= 60 else ""))
+    L.append(f"Off-task time     {_hm(report.offtask_sec)}")
+    if report.drifted_sec >= 60:
+        L.append(f"Drifted           {_hm(report.drifted_sec)} (real work off the declared intention; counted as neither)")
     L.append(f"Active days       {report.active_days} of {len(report.days)}")
     L.append("")
     L.append(_delta_sentence(report))
@@ -791,7 +792,7 @@ def render_html(report: Report, cfg: Optional[Config] = None) -> str:
   </div>
   <p style="{_CSS_MUTED}line-height:1.5;">How this is counted: each logged row is one decision interval at the screen.
      A row is productive when its category is, or when it was the declared work of a focus session
-     (a neutral category counts only while declared); real work done off-intent during a session is off-task.
+     (a neutral category counts only while declared); real work done off-intent during a session counts as neither.
      Corrections made in the dashboard's review tab are reflected here.</p>
   <p style="{_CSS_MUTED}line-height:1.5;border-top:1px solid #e2e8f0;padding-top:12px;">
      {e(unsubscribe_note(cfg))}<br>

@@ -144,11 +144,12 @@ def config() -> Config:
         seconds_per_row=_env_float("BEEMINDER_SECONDS_PER_ROW",
                                    DEFAULT_SETTINGS.decision_interval),
         dry_run=_env("BEEMINDER_DRY_RUN").lower() in ("1", "true", "yes"),
-        # Work done off-intent during a focus session counts as off-task, not
-        # productive — a declared session means the hours goal measures the
-        # work you said you'd do, and drifting to other real work doesn't pay
-        # it. Set BEEMINDER_STRICT_INTENT=0 to count any productive-category
-        # work regardless of the active session.
+        # Work done off-intent during a focus session counts as neither
+        # productive nor off-task — a declared session means the hours goal
+        # measures the work you said you'd do, so drifting to other real work
+        # doesn't pay it, but it was real work, not a lapse, so it isn't
+        # charged against you either. Set BEEMINDER_STRICT_INTENT=0 to count
+        # any productive-category work regardless of the active session.
         strict_intent=_env("BEEMINDER_STRICT_INTENT", "1").lower() in ("1", "true", "yes"),
     )
 
@@ -219,8 +220,8 @@ def label_rows(start: str, end: str) -> List[sqlite3.Row]:
 
 
 # What a label_rows() row counts as. DRIFTED is off-task time that was real
-# work done off-intent during a session — reported separately so a comment
-# can say "of which off-intent".
+# work done off-intent during a session — its own bucket so the comment can
+# say how much there was, though it counts as neither.
 PRODUCTIVE, DRIFTED, OFFTASK, NEITHER = "productive", "drifted", "offtask", "neither"
 
 
@@ -228,7 +229,8 @@ def bucket(row, *, strict_intent: bool = True) -> str:
     """Which column a label_rows() row belongs in — the one rule, in one place.
 
     A productive-category row logged off-intent during a session is DRIFTED
-    (off-task) under strict intent and PRODUCTIVE otherwise; a declared
+    under strict intent — real work, but not the declared work, so it counts
+    as neither productive nor off-task — and PRODUCTIVE otherwise; a declared
     neutral row is PRODUCTIVE; an unproductive category is OFFTASK; anything
     else (neutral, undeclared, or not a category at all) is NEITHER.
     """
@@ -246,8 +248,9 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
     reports an empty day, which is the honest thing to push.
 
     By default a productive-category row logged off-intent during a focus
-    session goes to the off-task column: it was real work, but not the work
-    you declared. strict_intent=False counts it as productive anyway.
+    session goes to neither column: it was real work, but not the work you
+    declared, so it neither pays the goal nor counts against it. It is still
+    named in the comment. strict_intent=False counts it as productive.
 
     A neutral-category row goes to the productive column only while it is
     the declared work (see NEVER_DECLARED) and counts as neither otherwise.
@@ -268,7 +271,6 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
         seconds = row["n"] * seconds_per_row
         kind = bucket(row, strict_intent=strict_intent)
         if kind == DRIFTED:
-            offtask_sec += seconds
             drifted_sec += seconds
         elif kind == PRODUCTIVE:
             productive_sec += seconds
@@ -286,10 +288,9 @@ def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True)
         comment += " — " + ", ".join(parts)
     # Same 0.1h floor as the breakdown: below it the figure renders as 0.0h.
     if offtask_sec >= 360:
-        comment += f" (off-task {offtask_sec / 3600:.1f}h"
-        if drifted_sec >= 360:
-            comment += f", of which off-intent {drifted_sec / 3600:.1f}h"
-        comment += ")"
+        comment += f" (off-task {offtask_sec / 3600:.1f}h)"
+    if drifted_sec >= 360:
+        comment += f" (drifted {drifted_sec / 3600:.1f}h, counted as neither)"
 
     return DayTotals(
         productive_hours=round(productive_sec / 3600, 2),
