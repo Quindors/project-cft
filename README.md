@@ -1,6 +1,3 @@
-one day we will do a rigorous comparison of the models trust
-
-
 # cft — AI-Powered Productivity Monitor
 
 A desktop productivity tracker that uses LLM-based classification to categorize your activities in real time. It monitors active window titles and keystrokes, classifies your activity into user-defined categories, and logs everything to Google Sheets.
