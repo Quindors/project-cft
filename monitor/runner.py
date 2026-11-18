@@ -14,7 +14,7 @@ from typing import List, Tuple, Dict, Any, Optional, Callable
 
 from monitor.config import Settings
 from monitor.decider import decide
-from monitor.sources import EventSource, KeystrokeSource, TraceEventSource
+from monitor.sources import EventSource, TraceEventSource
 from monitor import intentions as intentions_store
 from monitor import app_state
 from monitor import breaks as breaks_store
@@ -60,7 +60,6 @@ VISION_CONSEQUENCE = ("The screen check is off, so verdicts are going by window 
 
 def run_monitor_loop(
     event_src: EventSource,
-    key_src: KeystrokeSource,
     sink,
     show_popup: Callable,
     settings: Settings,
@@ -108,14 +107,13 @@ def run_monitor_loop(
 
     # Dispatch to trace or live loop
     if isinstance(event_src, TraceEventSource):
-        _run_trace_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications)
+        _run_trace_loop(event_src, sink, show_popup, settings, categories, corrections, prior_classifications)
     else:
-        _run_live_loop(event_src, key_src, sink, show_popup, settings, categories, corrections, prior_classifications, stop_event)
+        _run_live_loop(event_src, sink, show_popup, settings, categories, corrections, prior_classifications, stop_event)
 
 
 def _run_live_loop(
     event_src: EventSource,
-    key_src: KeystrokeSource,
     sink,
     show_popup: Callable,
     settings: Settings,
@@ -162,8 +160,7 @@ def _run_live_loop(
     user_away = False
 
     # Break state. A break is a hard stop, not a quieter mode: while one runs
-    # we do not poll windows, do not capture keystrokes, do not classify, do
-    # not log and do not alert. `on_break` tracks the transition so capture is
+    # we do not poll windows, do not classify, do not log and do not alert. `on_break` tracks the transition so capture is
     # torn down once on the way in and rebuilt once on the way out.
     on_break = False
 
@@ -216,7 +213,6 @@ def _run_live_loop(
             if active_break is not None:
                 if not on_break:
                     on_break = True
-                    key_src.stop()
                     status_store.set_paused(True)
                     drift_tier, drift_since, last_drift_alert = None, None, None
                     secs = active_break.get("remaining_sec") or 0
@@ -230,12 +226,11 @@ def _run_live_loop(
 
             if on_break:
                 # Break over: start capture again from a clean slate. Titles
-                # and keystrokes from before the break are not evidence about
-                # what you are doing now.
+                # from before the break are not evidence about what you are
+                # doing now.
                 on_break = False
                 events_buffer = []
                 event_src.reset()
-                key_src.start()
                 status_store.set_paused(False)
                 last_decision_time = time.time()
                 print("[runner] break over — monitoring resumed")
@@ -367,12 +362,6 @@ def _run_live_loop(
 
             if should_decide and len(events_buffer) >= settings.min_events:
                 force_decision = False
-                if last_decision_time is not None:
-                    prev_dt = datetime.fromtimestamp(last_decision_time)
-                else:
-                    prev_dt = now_dt
-                typed_text = key_src.typed_text_between(prev_dt, now_dt)
-
                 last_decision_time = time.time()
                 decision_count += 1
 
@@ -444,7 +433,7 @@ def _run_live_loop(
 
                 # Write to sheets
                 t = time.time()
-                record = _build_record(decision, events_buffer, typed_text, now_dt, intention=intention)
+                record = _build_record(decision, events_buffer, now_dt, intention=intention)
                 try:
                     sink.enqueue_record(record)
                     flush_result = sink.flush_if_needed()
@@ -551,7 +540,6 @@ def _run_live_loop(
 
 def _run_trace_loop(
     event_src: TraceEventSource,
-    key_src: KeystrokeSource,
     sink,
     show_popup: Callable,
     settings: Settings,
@@ -585,7 +573,6 @@ def _run_trace_loop(
     productive_count = 0
     unproductive_count = 0
     ambiguous_count = 0
-    prev_evt_time = event_times[0]
 
     # --- accuracy tracking ---
     labeled_count = 0
@@ -603,9 +590,6 @@ def _run_trace_loop(
         # Ensure correct daily sheet
         sink.ensure_day(evt_time.date())
 
-        # Get keystroke context
-        typed_text = key_src.typed_text_between(prev_evt_time, evt_time)
-
         print(f"\n[runner] Decision at {evt_time} ({len(events_buffer)} events)...")
 
         t = time.time()
@@ -619,7 +603,6 @@ def _run_trace_loop(
         llm_time = time.time() - t
         print(f"[runner] LLM pipeline took {llm_time:.2f}s")
         decision_count += 1
-        prev_evt_time = evt_time
 
         # Log to console
         _log_decision(decision)
@@ -689,13 +672,12 @@ def _run_trace_loop(
             "vision_category": vision.get("category_name", ""),
             "vision_conf": vision.get("conf", ""),
             "expected": event_src.get_label(evt_time),
-            "typed_text": typed_text,
             "events": [k for _, k in events_buffer],
         }
         results_file.write(json.dumps(result_record, ensure_ascii=False) + "\n")
 
         # Write to sheets
-        record = _build_record(decision, events_buffer, typed_text, evt_time)
+        record = _build_record(decision, events_buffer, evt_time)
         sink.enqueue_record(record)
         flush_result = sink.flush_if_needed()
         if flush_result:
@@ -854,7 +836,6 @@ def _log_decision(decision: Dict[str, Any], settings: Optional[Settings] = None)
 def _build_record(
     decision: Dict[str, Any],
     events_buffer: List[Tuple[str, str]],
-    typed_text: str,
     now_dt: datetime,
     intention: Optional[Dict] = None,
 ) -> Dict[str, Any]:
@@ -867,7 +848,6 @@ def _build_record(
         "primary_confidence": primary.get("conf", ""),
         "primary_reason":     primary.get("reason", ""),
         "main_label":         primary.get("category_name", ""),
-        "typed_text":         typed_text,
         "events":             [{"key": k} for _, k in events_buffer],
         "intention_id":       intention["id"] if intention else None,
         "align_score":        decision.get("final_align"),

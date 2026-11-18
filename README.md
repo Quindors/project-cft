@@ -1,6 +1,6 @@
 # cft — AI-Powered Productivity Monitor
 
-A desktop productivity tracker that uses LLM-based classification to categorize your activities in real time. It monitors active window titles and keystrokes, classifies your activity into user-defined categories, and logs everything to Google Sheets.
+A desktop productivity tracker that uses LLM-based classification to categorize your activities in real time. It reads the active window title (and, when the title leaves room for doubt, the screen), classifies your activity into user-defined categories, and keeps the log on your own machine. It never reads the keyboard.
 
 ## How It Works
 
@@ -144,7 +144,7 @@ project cft/
 │   ├── config.py           # All settings and defaults
 │   ├── creds.py            # Environment and credential loading
 │   ├── sheets_sink.py      # Google Sheets read/write
-│   ├── sources.py          # Window event and keystroke sources
+│   ├── sources.py          # Window event sources (live and trace replay)
 │   └── alerts.py           # Popup alerts
 ├── prompt-main.txt         # Primary LLM prompt template
 ├── user_goals.txt          # Your current projects and goals

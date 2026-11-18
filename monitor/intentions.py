@@ -414,8 +414,8 @@ def pause_active(minutes=None) -> Dict:
     session, for 1 to UNTIMED_PAUSE_MAX_MIN minutes (default the maximum).
 
     A pause is a break in all but name — implemented AS one (source="pause")
-    so the runner's hard stop (no polling, no keystrokes, no classification,
-    no alerts) is reused wholesale — except that the session survives it: its
+    so the runner's hard stop (no polling, no classification, no alerts) is
+    reused wholesale — except that the session survives it: its
     ends_at moves out by the paused minute, so no session time is lost. The
     pause expires on its own; ending it early (breaks.end) hands the unused
     part of the minute back.

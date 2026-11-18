@@ -199,14 +199,6 @@ REASONS = {
     "Gaming": "'{t}' is a game or game launcher.",
 }
 
-TYPED = [
-    "[SHIFT]The bi[BACKSPACE][BACKSPACE] [SHIFT]ANd[BACKSPACE][BACKSPACE][BACKSPACE] ",
-    "[LEFT][BACKSPACE][BACKSPACE][BACKSPACE]my",
-    "[CTRL_L]\x03", "[ALT_L][TAB]", " of them earlier[SHIFT]? ",
-    "[SHIFT]Winter 2027, [SHIFT]Math[BACKSPACE][BACKSPACE][BACKSPACE][SHIFT]ATH",
-    "[BACKSPACE][BACKSPACE][BACKSPACE]ic mechanism", "ok im cooked[ENTER]",
-]
-
 OFF = ("Entertainment", "Social Media", "Gaming")
 NEUTRAL_DECLARABLE = ("Composition", "Communication", "Music", "Project CFT")
 
@@ -258,13 +250,10 @@ class Demo:
         else:
             conf = 0.85
             reason = self.reason(cat, title)
-        typed = None
-        if cat in ("College Application", "ASE", "Chem", "Communication") and self.rng.random() < 0.12:
-            typed = self.rng.choice(TYPED)
         row = {
             "timestamp": t.strftime(FMT), "current_window": title,
             "category_name": cat, "confidence": conf, "reason": reason,
-            "human_label": human_label, "typed_text": typed,
+            "human_label": human_label,
             "events": self.events_for(pool or []), "reviewed_at": None,
             "intention_id": session["id"] if session else None,
             "align_score": None if align is None else round(align, 2),
@@ -656,9 +645,9 @@ def install(args) -> int:
                 r["intention_id"] = cur.lastrowid
         conn.executemany(
             "INSERT INTO focus_logs (timestamp, current_window, category_name, confidence, reason, "
-            "human_label, typed_text, events, reviewed_at, intention_id, align_score, human_align) "
+            "human_label, events, reviewed_at, intention_id, align_score, human_align) "
             "VALUES (:timestamp, :current_window, :category_name, :confidence, :reason, :human_label, "
-            ":typed_text, :events, :reviewed_at, :intention_id, :align_score, :human_align)",
+            ":events, :reviewed_at, :intention_id, :align_score, :human_align)",
             demo.rows)
         logs_hi = conn.execute("SELECT MAX(id) FROM focus_logs").fetchone()[0]
         sess_lo = conn.execute("SELECT MIN(id) FROM intentions").fetchone()[0]

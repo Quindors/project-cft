@@ -340,7 +340,6 @@ class SupabaseSink:
             "confidence": confidence,
             "reason": record.get("primary_reason") or None,
             "human_label": record.get("human_label") or None,
-            "typed_text": record.get("typed_text") or None,
             "events": json.dumps(events) if events else None,
             # Kept in lockstep with LocalSink._flatten_row: DualSink mirrors
             # rows through here, and supa_mirror's natural-key matching

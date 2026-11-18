@@ -23,8 +23,7 @@ need the config.py/app.py edits — it builds its own settings.)
 Usage:
     python compare_models.py openai/gpt-4o-mini anthropic/claude-3.7-sonnet google/gemini-2.0-flash-001
     python compare_models.py --no-vision openai/gpt-4o-mini ...        # primary only
-    python compare_models.py --win tests/traces/trace_win.jsonl \
-                             --key tests/traces/trace_key.jsonl  <models...>
+    python compare_models.py --win tests/traces/trace_win.jsonl <models...>
     python compare_models.py --verbose <models...>                    # show pipeline logs
 """
 from __future__ import annotations
@@ -82,14 +81,13 @@ def _quiet(enabled: bool):
         devnull.close()
 
 
-def build_base_settings(win_path: str, key_path: str):
+def build_base_settings(win_path: str):
     """A trace-mode settings object shared by every model (model swapped per run)."""
     trace = dataclasses.replace(
         DEFAULT_SETTINGS.trace,
         use_trace_file=True,
         upload_to_sheets=False,
         trace_win_path=win_path,
-        trace_key_path=key_path,
     )
     return dataclasses.replace(DEFAULT_SETTINGS, trace=trace)
 
@@ -120,11 +118,7 @@ def expected_productive(label: str, categories):
 
 def precompute_decisions(base_settings):
     """Build the (identical-for-every-model) list of decision points from the trace."""
-    event_src, key_src = make_sources(settings=base_settings)
-    try:
-        key_src.start()
-    except Exception:
-        pass
+    event_src = make_sources(settings=base_settings)
 
     points = []
     for evt_time in event_src.event_times():
@@ -136,11 +130,6 @@ def precompute_decisions(base_settings):
             "events": events,                      # [(ts_str, window_title), ...]
             "expected": event_src.get_label(evt_time),
         })
-
-    try:
-        key_src.stop()
-    except Exception:
-        pass
     return points
 
 
@@ -276,8 +265,6 @@ def main():
                     help="Model slugs (OpenRouter-namespaced, e.g. openai/gpt-4o-mini)")
     ap.add_argument("--win", default=DEFAULT_SETTINGS.trace.trace_win_path,
                     help="Window trace path")
-    ap.add_argument("--key", default=DEFAULT_SETTINGS.trace.trace_key_path,
-                    help="Keystroke trace path")
     ap.add_argument("--no-vision", action="store_true",
                     help="Primary only — skip the vision tiebreaker")
     ap.add_argument("--verbose", action="store_true",

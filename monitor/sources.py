@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import json
 import time
-import threading
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -13,32 +12,11 @@ from typing import List, Tuple, Optional, Dict
 from monitor.config import Settings, DEFAULT_SETTINGS
 from monitor.window_capture import get_active_window, get_mode
 
-# pynput needs X11 on Linux / WSL — catch ALL errors
-try:
-    from pynput import keyboard
-except Exception as e:
-    keyboard = None
-    if "No module" in str(e):
-        print("[warn] pynput not installed. Live KeyLogger disabled. pip install pynput")
-    else:
-        print(f"[warn] pynput cannot start ({type(e).__name__}): display/X11 not available")
-        print("[warn] Live KeyLogger disabled. Keystroke capture requires a display server.")
-
-
-def format_keys_as_text(keys: List[str]) -> str:
-    out = []
-    for k in keys:
-        if k == "Key.space":
-            out.append(" ")
-        elif k == "Key.enter":
-            out.append("[ENTER] ")
-        elif str(k).startswith("Key."):
-            out.append(f"[{str(k).replace('Key.', '').upper()}]")
-        elif isinstance(k, str) and len(k) == 1:
-            out.append(k)
-        else:
-            out.append(f"[{k}]")
-    return "".join(out)
+# The monitor reads window titles and, for the vision second look, the
+# screen. It does not read the keyboard: there is no keystroke source here,
+# and nothing anywhere in the app should start one. Idle detection
+# (monitor/idle.py) asks the OS for the time since the last input and never
+# sees which keys were pressed.
 
 
 # ==================== BASE CLASSES ====================
@@ -48,12 +26,6 @@ class EventSource:
     def poll(self) -> Optional[str]: ...
     def last_events(self, now_dt: datetime, limit: int) -> List[Tuple[str, str]]: ...
     def reset(self) -> None: ...
-
-
-class KeystrokeSource:
-    def start(self) -> None: ...
-    def stop(self) -> None: ...
-    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str: ...
 
 
 # ==================== LIVE SOURCES (IN-MEMORY) ====================
@@ -110,51 +82,6 @@ class LiveEventSource(EventSource):
         self._last_title = ""
 
 
-class LiveKeystrokeSource(KeystrokeSource):
-    """Captures keystrokes in memory via pynput. No file I/O."""
-
-    def __init__(self, settings: Settings):
-        self.settings = settings
-        self._buffer: deque[Tuple[datetime, str]] = deque(maxlen=5000)
-        self._lock = threading.Lock()
-        self._listener = None
-
-    def _token_from_key(self, k) -> str:
-        try:
-            if hasattr(k, "char") and k.char is not None:
-                return k.char
-            name = getattr(k, "name", None)
-            if name:
-                return f"Key.{name}"
-        except Exception:
-            pass
-        return str(k)
-
-    def _on_press(self, key):
-        token = self._token_from_key(key)
-        with self._lock:
-            self._buffer.append((datetime.now(), token))
-
-    def start(self) -> None:
-        if not keyboard:
-            print("[warn] KeyLogger disabled: pynput not available on this platform.")
-            return
-        self._listener = keyboard.Listener(on_press=self._on_press)
-        self._listener.start()
-        print("[info] KeyLogger started (in-memory)")
-
-    def stop(self) -> None:
-        if self._listener:
-            self._listener.stop()
-
-    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
-        """Reconstruct typed text between two timestamps."""
-        with self._lock:
-            keys = [k for dt, k in self._buffer if start_dt < dt <= end_dt]
-
-        return format_keys_as_text(keys)
-
-
 # ==================== TRACE SOURCES (FILE-BASED, FOR TESTING) ====================
 
 def _load_trace(path: str) -> Tuple[List[Tuple[datetime, str]], Dict[str, str]]:
@@ -185,18 +112,15 @@ def _load_trace(path: str) -> Tuple[List[Tuple[datetime, str]], Dict[str, str]]:
 @dataclass
 class TraceData:
     win: List[Tuple[datetime, str]]
-    keys: List[Tuple[datetime, str]]
     sim_start: datetime
     labels: Dict[str, str]
 
 
 def load_trace_data(settings: Settings) -> TraceData:
     win, labels = _load_trace(settings.trace.trace_win_path)
-    keys, _ = _load_trace(settings.trace.trace_key_path)
-    if not win and not keys:
-        raise RuntimeError("Trace mode enabled but both trace files are missing/empty.")
-    sim_start = min([x[0] for x in (win[:1] + keys[:1]) if x] or [datetime.now()])
-    return TraceData(win=win, keys=keys, sim_start=sim_start, labels=labels)
+    if not win:
+        raise RuntimeError("Trace mode enabled but the window trace file is missing/empty.")
+    return TraceData(win=win, sim_start=win[0][0], labels=labels)
 
 
 @dataclass
@@ -240,34 +164,21 @@ class TraceEventSource(EventSource):
         return self.session.trace.labels.get(ts_str)
 
 
-class TraceKeystrokeSource(KeystrokeSource):
-    def __init__(self, session: TraceSession):
-        self.session = session
-
-    def start(self) -> None:
-        return
-
-    def stop(self) -> None:
-        return
-
-    def typed_text_between(self, start_dt: datetime, end_dt: datetime) -> str:
-        keys = [k for (dt, k) in self.session.trace.keys if start_dt < dt <= end_dt]
-        return format_keys_as_text(keys)
-
-
 # ==================== FACTORY ====================
 
 def make_sources(
     use_trace: Optional[bool] = None,
     settings: Settings = DEFAULT_SETTINGS,
-):
+) -> EventSource:
+    """The window-title source for this run: replayed from a trace file in
+    trace mode, read from the foreground window live."""
     if use_trace is None:
         use_trace = settings.trace.use_trace_file
 
     if use_trace:
         trace = load_trace_data(settings)
         session = TraceSession(trace=trace, wall_start=time.time(), speed=settings.trace.trace_speed)
-        return TraceEventSource(session), TraceKeystrokeSource(session)
+        return TraceEventSource(session)
 
     print(f"[info] Window capture mode: {get_mode()}")
-    return LiveEventSource(settings), LiveKeystrokeSource(settings)
+    return LiveEventSource(settings)

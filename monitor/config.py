@@ -100,7 +100,6 @@ class SupabaseSettings:
 class TraceSettings:
     use_trace_file: bool = True
     trace_win_path: str = r"tests/traces/trace_win.jsonl"
-    trace_key_path: str = r"tests/traces/trace_key.jsonl"
     trace_speed: float = 1.0
     upload_to_sheets: bool = False     # testing mode: don't write to database
 

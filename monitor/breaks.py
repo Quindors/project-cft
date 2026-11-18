@@ -2,8 +2,8 @@
 """Post-session breaks: a fixed stretch where the monitor stops watching.
 
 A break is the deliberate opposite of a focus session. While one runs the
-monitor is *fully* off: no window polling, no keystroke capture, no
-classification, nothing written to focus_logs, and no alerts. There is no
+monitor is *fully* off: no window polling, no classification, nothing
+written to focus_logs, and no alerts. There is no
 intention to declare and nothing to drift from — the timer just counts down,
 and when it hits zero the monitor returns to its normal mode on its own.
 

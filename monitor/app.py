@@ -209,7 +209,7 @@ def _stop_ui() -> None:
 def run_dashboard_only() -> None:
     """Serve the dashboard + correction API WITHOUT monitoring.
 
-    No window capture, no keystrokes, no LLM — just the local API over the
+    No window capture, no LLM — just the local API over the
     existing focus.db so the user can browse stats and make corrections.
     Launch with: cft.exe --dashboard
     """
@@ -281,17 +281,13 @@ def run(settings: Settings | None = None) -> None:
 
     # --- Cheap main-thread work while those run ---
     t = time.time()
-    event_src, key_src = make_sources(settings=settings)
+    event_src = make_sources(settings=settings)
     print(f"[boot] make_sources                 {time.time() - t:.2f}s")
 
     popup_fn = (lambda *a, **kw: None) if testing_mode else show_popup
 
     if settings.trace.use_trace_file and hasattr(event_src, "sim_start"):
         print(f"[boot] TRACE MODE ON. sim_start={event_src.sim_start}")
-
-    t = time.time()
-    key_src.start()
-    print(f"[boot] key_src.start                {time.time() - t:.2f}s")
 
     # --- Join background inits ---
     llm_thread.join()
@@ -312,7 +308,6 @@ def run(settings: Settings | None = None) -> None:
     try:
         run_monitor_loop(
             event_src=event_src,
-            key_src=key_src,
             sink=sink,
             show_popup=popup_fn,
             settings=settings,
@@ -324,8 +319,6 @@ def run(settings: Settings | None = None) -> None:
     finally:
         print("[info] final flush...")
         sink.close()
-        print("[info] stopping key capture...")
-        key_src.stop()
         if tray_icon is not None:
             try:
                 tray_icon.stop()

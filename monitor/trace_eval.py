@@ -53,7 +53,6 @@ def build_trace_settings(
     base: Settings = DEFAULT_SETTINGS,
     *,
     win_path: Optional[str] = None,
-    key_path: Optional[str] = None,
     use_vision: bool = True,
 ) -> Settings:
     """A trace-mode settings object derived from `base` (usually load_settings())."""
@@ -62,7 +61,6 @@ def build_trace_settings(
         use_trace_file=True,
         upload_to_sheets=False,
         trace_win_path=win_path or base.trace.trace_win_path,
-        trace_key_path=key_path or base.trace.trace_key_path,
     )
     return dataclasses.replace(
         base,
@@ -73,11 +71,7 @@ def build_trace_settings(
 
 def decision_points(settings: Settings) -> List[Dict]:
     """The (model-independent) list of decision points from the trace."""
-    event_src, key_src = make_sources(settings=settings)
-    try:
-        key_src.start()
-    except Exception:
-        pass
+    event_src = make_sources(settings=settings)
 
     points: List[Dict] = []
     for evt_time in event_src.event_times():
@@ -89,11 +83,6 @@ def decision_points(settings: Settings) -> List[Dict]:
             "events": events,
             "expected": event_src.get_label(evt_time),
         })
-
-    try:
-        key_src.stop()
-    except Exception:
-        pass
     return points
 
 

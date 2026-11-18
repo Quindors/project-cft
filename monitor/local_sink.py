@@ -91,7 +91,6 @@ class LocalSink:
                     confidence     REAL,
                     reason         TEXT,
                     human_label    TEXT,
-                    typed_text     TEXT,
                     events         TEXT,
                     reviewed_at    TEXT,
                     intention_id   INTEGER,
@@ -115,6 +114,20 @@ class LocalSink:
                     self._conn.execute(f"ALTER TABLE focus_logs ADD COLUMN {col} {typ}")
                 except sqlite3.OperationalError:
                     pass  # column already exists
+            # Databases written by builds before 2026-11-18 carry a typed_text
+            # column: the text typed between decisions, captured by a keyboard
+            # hook nothing ever read. The hook is gone; take the column and
+            # everything in it with it. DROP COLUMN needs SQLite 3.35+; on an
+            # older library the values are blanked instead, which is the part
+            # that matters.
+            if any(r["name"] == "typed_text"
+                   for r in self._conn.execute("PRAGMA table_info(focus_logs)")):
+                try:
+                    self._conn.execute("ALTER TABLE focus_logs DROP COLUMN typed_text")
+                    print("[sink] removed the typed_text column from focus.db")
+                except sqlite3.OperationalError:
+                    self._conn.execute("UPDATE focus_logs SET typed_text = NULL")
+                    print("[sink] blanked typed_text in focus.db (SQLite too old to drop the column)")
             # After the column exists (older databases only gain it just
             # above). Every per-session read — the forest's /api/sessions,
             # Beeminder's session totals — groups focus_logs by intention_id,
@@ -166,9 +179,9 @@ class LocalSink:
                 self._conn.executemany(
                     """INSERT INTO focus_logs
                        (timestamp, current_window, category_name, confidence,
-                        reason, human_label, typed_text, events, intention_id, align_score)
+                        reason, human_label, events, intention_id, align_score)
                        VALUES (:timestamp, :current_window, :category_name, :confidence,
-                               :reason, :human_label, :typed_text, :events,
+                               :reason, :human_label, :events,
                                :intention_id, :align_score)""",
                     batch,
                 )
@@ -341,7 +354,6 @@ class LocalSink:
             "confidence": confidence,
             "reason": record.get("primary_reason") or None,
             "human_label": record.get("human_label") or None,
-            "typed_text": record.get("typed_text") or None,
             "events": json.dumps(events) if events else None,
             "intention_id": record.get("intention_id"),
             "align_score": record.get("align_score"),
