@@ -190,7 +190,7 @@ _DAY_QUERY = f"""
            COUNT(*) AS n
       FROM focus_logs f
       LEFT JOIN categories c ON c.name = {_LABEL}
-     WHERE f.timestamp >= ? AND f.timestamp < ?
+     WHERE f.timestamp >= ? AND f.timestamp < ?{{SCOPE}}
   GROUP BY label, productive, off_intent, declared
   ORDER BY n DESC
 """
@@ -202,7 +202,12 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def label_rows(start: str, end: str) -> List[sqlite3.Row]:
+# Narrows the day query to the rows logged under one project's sessions.
+_PROJECT_SCOPE = ("\n       AND f.intention_id IN "
+                  "(SELECT id FROM intentions WHERE project_id = ?)")
+
+
+def label_rows(start: str, end: str, *, project_id: Optional[int] = None) -> List[sqlite3.Row]:
     """The day query over [start, end): one row per (label, productive,
     off_intent, declared) with its row count `n`.
 
@@ -210,13 +215,20 @@ def label_rows(start: str, end: str) -> List[sqlite3.Row]:
     (monitor/email_report.py) totals through here too, so a number in the
     inbox is the number Beeminder was sent. Raises sqlite3.Error when the
     database cannot be read; callers decide what an empty answer means.
+
+    project_id keeps only the rows logged during that project's sessions,
+    for the stock a project buys with its hours (monitor/stocks.py).
     """
     from monitor.intent_review import align_sql
+    params: List = [OFF_INTENT_MAX, OFF_INTENT_MAX, start, end]
+    scope = ""
+    if project_id is not None:
+        scope = _PROJECT_SCOPE
+        params.append(project_id)
     with _connect() as conn:
-        query = _DAY_QUERY.replace("{ALIGN}", align_sql(conn, "f"))
-        return conn.execute(
-            query, (OFF_INTENT_MAX, OFF_INTENT_MAX, start, end)
-        ).fetchall()
+        query = (_DAY_QUERY.replace("{ALIGN}", align_sql(conn, "f"))
+                           .replace("{SCOPE}", scope))
+        return conn.execute(query, params).fetchall()
 
 
 # What a label_rows() row counts as. DRIFTED is off-task time that was real
@@ -241,6 +253,22 @@ def bucket(row, *, strict_intent: bool = True) -> str:
     if row["productive"] == 0:
         return OFFTASK
     return NEITHER
+
+
+def project_productive_sec(project_id: int, start: str, end: str, *,
+                           seconds_per_row: float, strict_intent: bool = True) -> float:
+    """Productive seconds logged under one project's sessions in [start, end),
+    by the same rule the hours goal is paid by. Never raises: an unreadable
+    database, or one from before sessions existed, reads as zero — when in
+    doubt, no credit.
+    """
+    try:
+        rows = label_rows(start, end, project_id=project_id)
+    except sqlite3.Error:
+        return 0.0
+    return seconds_per_row * sum(
+        row["n"] for row in rows
+        if bucket(row, strict_intent=strict_intent) == PRODUCTIVE)
 
 
 def day_totals(day: date, *, seconds_per_row: float, strict_intent: bool = True) -> DayTotals:

@@ -71,6 +71,28 @@
         "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && VITE_API_BASE=http://127.0.0.1:47996 npm run dev -- --mode test --port 5174 --strictPort"
       ],
       "port": 5174
+    },
+    {
+      "name": "project-stocks-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "cd ~/projects/project-cft && ./venv/bin/python tests/e2e/project_stocks.py --hold --origin http://localhost:5175"
+      ],
+      "port": 47994
+    },
+    {
+      "name": "focus-dashboard-stocks",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && VITE_API_BASE=http://127.0.0.1:47994 npm run dev -- --mode test --port 5175 --strictPort"
+      ],
+      "port": 5175
     }
   ]
 }

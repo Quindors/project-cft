@@ -145,6 +145,23 @@ Endpoints:
                                    with no project
     POST /api/sessions/project  -> {id, project_id|null} files a finished
                                    session under a project
+    GET  /api/stocks            -> the paper stock each project buys with its
+                                   productive hours (monitor/stocks.py):
+                                   {configured, paper, usd_per_hour,
+                                    min_buy_usd, feed, market, sync_running,
+                                    problem, totals, projects: [{project_id,
+                                    name, symbol, asset_name, since,
+                                    productive_hours, earned_usd,
+                                    invested_usd, queued_usd, owed_usd,
+                                    shares, price, value_usd, gain_usd,
+                                    gain_pct, holdings, buys, problem}]}
+                                   — never the keys
+    POST /api/stocks/ticker     -> {project_id, symbol|null} gives a project
+                                   a ticker (checked with the broker first),
+                                   changes it, or takes it off; hours count
+                                   from then on
+    POST /api/stocks/settle     -> buys now for whatever is owed, instead of
+                                   waiting for the background loop
     POST /api/intention         -> {text, duration_min | untimed: true, category?, confirm?,
                                    project_id?}
                                    starts a session intention (supersedes any
@@ -500,6 +517,15 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                 self._send_unexpected(e, "loading your projects")
             return
 
+        # What each project's hours have bought, on paper (monitor/stocks.py).
+        if u.path == "/api/stocks":
+            try:
+                from monitor import stocks
+                self._send_json(stocks.status())
+            except Exception as e:
+                self._send_unexpected(e, "loading your projects' stocks")
+            return
+
         # Beeminder setup state, so the dashboard's setup card knows whether
         # to show itself. Never includes the token.
         if u.path == "/api/beeminder":
@@ -687,6 +713,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/project": self._post_project_add,
             "/api/project/update": self._post_project_update,
             "/api/project/delete": self._post_project_delete,
+            "/api/stocks/ticker": self._post_stocks_ticker,
+            "/api/stocks/settle": self._post_stocks_settle,
             "/api/beeminder": self._post_beeminder,
             "/api/beeminder/live": self._post_beeminder_live,
             "/api/beeminder/disconnect": self._post_beeminder_disconnect,
@@ -976,6 +1004,21 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         self._send_json({"ok": True, "deleted": row["name"],
                          "unlinked_sessions": row["unlinked_sessions"]})
+
+    def _post_stocks_ticker(self, body) -> None:
+        """Set, change or clear the stock a project buys with its hours."""
+        from monitor import stocks
+        try:
+            entry = stocks.set_ticker(body.get("project_id"), body.get("symbol"))
+        except (ValueError, TypeError) as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        self._send_json({"ok": True, "project": entry})
+
+    def _post_stocks_settle(self, body) -> None:
+        from monitor import stocks
+        placed = stocks.settle()
+        self._send_json({"ok": True, **placed, **stocks.status()})
 
     def _post_session_project(self, conn, body) -> None:
         """File a finished session under a project, or take it out of one —
@@ -2147,6 +2190,14 @@ def start_local_server() -> Optional[str]:
         return None
 
     threading.Thread(target=httpd.serve_forever, daemon=True, name="dashboard-http").start()
+    # Projects' paper stock is bought wherever this API is up (monitor or
+    # dashboard-only): it reads the database, not the monitor loop. A no-op
+    # until the .env carries the paper account's keys.
+    try:
+        from monitor import stocks
+        stocks.start_background_sync()
+    except Exception as e:
+        print(f"[api] project stocks not started ({e})")
     allowed = _allowed_origins()
     print(f"[api] local API on http://127.0.0.1:{port} "
           f"(static={'bundled' if _STATIC_ROOT else 'hosted'}, allowed origins={sorted(allowed) or 'none'})")
