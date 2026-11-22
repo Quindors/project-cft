@@ -140,13 +140,17 @@ def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
     return _decorate(data)
 
 
-def start_lease(intention_id: int, lease_sec: int, *, source: str = SOURCE_DASHBOARD) -> Dict:
+def start_lease(intention_id: int, lease_sec: int, *, source: str = SOURCE_DASHBOARD,
+                holder: Optional[str] = None) -> Dict:
     """Open-ended pause, held by a lease: it lasts lease_sec unless renewed.
 
     The dashboard pause (intentions.dashboard_presence). It is the same pause
     as the one-minute kind, in the same slot, with the same hand-back when it
     ends early; the only difference is that nobody knows its length up front,
     so it is granted a few seconds at a time and the page keeps asking.
+
+    `holder` names the dashboard page that is in front, so that another
+    page going away does not end a pause this one is holding.
     """
     now = datetime.now()
     data = {
@@ -156,18 +160,26 @@ def start_lease(intention_id: int, lease_sec: int, *, source: str = SOURCE_DASHB
         "source": source,
         "intention_id": intention_id,
     }
+    if holder:
+        data["holder"] = holder
     app_state.set_value(_KEY, json.dumps(data))
     print(f"[break] session paused ({source}) — monitoring stops while it lasts")
     return _decorate(data)
 
 
-def renew_lease(new_ends_at: str) -> bool:
-    """Move a lease pause's end out to new_ends_at. False when the slot no
-    longer holds one (it ran out, or something else took the slot)."""
+def renew_lease(new_ends_at: Optional[str] = None, *, holder: Optional[str] = None) -> bool:
+    """Move a lease pause's end out to new_ends_at, and hand it to `holder`
+    when one is named (the page in front now). False when the slot no longer
+    holds one (it ran out, or something else took the slot)."""
     data = _parse(app_state.get_value(_KEY))
     if data is None or data.get("source") != SOURCE_DASHBOARD:
         return False
-    data["ends_at"] = new_ends_at
+    if new_ends_at is None and (not holder or data.get("holder") == holder):
+        return True
+    if new_ends_at is not None:
+        data["ends_at"] = new_ends_at
+    if holder:
+        data["holder"] = holder
     app_state.set_value(_KEY, json.dumps(data))
     return True
 

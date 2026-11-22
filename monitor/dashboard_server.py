@@ -203,7 +203,14 @@ Endpoints:
                                    silence, resumes it. Answers {paused}.
                                    GET /api/status reports it as state
                                    "paused" with paused_by "dashboard" and a
-                                   remaining_sec that stands still
+                                   remaining_sec that stands still. {client}
+                                   names the page; a {front: false} from a
+                                   page other than the one in front is ignored
+    GET  /api/dashboard/presence/watch?client=ID -> never answers in full: the
+                                   page in front holds it open, and when the
+                                   connection drops (tab closed, browser gone)
+                                   the monitor resumes the session at once
+                                   instead of waiting out the lease
     POST /api/intention/hold    -> shelves the running session: it keeps its
                                    text, category, project and remaining time
                                    and is neither active nor finished. GET
@@ -250,6 +257,7 @@ import functools
 import http.server
 import json
 import os
+import select
 import socketserver
 import sqlite3
 import threading
@@ -518,6 +526,10 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         _last_client_seen = time.time()  # a dashboard page is alive out there
         u = urlparse(self.path)
         qs = parse_qs(u.query)
+
+        if u.path == "/api/dashboard/presence/watch":
+            self._watch_dashboard_presence((qs.get("client") or [""])[0])
+            return
 
         # Intentions go through monitor/intentions.py (it creates the DB and
         # its own table on demand), not the read-only connection below.
@@ -1470,7 +1482,51 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
     def _post_dashboard_presence(self, body) -> None:
         """The dashboard page saying whether it is the window in front. The
         running session is paused while it is (intentions.dashboard_presence)."""
-        self._send_json({"ok": True, **intentions.dashboard_presence(bool(body.get("front")))})
+        self._send_json({"ok": True, **intentions.dashboard_presence(
+            bool(body.get("front")), client=body.get("client"))})
+
+    def _watch_dashboard_presence(self, client: str) -> None:
+        """Held open by a dashboard page for as long as it is in front.
+
+        Nothing is said over it. It exists so the monitor notices the page
+        going away without being told: the tab closed, the browser quit or
+        crashed, the page navigated. The browser drops the connection then,
+        and the session that page was holding paused runs again at once
+        instead of when the lease runs out. A page cannot be relied on to say
+        goodbye itself: a hosted page is not always allowed a last request to
+        this computer while it is being torn down.
+        """
+        self.close_connection = True
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self._send_cors()
+            self.end_headers()
+            self.wfile.write(b"watching\n")
+            self.wfile.flush()
+            sock = self.connection
+            last_word = time.monotonic()
+            while True:
+                readable, _, _ = select.select([sock], [], [], 1.0)
+                if readable:
+                    # Readable with nothing to read is the far end closing.
+                    if not sock.recv(4096):
+                        break
+                elif time.monotonic() - last_word >= 15:
+                    # A word now and then, so a connection that died without
+                    # a close (sleep, a dropped route) is found out too.
+                    self.wfile.write(b".\n")
+                    self.wfile.flush()
+                    last_word = time.monotonic()
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                intentions.dashboard_presence(False, client=client)
+            except Exception as e:
+                print(f"[dashboard] could not release the dashboard pause ({e})")
 
     def _post_intention_hold(self, body) -> None:
         """Shelve the running session, to be resumed from the dashboard."""

@@ -546,7 +546,7 @@ def _settle_dashboard_pause() -> None:
         print(f"[intention] could not settle the dashboard pause ({e})")
 
 
-def dashboard_presence(front: bool) -> Dict:
+def dashboard_presence(front: bool, client: Optional[str] = None) -> Dict:
     """The dashboard page reporting whether it is the window in front.
 
     While it is, the running session is paused: its countdown stands still
@@ -560,10 +560,24 @@ def dashboard_presence(front: bool) -> Dict:
     each "still in front" message renews, and a page that goes quiet
     (closed, crashed, asleep) loses it within dashboard_lease_sec().
 
+    The lease is only the backstop. A page that is in front also holds a
+    connection open to the monitor (dashboard_server, /api/dashboard/presence/
+    watch), and the moment that connection drops, however it drops, the
+    monitor says "not in front" on the page's behalf. A page being closed is
+    not reliably allowed a last request (a public page talking to this
+    computer least of all), so the goodbye cannot be left to it.
+
+    `client` names the page speaking. The pause remembers which page is in
+    front, and a "not in front" from any OTHER page changes nothing: with two
+    dashboard tabs, closing the one in the background must not resume a
+    session the one in front is holding. A message without a name (an older
+    page) is taken at its word, as before.
+
     It never stacks: while a pause the user asked for, or a real break, holds
     the slot, presence changes nothing. Returns {"paused": bool}: whether a
     dashboard pause is holding the session after this message.
     """
+    client = (str(client).strip()[:64] or None) if client else None
     from monitor import breaks
 
     lease = dashboard_lease_sec()
@@ -572,8 +586,12 @@ def dashboard_presence(front: bool) -> Dict:
         if cur is not None and cur.get("source") != breaks.SOURCE_DASHBOARD:
             return {"paused": False}
         if not front:
-            if cur is not None:
-                breaks.end()
+            if cur is None:
+                return {"paused": False}
+            holder = cur.get("holder")
+            if client and holder and holder != client:
+                return {"paused": True}       # another page is the one in front
+            breaks.end()
             return {"paused": False}
 
         now = datetime.now()
@@ -583,11 +601,12 @@ def dashboard_presence(front: bool) -> Dict:
             # end always stays past the pause's own (see pause_active).
             delta = int((_ts(new_ends) - _ts(cur["ends_at"])).total_seconds())
             if delta <= 0:
+                breaks.renew_lease(holder=client)
                 return {"paused": True}
             if not shift_active_ends(cur.get("intention_id"), delta, mirror=False):
                 breaks.clear_pause()      # the session it froze is gone
                 return {"paused": False}
-            if not breaks.renew_lease(new_ends):
+            if not breaks.renew_lease(new_ends, holder=client):
                 shift_active_ends(cur.get("intention_id"), -delta, mirror=False)
                 return {"paused": False}
             return {"paused": True}
@@ -598,7 +617,7 @@ def dashboard_presence(front: bool) -> Dict:
         if not shift_active_ends(active["id"], lease, mirror=False):
             return {"paused": False}
         try:
-            breaks.start_lease(active["id"], lease)
+            breaks.start_lease(active["id"], lease, holder=client)
         except Exception:
             shift_active_ends(active["id"], -lease, mirror=False)
             raise
