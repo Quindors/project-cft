@@ -117,24 +117,44 @@ def mirror_intent_rows(changes) -> None:
     _run_async("intent-review", op)
 
 
-_INTENTION_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status",
-                   "llm_category", "project_id")
+_INTENTION_BASE_COLS = ("id", "text", "started_at", "ends_at", "ended_at", "status",
+                        "llm_category", "project_id")
+# Added with holds and outcomes (migrations/2026-11-21_session_hold_outcome.sql).
+_INTENTION_COLS = _INTENTION_BASE_COLS + ("paused_sec", "held_at", "outcome")
 
 
-def _intention_payload(row) -> dict:
-    return {k: row.get(k) for k in _INTENTION_COLS}
+def _intention_payload(row, cols=_INTENTION_COLS) -> dict:
+    return {k: row.get(k) for k in cols}
+
+
+def _upsert_intentions(sb, rows) -> None:
+    """Upsert intention rows, falling back to the columns the cloud table
+    started with when it has not had the newer ones added yet. A mirror that
+    is one migration behind then still carries every session (held ones
+    included); it only lacks the pause time and the outcome until the
+    migration is run."""
+    try:
+        sb.table("intentions").upsert(
+            [_intention_payload(r) for r in rows], on_conflict="id").execute()
+    except Exception as e:
+        text = str(e)
+        if not any(c in text for c in ("paused_sec", "held_at", "outcome")):
+            raise
+        sb.table("intentions").upsert(
+            [_intention_payload(r, _INTENTION_BASE_COLS) for r in rows],
+            on_conflict="id").execute()
 
 
 def mirror_intention(row) -> None:
     """Upsert one session intention (any status) by its local id."""
     if not enabled():
         return
-    payload = _intention_payload(row)
+    row = dict(row)
 
     def op(sb):
-        sb.table("intentions").upsert(payload, on_conflict="id").execute()
+        _upsert_intentions(sb, [row])
 
-    _run_async(f"intention-{payload['id']}", op)
+    _run_async(f"intention-{row.get('id')}", op)
 
 
 def mirror_intentions(rows) -> None:
@@ -142,13 +162,13 @@ def mirror_intentions(rows) -> None:
     start costs one request per 500 rows and never duplicates anything."""
     if not enabled() or not rows:
         return
-    payloads = [_intention_payload(r) for r in rows]
+    rows = [dict(r) for r in rows]
 
     def op(sb):
-        for i in range(0, len(payloads), 500):
-            sb.table("intentions").upsert(payloads[i:i + 500], on_conflict="id").execute()
+        for i in range(0, len(rows), 500):
+            _upsert_intentions(sb, rows[i:i + 500])
 
-    _run_async(f"intentions-backfill({len(payloads)})", op)
+    _run_async(f"intentions-backfill({len(rows)})", op)
 
 
 _PROJECT_COLS = ("id", "name", "description", "category", "status", "created_at", "archived_at")

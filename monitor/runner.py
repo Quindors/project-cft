@@ -217,10 +217,14 @@ def _run_live_loop(
                     drift_tier, drift_since, last_drift_alert = None, None, None
                     secs = active_break.get("remaining_sec") or 0
                     span = f"~{secs // 60}m" if secs >= 60 else f"{secs}s"
-                    word = ("PAUSE" if active_break.get("source") == "pause"
-                            else "BREAK")
-                    print(f"[runner] {word} — tracking and alerts off for {span} "
-                          f"(until {active_break['ends_at'][11:16]})")
+                    if active_break.get("source") == breaks_store.SOURCE_DASHBOARD:
+                        print("[runner] PAUSE — the dashboard is in front; tracking "
+                              "and alerts off until it is not")
+                    else:
+                        word = ("PAUSE" if breaks_store.is_pause(active_break)
+                                else "BREAK")
+                        print(f"[runner] {word} — tracking and alerts off for {span} "
+                              f"(until {active_break['ends_at'][11:16]})")
                 time.sleep(settings.poll_interval)
                 continue
 

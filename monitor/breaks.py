@@ -33,6 +33,22 @@ DEFAULT_BREAK_MIN = 15
 MIN_BREAK_MIN = 1
 MAX_BREAK_MIN = 120
 
+# The two things in the break slot that are not a break: a pause the user
+# asked for (a fixed minute, or up to five in a marathon) and the pause that
+# lasts as long as the dashboard is the window in front (a short lease the
+# page keeps renewing, see intentions.dashboard_presence). Both freeze a
+# session that stays active; everything that asks "is this a pause?" asks
+# is_pause(), so the two can never be treated differently by accident.
+SOURCE_PAUSE = "pause"
+SOURCE_DASHBOARD = "dashboard"
+PAUSE_SOURCES = (SOURCE_PAUSE, SOURCE_DASHBOARD)
+
+
+def is_pause(data: Optional[Dict]) -> bool:
+    """True when the break slot holds a pause: the session under it is still
+    active and comes back when the pause ends."""
+    return bool(data) and data.get("source") in PAUSE_SOURCES
+
 
 def _now_str() -> str:
     return datetime.now().strftime(_TS_FMT)
@@ -124,6 +140,38 @@ def start(duration_min: int = DEFAULT_BREAK_MIN, *, source: str = "manual",
     return _decorate(data)
 
 
+def start_lease(intention_id: int, lease_sec: int, *, source: str = SOURCE_DASHBOARD) -> Dict:
+    """Open-ended pause, held by a lease: it lasts lease_sec unless renewed.
+
+    The dashboard pause (intentions.dashboard_presence). It is the same pause
+    as the one-minute kind, in the same slot, with the same hand-back when it
+    ends early; the only difference is that nobody knows its length up front,
+    so it is granted a few seconds at a time and the page keeps asking.
+    """
+    now = datetime.now()
+    data = {
+        "started_at": now.strftime(_TS_FMT),
+        "ends_at": (now + timedelta(seconds=int(lease_sec))).strftime(_TS_FMT),
+        "duration_min": 0,
+        "source": source,
+        "intention_id": intention_id,
+    }
+    app_state.set_value(_KEY, json.dumps(data))
+    print(f"[break] session paused ({source}) — monitoring stops while it lasts")
+    return _decorate(data)
+
+
+def renew_lease(new_ends_at: str) -> bool:
+    """Move a lease pause's end out to new_ends_at. False when the slot no
+    longer holds one (it ran out, or something else took the slot)."""
+    data = _parse(app_state.get_value(_KEY))
+    if data is None or data.get("source") != SOURCE_DASHBOARD:
+        return False
+    data["ends_at"] = new_ends_at
+    app_state.set_value(_KEY, json.dumps(data))
+    return True
+
+
 def end() -> Optional[Dict]:
     """End a break early. Returns the break that was cut short, or None.
 
@@ -140,7 +188,7 @@ def end() -> Optional[Dict]:
         return None
     print("[break] break ended early — monitoring resumes")
     unused = data.get("remaining_sec", 0)
-    if data.get("source") == "pause" and data.get("intention_id") and unused > 0:
+    if is_pause(data) and data.get("intention_id") and unused > 0:
         try:
             from monitor import intentions
             intentions.shift_active_ends(data["intention_id"], -unused)
@@ -156,7 +204,7 @@ def clear_pause() -> bool:
     real breaks are never touched.
     """
     data = _parse(app_state.get_value(_KEY))
-    if data is not None and data.get("source") == "pause":
+    if is_pause(data):
         return app_state.delete_value(_KEY)
     return False
 

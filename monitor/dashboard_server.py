@@ -35,7 +35,9 @@ Endpoints:
                                    plus intention_id/align_score (0-1 intent
                                    alignment, null outside a focus session),
                                    for the dashboard's review (re-classify) tab
-    GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null}
+    GET  /api/intention         -> {active: {id, text, started_at, ends_at} | null,
+                                    held: [...]} — held is the shelf, see
+                                   POST /api/intention/hold
     GET  /api/sessions?limit=<n>-> finished focus sessions (completed or expired
                                    — the same set Beeminder counts), newest
                                    first: [{id, text, started_at, ended_at,
@@ -193,6 +195,40 @@ Endpoints:
                                    resumes early and hands the unused part of
                                    the minute back
 
+    POST /api/dashboard/presence -> {front: bool} the dashboard page saying
+                                   whether it is the window in front. While
+                                   it is, the running session is paused (the
+                                   same pause as above, held by a short lease
+                                   each message renews); {front: false}, or
+                                   silence, resumes it. Answers {paused}.
+                                   GET /api/status reports it as state
+                                   "paused" with paused_by "dashboard" and a
+                                   remaining_sec that stands still
+    POST /api/intention/hold    -> shelves the running session: it keeps its
+                                   text, category, project and remaining time
+                                   and is neither active nor finished. GET
+                                   /api/status lists the shelf as `held`:
+                                   [{id, text, llm_category, project,
+                                   remaining_sec, worked_sec, held_at, ...}]
+    POST /api/intention/resume  -> {id} brings a held session back with the
+                                   time it left with; a session running at
+                                   that moment takes its place on the shelf,
+                                   a running break ends. 404 if not on hold
+    POST /api/intention/drop    -> {id} abandons a held session; 404 if not
+                                   on hold
+    POST /api/sessions/outcome  -> {id, outcome: complete|incomplete|skipped|
+                                   null} the user's answer to "did you finish
+                                   it?" for a FINISHED session. GET
+                                   /api/status carries `ask`, the one
+                                   finished session still waiting for that
+                                   answer (the latest, for 12 hours), and
+                                   GET /api/sessions lists `outcome`
+    POST /api/sessions/continue -> {id, hold?: true} picks a finished
+                                   session's work up again as a NEW session
+                                   with the same text, category, project and
+                                   length: on the shelf (default), or started
+                                   now with hold=false
+
 GET /intention serves a built-in page for starting/ending a session intention
 and taking a break — usable even without the bundled dashboard (the tray and
 the timer widget both link to it).
@@ -327,6 +363,7 @@ def _finished_sessions(conn, limit: int) -> list:
         rows = conn.execute(
             "SELECT i.id, i.text, i.started_at, i.ended_at, "
             "       i.status, i.llm_category, i.project_id, "
+            "       i.paused_sec, i.outcome, "
             "       p.name AS project_name, "
             f"       AVG({align}) AS avg_align "
             "FROM intentions i "
@@ -486,7 +523,8 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # its own table on demand), not the read-only connection below.
         if u.path == "/api/intention":
             try:
-                self._send_json({"active": intentions.get_active()})
+                self._send_json({"active": intentions.get_active(),
+                                 "held": intentions.list_held()})
             except Exception as e:
                 self._send_unexpected(e, "loading your focus session")
             return
@@ -565,7 +603,14 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
         # The resolved everything-at-once view the timer widget renders from.
         if u.path == "/api/status":
             try:
-                self._send_json(status_store.full_snapshot())
+                snap = status_store.full_snapshot()
+                # The shelf and the unanswered "did you finish it?" ride on
+                # the page's one poll. They are added here, not in the
+                # snapshot itself: the timer widget renders from that every
+                # second and shows neither.
+                snap["held"] = intentions.list_held()
+                snap["ask"] = intentions.outcome_ask()
+                self._send_json(snap)
             except Exception as e:
                 self._send_unexpected(e, "loading the monitor's status")
             return
@@ -687,6 +732,9 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
                     limit = min(max(int(qs.get("limit", ["1000"])[0]), 1), 5000)
                 except ValueError:
                     limit = 1000
+                # paused_sec and outcome are read below; make sure a database
+                # from an older build has grown them before it is asked.
+                intentions.list_held()
                 self._send_json(_finished_sessions(conn, limit))
             else:
                 self._send_problem(
@@ -706,6 +754,12 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             "/api/intention": self._post_intention_start,
             "/api/intention/end": self._post_intention_end,
             "/api/intention/pause": self._post_intention_pause,
+            "/api/intention/hold": self._post_intention_hold,
+            "/api/intention/resume": self._post_intention_resume,
+            "/api/intention/drop": self._post_intention_drop,
+            "/api/dashboard/presence": self._post_dashboard_presence,
+            "/api/sessions/outcome": self._post_session_outcome,
+            "/api/sessions/continue": self._post_session_continue,
             "/api/break": self._post_break_start,
             "/api/break/end": self._post_break_end,
             "/api/intent-correct": self._post_intent_correct,
@@ -1413,6 +1467,76 @@ class _Handler(http.server.SimpleHTTPRequestHandler):
             return
         self._send_json({"ok": True, **result})
 
+    def _post_dashboard_presence(self, body) -> None:
+        """The dashboard page saying whether it is the window in front. The
+        running session is paused while it is (intentions.dashboard_presence)."""
+        self._send_json({"ok": True, **intentions.dashboard_presence(bool(body.get("front")))})
+
+    def _post_intention_hold(self, body) -> None:
+        """Shelve the running session, to be resumed from the dashboard."""
+        try:
+            held = intentions.hold_active()
+        except ValueError as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        self._send_json({"ok": True, "held": held})
+
+    def _send_not_on_hold(self) -> None:
+        self._send_problem(
+            "That session isn't on hold any more.",
+            "Refresh the dashboard \u2014 it was probably resumed or dropped "
+            "from another tab, or from the timer on your desktop.", status=404)
+
+    def _post_intention_resume(self, body) -> None:
+        """Bring a held session back; whatever is running swaps onto the shelf."""
+        resumed = intentions.resume_held(body.get("id"))
+        if resumed is None:
+            self._send_not_on_hold()
+            return
+        self._send_json({"ok": True, **resumed})
+
+    def _post_intention_drop(self, body) -> None:
+        dropped = intentions.drop_held(body.get("id"))
+        if dropped is None:
+            self._send_not_on_hold()
+            return
+        self._send_json({"ok": True, "dropped": dropped})
+
+    def _send_no_finished_session(self) -> None:
+        self._send_problem(
+            "That focus session isn't there any more.",
+            "Refresh the dashboard \u2014 only a session that has finished "
+            "can be marked or continued, and this one may have been removed "
+            "since the page loaded.", status=404)
+
+    def _post_session_outcome(self, body) -> None:
+        """Store the answer to "did you finish it?" on a finished session."""
+        raw = body.get("outcome")
+        outcome = raw.strip().lower() if isinstance(raw, str) else raw
+        try:
+            row = intentions.set_outcome(body.get("id"), outcome or None)
+        except ValueError as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        if row is None:
+            self._send_no_finished_session()
+            return
+        self._send_json({"ok": True, "session": row})
+
+    def _post_session_continue(self, body) -> None:
+        """Pick a finished session's work up again, on the shelf or right now."""
+        hold = body.get("hold")
+        try:
+            result = intentions.continue_session(
+                body.get("id"), hold=True if hold is None else bool(hold))
+        except ValueError as e:
+            self._send_json(problems.body(e), status=400)
+            return
+        if result is None:
+            self._send_no_finished_session()
+            return
+        self._send_json({"ok": True, **result})
+
     def _post_intention_end(self, body) -> None:
         status = (body.get("status") or "completed").strip().lower()
         try:
@@ -1971,6 +2095,22 @@ function render(force) {
   }
 
   if (snap.phase === 'session') {
+    if (snap.state === 'paused' && snap.paused_by === 'dashboard') {
+      // Paused because the dashboard is the window in front: nothing counts
+      // down, the session's own time stands still until that changes.
+      card.innerHTML = `
+        <span class="chip"><i></i>${CHIP.paused}</span>
+        <div class="dial">${ring()}
+          <div><div class="time">${fmt(snap.untimed ? (snap.elapsed_sec || 0) : (snap.remaining_sec || 0))}</div>
+               <div class="sub">${snap.untimed ? 'worked' : 'left'} · paused</div></div></div>
+        <p class="note">${esc(snap.label)}<br>
+           Paused while the dashboard is in front — it picks up again when you
+           switch back to your work.</p>
+        <div class="row">
+          <button class="ghost" onclick="endSession('abandoned')">Abandon</button>
+        </div>`;
+      return;
+    }
     if (snap.state === 'paused') {
       // The countdown here is the pause's own: when monitoring comes back.
       card.innerHTML = `

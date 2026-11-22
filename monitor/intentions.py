@@ -13,7 +13,16 @@ HTTP threads, and the tray thread at the same time.
 Timestamps are naive local "YYYY-MM-DD HH:MM:SS" strings, matching
 focus_logs.timestamp, so plain string comparison is correct.
 
-Status lifecycle: active -> completed | abandoned | superseded | expired.
+Status lifecycle: active -> completed | abandoned | superseded | expired,
+with one detour: active <-> held. A held session is shelved, not ended: it
+keeps its text, category, project and the time it had left, and is neither a
+finished session (no break, no Beeminder datapoint, no plant in the forest)
+nor the active one (nothing is judged against it) until it is resumed.
+
+A finished session also carries an outcome, the user's own answer to "did you
+finish it?": complete | incomplete | skipped, or NULL while unanswered. It is
+a note on the session, not a status: an incomplete session ran its time and
+counts exactly as a complete one does.
 
 Finishing a session (completed or expired, not abandoned or superseded) hands
 off to monitor/breaks.py, which starts the post-session break. The handoff is
@@ -22,9 +31,11 @@ ended — the runner loop, an HTTP request and the tray all race to read it.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from monitor.paths import data_dir
 from monitor.problems import UserError
@@ -50,6 +61,29 @@ PAUSE_MIN = 1
 # like any other once it reaches MAX_DURATION_MIN.
 UNTIMED_FINISH_MIN = 20
 UNTIMED_PAUSE_MAX_MIN = 5
+
+# The shelf is for the thing you were pulled away from, not a backlog.
+MAX_HELD = 5
+# A finished session is asked about (complete / incomplete) for this long;
+# after that the moment has passed and the dashboard stops bringing it up.
+OUTCOME_ASK_HOURS = 12
+OUTCOMES = ("complete", "incomplete", "skipped")
+
+
+def dashboard_lease_sec() -> int:
+    """How long a dashboard pause lasts without the page renewing it. The
+    page says "still in front" every few seconds; a page that was closed or
+    crashed says nothing, and the session resumes this long after its last
+    word. Short, because that silence is time the session is not running."""
+    try:
+        return max(2, int(os.environ.get("CFT_DASHBOARD_LEASE_SEC") or 20))
+    except ValueError:
+        return 20
+
+
+# One dashboard-presence message at a time: two tabs renewing the same lease
+# at once would each move the session's end out by the same seconds.
+_presence_lock = threading.RLock()
 
 
 def _finished(intention: Dict, status: str, *, start_break: bool = True) -> None:
@@ -201,7 +235,10 @@ def _connect() -> sqlite3.Connection:
         pass  # column already exists
     # untimed: 1 for a stopwatch session. paused_sec: seconds spent in
     # in-session breaks/pauses so far, so worked time = elapsed - paused_sec.
-    for col in ("untimed INTEGER NOT NULL DEFAULT 0", "paused_sec INTEGER NOT NULL DEFAULT 0"):
+    # held_at: when a held session was shelved (NULL otherwise). outcome: the
+    # user's complete/incomplete answer for a finished session.
+    for col in ("untimed INTEGER NOT NULL DEFAULT 0", "paused_sec INTEGER NOT NULL DEFAULT 0",
+                "held_at TEXT", "outcome TEXT"):
         try:
             conn.execute(f"ALTER TABLE intentions ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -224,7 +261,8 @@ def worked_sec(row: Dict, *, now: Optional[datetime] = None, pause_left_sec: int
     start = _ts(row.get("started_at"))
     if start is None:
         return 0
-    end = _ts(row.get("ended_at")) or now or datetime.now()
+    # A held session stopped working the moment it was shelved.
+    end = _ts(row.get("ended_at")) or _ts(row.get("held_at")) or now or datetime.now()
     paused = int(row.get("paused_sec") or 0) - int(pause_left_sec or 0)
     return max(0, int((end - start).total_seconds()) - max(0, paused))
 
@@ -426,6 +464,10 @@ def pause_active(minutes=None) -> Dict:
     """
     from monitor import breaks
 
+    # Asking for a pause from the dashboard happens while the dashboard's own
+    # pause is holding the session. The asked-for one replaces it: it has a
+    # length, and it lasts after the dashboard is left.
+    _settle_dashboard_pause()
     if breaks.get_active() is not None:
         raise UserError(
             "You're on a break, so there's no session to pause.",
@@ -492,11 +534,85 @@ def pause_active(minutes=None) -> Dict:
     return {"active": active, "pause": pause}
 
 
-def shift_active_ends(intention_id: int, delta_sec: int) -> bool:
+def _settle_dashboard_pause() -> None:
+    """End a running dashboard pause, handing its unused seconds back."""
+    try:
+        from monitor import breaks
+        with _presence_lock:
+            cur = breaks.get_active()
+            if cur is not None and cur.get("source") == breaks.SOURCE_DASHBOARD:
+                breaks.end()
+    except Exception as e:
+        print(f"[intention] could not settle the dashboard pause ({e})")
+
+
+def dashboard_presence(front: bool) -> Dict:
+    """The dashboard page reporting whether it is the window in front.
+
+    While it is, the running session is paused: its countdown stands still
+    and nothing is watched, logged or scored. This is the SAME pause as the
+    one-minute kind (monitor/breaks.py, source="dashboard") rather than a
+    second clock: it sits in the break slot, the runner stands down for it
+    exactly as for any pause, the session's ends_at moves out by the paused
+    time and paused_sec grows by it, and ending it early hands the unused
+    part back. What differs is only the length. Nobody knows up front how
+    long the dashboard stays in front, so the pause is a short lease that
+    each "still in front" message renews, and a page that goes quiet
+    (closed, crashed, asleep) loses it within dashboard_lease_sec().
+
+    It never stacks: while a pause the user asked for, or a real break, holds
+    the slot, presence changes nothing. Returns {"paused": bool}: whether a
+    dashboard pause is holding the session after this message.
+    """
+    from monitor import breaks
+
+    lease = dashboard_lease_sec()
+    with _presence_lock:
+        cur = breaks.get_active()
+        if cur is not None and cur.get("source") != breaks.SOURCE_DASHBOARD:
+            return {"paused": False}
+        if not front:
+            if cur is not None:
+                breaks.end()
+            return {"paused": False}
+
+        now = datetime.now()
+        new_ends = (now + timedelta(seconds=lease)).strftime(_TS_FMT)
+        if cur is not None:
+            # Renewal: the session pays for the extra seconds first, so its
+            # end always stays past the pause's own (see pause_active).
+            delta = int((_ts(new_ends) - _ts(cur["ends_at"])).total_seconds())
+            if delta <= 0:
+                return {"paused": True}
+            if not shift_active_ends(cur.get("intention_id"), delta, mirror=False):
+                breaks.clear_pause()      # the session it froze is gone
+                return {"paused": False}
+            if not breaks.renew_lease(new_ends):
+                shift_active_ends(cur.get("intention_id"), -delta, mirror=False)
+                return {"paused": False}
+            return {"paused": True}
+
+        active = get_active()
+        if active is None:
+            return {"paused": False}
+        if not shift_active_ends(active["id"], lease, mirror=False):
+            return {"paused": False}
+        try:
+            breaks.start_lease(active["id"], lease)
+        except Exception:
+            shift_active_ends(active["id"], -lease, mirror=False)
+            raise
+        return {"paused": True}
+
+
+def shift_active_ends(intention_id: int, delta_sec: int, *, mirror: bool = True) -> bool:
     """Move an ACTIVE intention's ends_at by delta_sec (negative = earlier).
 
-    Used by breaks.end() to hand back the unused part of a pause. The
-    status='active' guard makes it a no-op if the session ended meanwhile.
+    Used by breaks.end() to hand back the unused part of a pause, and by the
+    dashboard pause to pay for each stretch of its lease. The status='active'
+    guard makes it a no-op if the session ended meanwhile. mirror=False is
+    for the lease renewals, which land every few seconds: the cloud copy
+    hears about the pause once, when it ends.
     """
     with _connect() as conn:
         row = conn.execute(
@@ -517,7 +633,7 @@ def shift_active_ends(intention_id: int, delta_sec: int) -> bool:
         full = dict(conn.execute(
             "SELECT * FROM intentions WHERE id = ?", (intention_id,)
         ).fetchone()) if won else None
-    if full is not None:
+    if full is not None and mirror:
         _mirror(full)
     return won
 
@@ -536,13 +652,17 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
             "Use \u201cDone\u201d if you saw it through, or \u201cGive "
             "up\u201d if you didn't \u2014 only finished sessions count "
             "towards your goals.")
+    # "Done" on the dashboard is clicked while the dashboard's own pause is
+    # holding the session. Settle that first (the unused part of its lease
+    # goes back), so the session ends with exactly the time it worked.
+    _settle_dashboard_pause()
     active = get_active()
     if active is None:
         return None
     if status == "completed" and active.get("untimed"):
         from monitor import breaks
         pause = breaks.get_active()
-        left = pause.get("remaining_sec", 0) if pause and pause.get("source") == "pause" else 0
+        left = pause.get("remaining_sec", 0) if breaks.is_pause(pause) else 0
         worked = worked_sec(active, pause_left_sec=left)
         if worked < UNTIMED_FINISH_MIN * 60:
             more = UNTIMED_FINISH_MIN * 60 - worked
@@ -574,3 +694,256 @@ def end_active(status: str = "completed", *, fire_hook: bool = True) -> Optional
     _mirror(active)
     _finished(active, status, start_break=fire_hook)
     return active
+
+
+# ---------- on hold ----------
+
+def _held_view(row: Dict) -> Dict:
+    """A held row as the shelf shows it: what it is, and what it has left."""
+    row = _attach_project(dict(row))
+    held, ends = _ts(row.get("held_at")), _ts(row.get("ends_at"))
+    row["worked_sec"] = worked_sec(row)
+    row["planned_min"] = planned_min(row)
+    # A marathon has no countdown to preserve; its stopwatch is worked_sec.
+    row["remaining_sec"] = (None if row.get("untimed") or held is None or ends is None
+                            else max(0, int((ends - held).total_seconds())))
+    return row
+
+
+def list_held() -> List[Dict]:
+    """Sessions on hold, most recently shelved first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM intentions WHERE status = 'held' ORDER BY held_at DESC, id DESC"
+        ).fetchall()
+    return [_held_view(dict(r)) for r in rows]
+
+
+def _shelf_full() -> UserError:
+    return UserError(
+        f"You already have {MAX_HELD} sessions on hold.",
+        "Resume or drop one of them first \u2014 the shelf is for work you "
+        "were pulled away from, and it stays short on purpose.")
+
+
+def hold_active() -> Dict:
+    """Shelve the running session. Returns it as the shelf shows it.
+
+    Nothing is lost and nothing is counted: the session keeps the time it had
+    left (a pause in progress is settled first, so that figure is exact), and
+    it is not finished, so there is no break, no Beeminder datapoint and no
+    plant. Monitoring carries on as it does with no session running.
+    """
+    from monitor import breaks
+
+    with _presence_lock:
+        if breaks.is_pause(breaks.get_active()):
+            breaks.end()
+    active = get_active()
+    if active is None:
+        raise UserError(
+            "There's no focus session running to put on hold.",
+            "Start one first \u2014 or resume one from the shelf under the "
+            "session box, if that's the one you meant.")
+    now = _now_str()
+    with _connect() as conn:
+        held = conn.execute(
+            "SELECT COUNT(*) FROM intentions WHERE status = 'held'").fetchone()[0]
+        if held >= MAX_HELD:
+            raise _shelf_full()
+        won = conn.execute(
+            "UPDATE intentions SET status = 'held', held_at = ? "
+            "WHERE id = ? AND status = 'active'",
+            (now, active["id"]),
+        ).rowcount == 1
+        row = dict(conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (active["id"],)).fetchone()) if won else None
+    if row is None:
+        raise UserError(
+            "The focus session ended while that was being processed.",
+            "Refresh the dashboard to see where things stand.")
+    print(f"[intention] session {row['id']} put on hold")
+    _mirror(row)
+    return _held_view(row)
+
+
+def resume_held(intention_id) -> Optional[Dict]:
+    """Bring a held session back as the active one. None if it isn't on hold.
+
+    It comes back with the time it left with: its start and end both move
+    forward by the time it spent on the shelf, so it is still one block of
+    the declared length, placed where it is actually being worked.
+
+    A session that is running at that moment is not lost and not ended: it
+    takes the resumed one's place on the shelf (a swap, so the shelf cannot
+    overflow). A break that is running ends, because resuming is choosing to
+    work; a pause ends too, with its unused time handed back.
+    """
+    from monitor import breaks
+
+    try:
+        iid = int(intention_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        target = conn.execute(
+            "SELECT * FROM intentions WHERE id = ? AND status = 'held'", (iid,)).fetchone()
+    if target is None:
+        return None
+    target = dict(target)
+
+    with _presence_lock:
+        if breaks.get_active() is not None:
+            breaks.end()
+    running = get_active()
+
+    now = datetime.now()
+    now_s = now.strftime(_TS_FMT)
+    away = now - (_ts(target.get("held_at")) or now)
+    started = ((_ts(target["started_at"]) or now) + away).strftime(_TS_FMT)
+    ends = ((_ts(target["ends_at"]) or now) + away).strftime(_TS_FMT)
+    shelved = None
+    with _connect() as conn:
+        won = conn.execute(
+            "UPDATE intentions SET status = 'active', held_at = NULL, "
+            "started_at = ?, ends_at = ? WHERE id = ? AND status = 'held'",
+            (started, ends, iid),
+        ).rowcount == 1
+        if won and running is not None:
+            conn.execute(
+                "UPDATE intentions SET status = 'held', held_at = ? "
+                "WHERE id = ? AND status = 'active' AND id != ?",
+                (now_s, running["id"], iid))
+            shelved = dict(conn.execute(
+                "SELECT * FROM intentions WHERE id = ?", (running["id"],)).fetchone())
+        row = dict(conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (iid,)).fetchone()) if won else None
+    if row is None:
+        return None     # two clicks raced; the other one resumed it
+    print(f"[intention] session {iid} resumed from hold"
+          + (f"; session {shelved['id']} took its place" if shelved else ""))
+    if shelved is not None:
+        _mirror(shelved)
+    _mirror(row)
+    return {"active": _attach_project(row),
+            "shelved": _held_view(shelved) if shelved is not None else None}
+
+
+def drop_held(intention_id) -> Optional[Dict]:
+    """Give up on a held session: it becomes abandoned, dated to the moment
+    it was shelved (the last time it was worked). None if it isn't on hold."""
+    try:
+        iid = int(intention_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        won = conn.execute(
+            "UPDATE intentions SET status = 'abandoned', ended_at = held_at, held_at = NULL "
+            "WHERE id = ? AND status = 'held'", (iid,)).rowcount == 1
+        row = dict(conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (iid,)).fetchone()) if won else None
+    if row is None:
+        return None
+    _mirror(row)
+    return row
+
+
+# ---------- complete / incomplete ----------
+
+def set_outcome(intention_id, outcome: Optional[str]) -> Optional[Dict]:
+    """Record whether a FINISHED session's work got done: complete,
+    incomplete, skipped (asked, and the user would rather not say), or None
+    to clear. Returns the row, or None when no finished session has that id.
+
+    The outcome changes nothing about how the session counts. A session that
+    ran its time is a session whether or not the work fit into it, and an
+    honest "incomplete" must not cost anything, or nobody would give one.
+    """
+    if outcome is not None and outcome not in OUTCOMES:
+        raise UserError(
+            "A finished session is either complete or incomplete.",
+            "Pick one of the two on the dashboard \u2014 or skip the "
+            "question if you'd rather not say for this one.")
+    try:
+        iid = int(intention_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE intentions SET outcome = ? "
+            "WHERE id = ? AND status IN ('completed', 'expired')",
+            (outcome, iid),
+        ).rowcount == 1
+        row = conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (iid,)).fetchone() if changed else None
+    if row is None:
+        return None
+    row = dict(row)
+    _mirror(row)
+    return _attach_project(row)
+
+
+def outcome_ask() -> Optional[Dict]:
+    """The finished session the dashboard should ask about, or None.
+
+    Only ever the most recent finished session, only while it is unanswered,
+    and only for OUTCOME_ASK_HOURS after it ended: the question is about what
+    just happened, not a backlog of every session that was never marked.
+    """
+    cutoff = (datetime.now() - timedelta(hours=OUTCOME_ASK_HOURS)).strftime(_TS_FMT)
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM intentions WHERE status IN ('completed', 'expired') "
+            "ORDER BY ended_at DESC, id DESC LIMIT 1").fetchone()
+    if row is None or row["outcome"] is not None or (row["ended_at"] or "") < cutoff:
+        return None
+    row = _attach_project(dict(row))
+    row["planned_min"] = planned_min(row)
+    return row
+
+
+def continue_session(intention_id, *, hold: bool = True) -> Optional[Dict]:
+    """Pick a finished session's work up again: a NEW session with the same
+    text, category, project and declared length. None when no finished
+    session has that id.
+
+    The finished session stays finished. It was a real block of work, it has
+    already been counted and its break has started, so the continuation is
+    the next block rather than the old one reopened. hold=True puts it on the
+    shelf (for after the break); hold=False starts it now, through
+    resume_held, so a break ends and a running session swaps onto the shelf.
+    """
+    try:
+        iid = int(intention_id)
+    except (TypeError, ValueError):
+        return None
+    with _connect() as conn:
+        src = conn.execute(
+            "SELECT * FROM intentions WHERE id = ? AND status IN ('completed', 'expired')",
+            (iid,)).fetchone()
+    if src is None:
+        return None
+    src = dict(src)
+    untimed = bool(src.get("untimed"))
+    minutes = MAX_DURATION_MIN if untimed else min(
+        MAX_DURATION_MIN, max(MIN_DURATION_MIN, planned_min(src) or MIN_DURATION_MIN))
+    now = datetime.now()
+    now_s = now.strftime(_TS_FMT)
+    with _connect() as conn:
+        if hold and conn.execute(
+                "SELECT COUNT(*) FROM intentions WHERE status = 'held'").fetchone()[0] >= MAX_HELD:
+            raise _shelf_full()
+        # Shelved the instant it is made: started_at == held_at, so resuming
+        # it moves its whole window to the moment work begins.
+        cur = conn.execute(
+            "INSERT INTO intentions (text, started_at, ends_at, status, llm_category, "
+            "project_id, untimed, paused_sec, held_at) VALUES (?,?,?, 'held', ?, ?, ?, 0, ?)",
+            (src["text"], now_s, (now + timedelta(minutes=minutes)).strftime(_TS_FMT),
+             src.get("llm_category"), src.get("project_id"), int(untimed), now_s))
+        row = dict(conn.execute(
+            "SELECT * FROM intentions WHERE id = ?", (cur.lastrowid,)).fetchone())
+    _mirror(row)
+    if hold:
+        return {"held": _held_view(row)}
+    resumed = resume_held(row["id"])
+    return resumed if resumed is not None else {"held": _held_view(row)}

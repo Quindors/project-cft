@@ -181,13 +181,25 @@ def full_snapshot() -> Dict[str, Any]:
     # sessions and would start a second break on top of this one. A pause is
     # the exception — pausing moved the session's ends_at past the pause's own
     # end, so the session cannot be past due here and the read is safe.
-    is_pause = active_break is not None and active_break.get("source") == "pause"
+    is_pause = breaks.is_pause(active_break)
+    # Which pause: "pause" (asked for, a fixed length that counts down) or
+    # "dashboard" (lasts while the dashboard is the window in front).
+    paused_by = active_break.get("source") if is_pause else None
     active_intention = None
     if active_break is None or is_pause:
         try:
             active_intention = intentions.get_active()
         except Exception:
             active_intention = None
+        if active_intention is None and active_break is None:
+            # That read is also what notices a session has run out, and it
+            # starts the break on the spot. Look again, so the view that
+            # ended the session already shows its break instead of an idle
+            # moment in between.
+            try:
+                active_break = breaks.get_active()
+            except Exception:
+                active_break = None
 
     # Alert mode, and whether anything may interrupt right now: tracker mode
     # silences everything but a session filed under a project.
@@ -205,6 +217,7 @@ def full_snapshot() -> Dict[str, Any]:
         "is_productive": snap.get("is_productive"),
         "stale": snap.get("stale"),
         "paused": active_break is not None,
+        "paused_by": None,
         "away": bool(snap.get("away")),
         "problems": problems_list(),
     }
@@ -231,10 +244,32 @@ def full_snapshot() -> Dict[str, Any]:
         out.update(untimed=False, elapsed_sec=None, finish_in_sec=0,
                    stopwatch_from=None, pause_max_min=None)
 
-    if is_pause and active_intention is not None:
+    if is_pause and active_intention is not None and paused_by == breaks.SOURCE_DASHBOARD:
+        # Paused because the dashboard is in front. There is no moment this
+        # pause is known to end, so nothing counts down: the readout is the
+        # session's own remainder, standing still. That is how far the
+        # session's end sits past the pause's end, which stays the same
+        # however often the lease is renewed (both move together).
+        untimed = bool(active_intention.get("untimed"))
+        frozen = None
+        if not untimed:
+            left = seconds_until(active_intention.get("ends_at"))
+            frozen = None if left is None else max(
+                0, left - int(active_break.get("remaining_sec") or 0))
+        out.update(
+            phase=PHASE_SESSION,
+            state=STATE_PAUSED,
+            paused_by=paused_by,
+            label=active_intention.get("text") or "Focus session",
+            started_at=active_intention.get("started_at"),
+            ends_at=None,
+            remaining_sec=frozen,
+        )
+    elif is_pause and active_intention is not None:
         # A paused session is still a session — the card keeps the intention,
         # and the countdown is the pause's own: when monitoring comes back.
         out.update(
+            paused_by=paused_by,
             phase=PHASE_SESSION,
             state=STATE_PAUSED,
             label=active_intention.get("text") or "Focus session",

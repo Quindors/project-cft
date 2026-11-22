@@ -67,6 +67,8 @@ def _status_text(item=None) -> str:
     mins = None if left is None else max(0, int(left) // 60)
 
     if snap.get("state") == status.STATE_PAUSED:
+        if snap.get("paused_by") == "dashboard":
+            return "Session paused — the dashboard is in front"
         return "Session paused — resuming shortly"
     if snap.get("phase") == status.PHASE_BREAK:
         return f"On a break — {mins}m left"

@@ -93,6 +93,28 @@
         "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && VITE_API_BASE=http://127.0.0.1:47994 npm run dev -- --mode test --port 5175 --strictPort"
       ],
       "port": 5175
+    },
+    {
+      "name": "session-hold-e2e",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "cd ~/projects/project-cft && CFT_ALLOWED_ORIGINS=http://localhost:5176 ./venv/bin/python tests/e2e/session_hold.py --serve"
+      ],
+      "port": 47993
+    },
+    {
+      "name": "focus-dashboard-hold",
+      "runtimeExecutable": "wsl",
+      "runtimeArgs": [
+        "-e",
+        "bash",
+        "-c",
+        "export PATH=~/.nvm/versions/node/v24.15.0/bin:$PATH && cd ~/projects/focus-dashboard && VITE_API_BASE=http://127.0.0.1:47993 npm run dev -- --mode test --port 5176 --strictPort"
+      ],
+      "port": 5176
     }
   ]
 }

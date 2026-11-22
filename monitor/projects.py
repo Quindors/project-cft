@@ -144,7 +144,8 @@ def _with_stats(conn: sqlite3.Connection, rows: List[Dict]) -> List[Dict]:
     try:
         stats = conn.execute(
             "SELECT project_id, COUNT(*) AS n, "
-            "       SUM((julianday(ended_at) - julianday(started_at)) * 1440) AS mins "
+            "       SUM((julianday(ended_at) - julianday(started_at)) * 1440 "
+            "           - COALESCE(paused_sec, 0) / 60.0) AS mins "
             "FROM intentions WHERE project_id IS NOT NULL "
             "  AND status IN ('completed', 'expired') GROUP BY project_id"
         ).fetchall()

@@ -506,6 +506,10 @@ class _TimerWidget:
         snap = self._snapshot
         if snap.get("untimed") and snap.get("state") != status.STATE_PAUSED:
             return status.seconds_since(snap.get("stopwatch_from"))
+        if snap.get("paused_by") == "dashboard":
+            # Paused while the dashboard is in front: nothing counts down, so
+            # the clock shows the session's own time, standing still.
+            return snap.get("elapsed_sec") if snap.get("untimed") else snap.get("remaining_sec")
         return status.seconds_until(snap.get("ends_at"))
 
     def _colors(self):
@@ -1174,7 +1178,8 @@ class _TimerWidget:
         if snap.get("phase") == status.PHASE_BREAK:
             menu.add_command(label="End break now", command=self._end_break)
         else:
-            if snap.get("state") == status.STATE_PAUSED:
+            if (snap.get("state") == status.STATE_PAUSED
+                    and snap.get("paused_by") != "dashboard"):
                 # A pause is a break under the hood: ending it resumes the
                 # session and hands back the unused part of the minute.
                 menu.add_command(label="Resume session now", command=self._end_break)
@@ -1189,6 +1194,8 @@ class _TimerWidget:
                     f"Finish session — available in {max(1, -(-int(snap.get('finish_in_sec')) // 60))} min",
                     command=lambda: self._end_session("completed"),
                     state="normal" if finishable else "disabled")
+                menu.add_command(label="Put session on hold",
+                                 command=self._hold_session)
                 menu.add_command(label="Abandon session",
                                  command=lambda: self._end_session("abandoned"))
             else:
@@ -1233,6 +1240,15 @@ class _TimerWidget:
             intentions.pause_active(intentions.UNTIMED_PAUSE_MAX_MIN)
         except Exception as e:
             print(f"[timer] could not start the in-session break ({e})")
+        self._refresh_now()
+
+    def _hold_session(self) -> None:
+        """Shelve the session; it is resumed from the dashboard's shelf."""
+        from monitor import intentions
+        try:
+            intentions.hold_active()
+        except Exception as e:
+            print(f"[timer] could not put the session on hold ({e})")
         self._refresh_now()
 
     def _end_break(self) -> None:
