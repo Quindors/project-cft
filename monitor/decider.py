@@ -530,19 +530,65 @@ def _productivity_label(is_productive) -> str:
 _STARTER_OFF_TASK = "(Social Media, Gaming, Entertainment, Shopping)"
 _CLASSIFIER_BUCKETS = {"ambiguous", "system"}
 
+# The same file also spells out the starter categories one rule at a time:
+# "Amazon, eBay, shopping sites → Shopping", '"Calc HW 10.3 - OneNote" →
+# Homework (named assignment)', and "To classify as Deep Work, Homework, ...".
+# Once the user deletes Shopping those lines still tell the model to answer
+# Shopping, and it did (2026-11-21, the Amazon home page).
+_STARTER_PRODUCTIVE = "Deep Work, Homework, Research & Learning, or Communication"
+_RULE_ARROW = re.compile(r"^\s*-\s.*(?:→|->)\s*(?P<target>\S.*?)\s*$")
+
+
+def _rule_target(line: str) -> Optional[str]:
+    """The category a "- <examples> → <Category> (<note>)" rule line points
+    at, or None when the line is not such a rule (a score band like
+    "→ 0.10–0.20" points at a number, not a category)."""
+    m = _RULE_ARROW.match(line)
+    if not m:
+        return None
+    target = re.sub(r"\s*\([^()]*\)\s*$", "", m.group("target")).strip()
+    if not target or target[0].isdigit() or target[0] == ".":
+        return None
+    return target
+
+
+def _drop_rules_for_missing_categories(prompt: str, categories: List[Dict]) -> str:
+    have = {(c.get("name") or "").strip().lower() for c in categories}
+    kept = []
+    for line in prompt.splitlines(keepends=True):
+        target = _rule_target(line)
+        if target is not None and target.lower() not in have:
+            continue
+        kept.append(line)
+    return "".join(kept)
+
 
 def _fit_rules_to_categories(prompt: str, categories: List[Dict]) -> str:
+    """Rewrite the template's rules to speak about the categories that exist.
+    Runs on the bare template, before the category list and the activity are
+    filled in, so nothing the user wrote is ever read as a rule."""
     if not categories:
         return prompt
     named = [c for c in categories if (c.get("name") or "").lower() not in _CLASSIFIER_BUCKETS]
     off_task = [c["name"] for c in named if c.get("is_productive") is False]
     neutral = [c["name"] for c in named if c.get("is_productive") is None]
+    productive = [c["name"] for c in named if c.get("is_productive") is True]
     specific = off_task + neutral
     if specific and _STARTER_OFF_TASK in prompt:
         prompt = prompt.replace(
             "specific off-task category " + _STARTER_OFF_TASK,
             "specific off-task or neutral category (" + ", ".join(specific) + ")")
         prompt = prompt.replace(_STARTER_OFF_TASK, "(" + ", ".join(specific) + ")")
+    if productive:
+        prompt = prompt.replace(
+            "To classify as " + _STARTER_PRODUCTIVE,
+            "To classify as a productive category (" + ", ".join(productive) + ")")
+    prompt = _drop_rules_for_missing_categories(prompt, categories)
+    prompt += (
+        "\n\nONLY LISTED CATEGORIES: CATEGORY must be one of the names under "
+        "AVAILABLE CATEGORIES, spelled exactly as listed. Never answer with a "
+        "category that is not in that list, however well its name would fit: "
+        "an activity none of the listed categories describes is Ambiguous.")
     if neutral:
         names = ", ".join(f'"{n}"' for n in neutral)
         prompt += (
@@ -589,14 +635,20 @@ def build_prompt(
     else:
         category_list = "(no categories available)"
 
-    filled = template
+    filled = _fit_rules_to_categories(template, categories or [])
     filled = filled.replace("[insert categories here]", category_list)
     filled = filled.replace("[insert here]", activity_str)
-    filled = _fit_rules_to_categories(filled, categories or [])
 
     # Inject few-shot examples (corrections + prior classifications)
     if events:
         current_win = events[-1][1]
+        # A row logged under a category that has since been deleted (or that
+        # the model made up) is not precedent: shown here, "THIS EXACT WINDOW
+        # was classified as Shopping" brings the missing category straight back.
+        if categories and prior_classifications:
+            prior_classifications = [
+                p for p in prior_classifications
+                if _known_category(p.get("category_name"), categories)]
         fewshot_section = _build_fewshot_prompt(
             current_win, corrections or [], prior_classifications
         )
@@ -1060,6 +1112,35 @@ def _known_category(name: Optional[str], categories: Optional[List[Dict]]) -> bo
     return any(c["name"].lower() == wanted for c in categories)
 
 
+def _keep_to_listed(
+    name: str,
+    is_productive: Optional[bool],
+    conf: float,
+    reason: str,
+    categories: Optional[List[Dict]],
+) -> Tuple[str, Optional[bool], float, str]:
+    """The title call's answer, held to the user's own categories.
+
+    A name that is not in the list (a category the user deleted, or one the
+    model made up) used to be stored as given. It has no productive flag, so
+    the time counted as neither work nor off-task, and the row then came back
+    as precedent for the next visit. Such an answer is filed under Ambiguous
+    instead, the catch-all the prompt already names for anything that fits no
+    category, at the default-by-absence confidence: the model's confidence
+    was in the answer that got turned down, and the low figure lets the
+    screen check have its look.
+
+    Returns (name, is_productive, conf, reason).
+    """
+    if name in ("[ERROR]", "[PARSE_ERROR]") or _known_category(name, categories):
+        return name, is_productive, conf, reason
+    fallback, fallback_prod = _resolve_category("Ambiguous", categories)
+    print(f"[decider] '{name}' is not one of the categories -> {fallback}")
+    note = (f'The title call answered "{name}", which is not one of your '
+            f"categories, so this is filed under {fallback}.")
+    return fallback, fallback_prod, min(conf, 0.5), f"{note} {reason or ''}".strip()
+
+
 def _vision_may_override(
     current_name: str,
     v_name: str,
@@ -1321,6 +1402,8 @@ def decide(
             temperature=0.0,
             categories=categories,
         )
+        p1_name, p1_prod, p1_conf, p1_reason = _keep_to_listed(
+            p1_name, p1_prod, p1_conf, p1_reason, categories)
         p1_align = _parse_align(p1_raw) if intention else None
         primary_res = {
             "category_name": p1_name,
